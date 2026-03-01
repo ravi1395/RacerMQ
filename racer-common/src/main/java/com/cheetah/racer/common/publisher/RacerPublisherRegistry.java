@@ -2,6 +2,7 @@ package com.cheetah.racer.common.publisher;
 
 import com.cheetah.racer.common.config.RacerProperties;
 import com.cheetah.racer.common.metrics.RacerMetrics;
+import com.cheetah.racer.common.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -32,6 +33,8 @@ public class RacerPublisherRegistry {
     private final ObjectMapper objectMapper;
     @Nullable
     private final RacerMetrics racerMetrics;
+    @Nullable
+    private final RacerSchemaRegistry schemaRegistry;
 
     /** alias → publisher */
     private final Map<String, RacerChannelPublisher> registry = new HashMap<>();
@@ -39,17 +42,26 @@ public class RacerPublisherRegistry {
     public RacerPublisherRegistry(RacerProperties properties,
                                   ReactiveRedisTemplate<String, String> redisTemplate,
                                   ObjectMapper objectMapper) {
-        this(properties, redisTemplate, objectMapper, Optional.empty());
+        this(properties, redisTemplate, objectMapper, Optional.empty(), Optional.empty());
     }
 
     public RacerPublisherRegistry(RacerProperties properties,
                                   ReactiveRedisTemplate<String, String> redisTemplate,
                                   ObjectMapper objectMapper,
                                   Optional<RacerMetrics> metricsOpt) {
-        this.properties    = properties;
-        this.redisTemplate = redisTemplate;
-        this.objectMapper  = objectMapper;
-        this.racerMetrics  = metricsOpt.orElse(null);
+        this(properties, redisTemplate, objectMapper, metricsOpt, Optional.empty());
+    }
+
+    public RacerPublisherRegistry(RacerProperties properties,
+                                  ReactiveRedisTemplate<String, String> redisTemplate,
+                                  ObjectMapper objectMapper,
+                                  Optional<RacerMetrics> metricsOpt,
+                                  Optional<RacerSchemaRegistry> schemaRegistryOpt) {
+        this.properties     = properties;
+        this.redisTemplate  = redisTemplate;
+        this.objectMapper   = objectMapper;
+        this.racerMetrics   = metricsOpt.orElse(null);
+        this.schemaRegistry = schemaRegistryOpt.orElse(null);
     }
 
     @PostConstruct
@@ -57,7 +69,7 @@ public class RacerPublisherRegistry {
         // Register the default channel
         registry.put(DEFAULT_ALIAS, new RacerChannelPublisherImpl(
                 redisTemplate, objectMapper,
-                properties.getDefaultChannel(), DEFAULT_ALIAS, "racer", racerMetrics));
+                properties.getDefaultChannel(), DEFAULT_ALIAS, "racer", racerMetrics, schemaRegistry));
         log.info("[racer] Default channel registered: '{}'", properties.getDefaultChannel());
 
         // Register each named channel
@@ -68,7 +80,7 @@ public class RacerPublisherRegistry {
             }
             registry.put(alias, new RacerChannelPublisherImpl(
                     redisTemplate, objectMapper,
-                    channelProps.getName(), alias, channelProps.getSender(), racerMetrics));
+                    channelProps.getName(), alias, channelProps.getSender(), racerMetrics, schemaRegistry));
             log.info("[racer] Channel '{}' registered → '{}'", alias, channelProps.getName());
         });
     }

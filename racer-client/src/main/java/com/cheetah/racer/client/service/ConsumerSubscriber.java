@@ -4,6 +4,7 @@ import com.cheetah.racer.common.RedisChannels;
 import com.cheetah.racer.common.metrics.RacerMetrics;
 import com.cheetah.racer.common.model.RacerMessage;
 import com.cheetah.racer.common.router.RacerRouterService;
+import com.cheetah.racer.common.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -46,6 +47,11 @@ public class ConsumerSubscriber {
     @Nullable
     @Autowired(required = false)
     private RacerMetrics racerMetrics;
+
+    /** Optional — active only when {@code racer.schema.enabled=true}. */
+    @Nullable
+    @Autowired(required = false)
+    private RacerSchemaRegistry racerSchemaRegistry;
 
     private final AtomicReference<String> currentMode = new AtomicReference<>("ASYNC");
     private final AtomicLong processedCount = new AtomicLong(0);
@@ -127,6 +133,18 @@ public class ConsumerSubscriber {
                 if (racerRouter != null && racerRouter.route(message)) {
                     log.debug("[racer-router] Message id={} routed — skipping local processing", message.getId());
                     return Mono.empty();
+                }
+
+                // R-7: validate payload against registered schema on the consume path
+                if (racerSchemaRegistry != null) {
+                    try {
+                        racerSchemaRegistry.validateForConsume(
+                                message.getChannel(), message.getPayload());
+                    } catch (com.cheetah.racer.common.schema.SchemaValidationException e) {
+                        log.warn("[racer-schema] Consume validation failed id={}: {}",
+                                message.getId(), e.getMessage());
+                        return dlqService.enqueue(message, e).then();
+                    }
                 }
 
                 MessageProcessor processor = getActiveProcessor();

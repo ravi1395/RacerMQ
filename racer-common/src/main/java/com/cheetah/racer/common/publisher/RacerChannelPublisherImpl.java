@@ -1,6 +1,7 @@
 package com.cheetah.racer.common.publisher;
 
 import com.cheetah.racer.common.metrics.RacerMetrics;
+import com.cheetah.racer.common.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
@@ -36,13 +37,15 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
     private final String defaultSender;
     @Nullable
     private final RacerMetrics racerMetrics;
+    @Nullable
+    private final RacerSchemaRegistry schemaRegistry;
 
     public RacerChannelPublisherImpl(ReactiveRedisTemplate<String, String> redisTemplate,
                                      ObjectMapper objectMapper,
                                      String channelName,
                                      String channelAlias,
                                      String defaultSender) {
-        this(redisTemplate, objectMapper, channelName, channelAlias, defaultSender, null);
+        this(redisTemplate, objectMapper, channelName, channelAlias, defaultSender, null, null);
     }
 
     public RacerChannelPublisherImpl(ReactiveRedisTemplate<String, String> redisTemplate,
@@ -51,12 +54,23 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
                                      String channelAlias,
                                      String defaultSender,
                                      @Nullable RacerMetrics racerMetrics) {
-        this.redisTemplate = redisTemplate;
-        this.objectMapper = objectMapper;
-        this.channelName = channelName;
-        this.channelAlias = channelAlias;
-        this.defaultSender = defaultSender;
-        this.racerMetrics = racerMetrics;
+        this(redisTemplate, objectMapper, channelName, channelAlias, defaultSender, racerMetrics, null);
+    }
+
+    public RacerChannelPublisherImpl(ReactiveRedisTemplate<String, String> redisTemplate,
+                                     ObjectMapper objectMapper,
+                                     String channelName,
+                                     String channelAlias,
+                                     String defaultSender,
+                                     @Nullable RacerMetrics racerMetrics,
+                                     @Nullable RacerSchemaRegistry schemaRegistry) {
+        this.redisTemplate  = redisTemplate;
+        this.objectMapper   = objectMapper;
+        this.channelName    = channelName;
+        this.channelAlias   = channelAlias;
+        this.defaultSender  = defaultSender;
+        this.racerMetrics   = racerMetrics;
+        this.schemaRegistry = schemaRegistry;
     }
 
     @Override
@@ -66,6 +80,14 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
 
     @Override
     public Mono<Long> publishAsync(Object payload, String sender) {
+        // R-7: validate payload against registered schema before publishing
+        if (schemaRegistry != null) {
+            try {
+                schemaRegistry.validateForPublish(channelName, payload);
+            } catch (com.cheetah.racer.common.schema.SchemaValidationException e) {
+                return Mono.error(e);
+            }
+        }
         return serialize(payload, sender)
                 .flatMap(json -> redisTemplate.convertAndSend(channelName, json))
                 .doOnSuccess(count -> {

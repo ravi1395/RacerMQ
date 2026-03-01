@@ -9,6 +9,7 @@ import com.cheetah.racer.common.publisher.RacerPublisherRegistry;
 import com.cheetah.racer.common.publisher.RacerShardedStreamPublisher;
 import com.cheetah.racer.common.publisher.RacerStreamPublisher;
 import com.cheetah.racer.common.router.RacerRouterService;
+import com.cheetah.racer.common.schema.RacerSchemaRegistry;
 import com.cheetah.racer.common.tx.RacerTransaction;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -19,6 +20,7 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
+import org.springframework.core.io.ResourceLoader;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 
 import java.util.Optional;
@@ -53,13 +55,15 @@ public class RacerAutoConfiguration {
             RacerProperties racerProperties,
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
             ObjectMapper objectMapper,
-            Optional<RacerMetrics> racerMetrics) {
+            Optional<RacerMetrics> racerMetrics,
+            Optional<RacerSchemaRegistry> racerSchemaRegistry) {
 
         return new RacerPublisherRegistry(
                 racerProperties,
                 reactiveStringRedisTemplate,
                 objectMapper,
-                racerMetrics);
+                racerMetrics,
+                racerSchemaRegistry);
     }
 
     @Bean
@@ -117,12 +121,14 @@ public class RacerAutoConfiguration {
             RacerProperties racerProperties,
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
             ObjectMapper objectMapper,
-            Optional<RacerMetrics> racerMetrics) {
+            Optional<RacerMetrics> racerMetrics,
+            Optional<RacerSchemaRegistry> racerSchemaRegistry) {
         return new RacerPipelinedPublisher(
                 reactiveStringRedisTemplate,
                 objectMapper,
                 racerProperties.getPipeline().getMaxBatchSize(),
-                racerMetrics.orElse(null));
+                racerMetrics.orElse(null),
+                racerSchemaRegistry.orElse(null));
     }
 
     // ── R-8: Sharded stream publisher (optional) ─────────────────────────────
@@ -143,7 +149,22 @@ public class RacerAutoConfiguration {
     @ConditionalOnProperty(name = "racer.priority.enabled", havingValue = "true")
     public RacerPriorityPublisher racerPriorityPublisher(
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            ObjectMapper objectMapper,
+            Optional<RacerSchemaRegistry> racerSchemaRegistry) {
+        return new RacerPriorityPublisher(
+                reactiveStringRedisTemplate,
+                objectMapper,
+                racerSchemaRegistry.orElse(null));
+    }
+
+    // ── R-7: Schema registry (optional — enabled by racer.schema.enabled=true) ──
+
+    @Bean
+    @ConditionalOnProperty(name = "racer.schema.enabled", havingValue = "true")
+    public RacerSchemaRegistry racerSchemaRegistry(
+            RacerProperties racerProperties,
+            ResourceLoader resourceLoader,
             ObjectMapper objectMapper) {
-        return new RacerPriorityPublisher(reactiveStringRedisTemplate, objectMapper);
+        return new RacerSchemaRegistry(racerProperties, resourceLoader, objectMapper);
     }
 }

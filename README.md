@@ -2229,7 +2229,7 @@ racer.retention.schedule-cron=0 0 * * * *
 | R-4 | Retention & Pruning | ✅ Done | `RacerRetentionService`, `/api/dlq/trim` |
 | R-5 | Atomic Batch Publish | ✅ Done | `RacerTransaction`, `/api/publish/batch-atomic` |
 | R-6 | HA — Sentinel + Cluster | ✅ Done | `compose.sentinel.yaml`, `compose.cluster.yaml` |
-| R-7 | Schema Registry | 🔮 Future | `RacerSchemaValidator` (planned) |
+| R-7 | Schema Registry | ✅ Implemented | `RacerSchemaRegistry` — JSON Schema Draft-07 validation on publish & consume paths; opt-in via `racer.schema.enabled=true`; REST API at `/api/schema` |
 | R-8 | Consumer Scaling + Sharding | ✅ Done | `racer.consumer.concurrency`, `RacerShardedStreamPublisher` |
 | R-9 | Throughput — Pipelining | ✅ Done | `RacerPipelinedPublisher`, `/api/publish/batch-pipelined` |
 | R-10 | Message Priority | ✅ Done | `RacerPriorityPublisher`, `RacerPriorityConsumerService` |

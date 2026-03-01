@@ -196,4 +196,87 @@ public class RacerProperties {
 
     /** Priority configuration (R-10). */
     private PriorityProperties priority = new PriorityProperties();
+
+    // ── R-7: Schema Registry ─────────────────────────────────────────────────
+
+    /**
+     * Schema validation settings.
+     * Mapped under {@code racer.schema.*}.
+     */
+    @Data
+    public static class SchemaDefinition {
+
+        /**
+         * Classpath or file resource path to a JSON Schema file.
+         * E.g. {@code classpath:schemas/orders-v1.json}.
+         */
+        private String location;
+
+        /**
+         * Inline JSON Schema string. Takes precedence over {@link #location}
+         * when both are set.
+         * E.g. {@code {"type":"object","required":["orderId"]}}.
+         */
+        private String inline;
+
+        /**
+         * Human-readable schema version label, e.g. {@code 1.0}, {@code 2.1-beta}.
+         * Not used for validation logic — surfaced via the schema REST API.
+         */
+        private String version = "1.0";
+
+        /**
+         * Optional description surfaced by the schema REST API.
+         */
+        private String description = "";
+    }
+
+    /**
+     * Controls when schema validation is applied.
+     */
+    public enum SchemaValidationMode {
+        /** Validate payloads only when publishing. */
+        PUBLISH,
+        /** Validate payloads only when consuming. */
+        CONSUME,
+        /** Validate on both publish and consume (default). */
+        BOTH
+    }
+
+    @Data
+    public static class SchemaProperties {
+
+        /**
+         * When {@code false} (default) the registry is not started and all publish/consume
+         * paths skip validation entirely. Set to {@code true} to activate R-7.
+         */
+        private boolean enabled = false;
+
+        /**
+         * Controls which direction is validated.
+         * Defaults to {@link SchemaValidationMode#BOTH}.
+         */
+        private SchemaValidationMode validationMode = SchemaValidationMode.BOTH;
+
+        /**
+         * When {@code true} (default) a schema violation throws
+         * {@code SchemaValidationException}, blocking the publish or consume.
+         * When {@code false} violations are logged as warnings and processing continues.
+         */
+        private boolean failOnViolation = true;
+
+        /**
+         * Schema definitions keyed by channel alias (matching {@code racer.channels.<alias>})
+         * or by literal Redis channel name.
+         *
+         * <pre>
+         * racer.schema.schemas.orders.location=classpath:schemas/orders-v1.json
+         * racer.schema.schemas.orders.version=1.0
+         * </pre>
+         */
+        private java.util.Map<String, SchemaDefinition> schemas = new java.util.LinkedHashMap<>();
+    }
+
+    /** Schema registry configuration (R-7). */
+    private SchemaProperties schema = new SchemaProperties();
 }

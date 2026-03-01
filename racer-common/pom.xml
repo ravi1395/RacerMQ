@@ -46,6 +46,12 @@
 			<artifactId>micrometer-core</artifactId>
 			<optional>true</optional>
 		</dependency>
+		<!-- JSON Schema validation (R-7) — always on classpath; feature gated by racer.schema.enabled=true -->
+		<dependency>
+			<groupId>com.networknt</groupId>
+			<artifactId>json-schema-validator</artifactId>
+			<version>1.3.3</version>
+		</dependency>
 	</dependencies>
 
 	<build>
