@@ -3,6 +3,7 @@ package com.cheetah.racer.client.service;
 import com.cheetah.racer.common.model.PriorityLevel;
 import com.cheetah.racer.common.model.RacerMessage;
 import com.cheetah.racer.common.publisher.RacerPriorityPublisher;
+import com.cheetah.racer.common.publisher.RacerPublisherRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -62,6 +63,8 @@ public class RacerPriorityConsumerService {
     private final MessageProcessor asyncProcessor;
     private final DeadLetterQueueService dlqService;
     private final ObjectMapper objectMapper;
+    /** Resolves channel aliases (e.g. {@code orders}) to their Redis channel names (e.g. {@code racer:orders}). */
+    private final RacerPublisherRegistry publisherRegistry;
 
     @Value("${racer.priority.levels:HIGH,NORMAL,LOW}")
     private String levelsConfig;
@@ -91,12 +94,14 @@ public class RacerPriorityConsumerService {
             @Qualifier("syncProcessor")  MessageProcessor syncProcessor,
             @Qualifier("asyncProcessor") MessageProcessor asyncProcessor,
             DeadLetterQueueService dlqService,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            RacerPublisherRegistry publisherRegistry) {
         this.listenerContainer = listenerContainer;
         this.syncProcessor     = syncProcessor;
         this.asyncProcessor    = asyncProcessor;
         this.dlqService        = dlqService;
         this.objectMapper      = objectMapper;
+        this.publisherRegistry = publisherRegistry;
     }
 
     @PostConstruct
@@ -225,9 +230,10 @@ public class RacerPriorityConsumerService {
 
     /**
      * Resolves configured aliases/channel names to their Redis channel keys.
-     * Supports both direct Redis channel names (e.g. {@code racer:orders}) and
-     * alias names configured under {@code racer.channels.*}.
-     * Falls back to the raw alias value when no mapping is found.
+     * Aliases defined in {@code racer.channels.*} are resolved via
+     * {@link RacerPublisherRegistry} so that the correct full Redis key (e.g.
+     * {@code racer:orders}) is used — not the short alias (e.g. {@code orders}).
+     * Raw Redis channel names (containing a colon) are passed through unchanged.
      */
     private List<String> parseChannels() {
         if (channelAliasesConfig == null || channelAliasesConfig.isBlank()) {
@@ -236,6 +242,16 @@ public class RacerPriorityConsumerService {
         return Arrays.stream(channelAliasesConfig.split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
+                .map(alias -> {
+                    // If it already looks like a full Redis key (contains ':')
+                    // use it directly; otherwise resolve via the publisher registry.
+                    if (alias.contains(":")) {
+                        return alias;
+                    }
+                    String resolved = publisherRegistry.getPublisher(alias).getChannelName();
+                    log.debug("[PRIORITY-CONSUMER] Resolved alias '{}' → channel '{}'", alias, resolved);
+                    return resolved;
+                })
                 .toList();
     }
 

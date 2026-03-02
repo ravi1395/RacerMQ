@@ -20,9 +20,12 @@ import reactor.core.scheduler.Schedulers;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * {@link BeanPostProcessor} that discovers methods annotated with {@link RacerPoll}
@@ -107,8 +110,9 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
 
         Flux<Long> ticker;
         if (!cronExpr.isEmpty()) {
+            AtomicReference<LocalDateTime> lastCronFired = new AtomicReference<>(LocalDateTime.MIN);
             ticker = Flux.interval(Duration.ofSeconds(1))
-                    .filter(n -> CronMatcher.matches(cronExpr))
+                    .filter(n -> CronMatcher.matchesOnce(cronExpr, lastCronFired))
                     .publishOn(Schedulers.boundedElastic());
         } else {
             ticker = Flux.interval(Duration.ofMillis(initialDelay), Duration.ofMillis(fixedRate))
@@ -190,6 +194,39 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
     static class CronMatcher {
         private CronMatcher() {}
 
+        /**
+         * Returns {@code true} if the given cron expression matches the current second
+         * AND this second has not already been fired (prevents duplicate firings within
+         * the same calendar second caused by jitter or multiple interval ticks).
+         *
+         * @param cron      Spring 6-field cron expression
+         * @param lastFired per-poller reference tracking the last second that fired;
+         *                  updated atomically on a successful match
+         */
+        static boolean matchesOnce(String cron, AtomicReference<LocalDateTime> lastFired) {
+            try {
+                org.springframework.scheduling.support.CronExpression expr =
+                        org.springframework.scheduling.support.CronExpression.parse(cron);
+                LocalDateTime now  = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS);
+                LocalDateTime next = expr.next(now.minusSeconds(1));
+                if (next == null || next.isAfter(now)) {
+                    return false;
+                }
+                // Atomically claim this second — only the first tick per second fires.
+                // Subsequent duplicate ticks within the same second will find `lastFired`
+                // already set to `now` and return false.
+                LocalDateTime prev = lastFired.get();
+                if (prev.equals(now)) {
+                    return false; // already fired this second
+                }
+                return lastFired.compareAndSet(prev, now);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        /** @deprecated use {@link #matchesOnce(String, AtomicReference)} to avoid duplicate fires */
+        @Deprecated
         static boolean matches(String cron) {
             try {
                 org.springframework.scheduling.support.CronExpression expr =

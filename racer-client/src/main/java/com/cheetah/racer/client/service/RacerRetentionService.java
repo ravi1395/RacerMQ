@@ -43,10 +43,10 @@ public class RacerRetentionService {
     private final DeadLetterQueueService dlqService;
     private final ObjectMapper objectMapper;
 
-    @Value("${racer.retention.stream.max-len:10000}")
+    @Value("${racer.retention.stream-max-len:10000}")
     private long streamMaxLen;
 
-    @Value("${racer.retention.dlq.max-age-hours:48}")
+    @Value("${racer.retention.dlq-max-age-hours:72}")
     private long dlqMaxAgeHours;
 
     private final AtomicLong totalStreamTrimmed = new AtomicLong(0);
@@ -68,7 +68,7 @@ public class RacerRetentionService {
      * Scheduled retention run. Default cron: top of every hour.
      * Override with {@code racer.retention.schedule.cron} in properties.
      */
-    @Scheduled(cron = "${racer.retention.schedule.cron:0 0 * * * *}")
+    @Scheduled(cron = "${racer.retention.schedule-cron:0 0 * * * *}")
     public void runRetention() {
         log.info("[racer-retention] Starting scheduled retention run (streamMaxLen={}, dlqMaxAgeHours={})",
                 streamMaxLen, dlqMaxAgeHours);

@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -107,8 +108,13 @@ public class RacerStreamConsumerService {
         // Ensure consumer groups exist, then start N consumers per stream.
         // Consumers are chained after group creation to avoid a race where a
         // consumer polls before the group exists (NOGROUP error).
+        // Retry up to 5 times with exponential back-off to handle transient
+        // Redis unavailability at startup time (BUG-8 fix).
         streamKeys.forEach(key -> {
             ensureConsumerGroup(key)
+                    .retryWhen(Retry.backoff(5, Duration.ofSeconds(2))
+                            .doBeforeRetry(rs -> log.warn("[DURABLE-CONSUMER] Retrying group creation on '{}' (attempt {})",
+                                    key, rs.totalRetries() + 1)))
                     .doOnSuccess(v -> {
                         log.info("[DURABLE-CONSUMER] Group '{}' ready on '{}'", CONSUMER_GROUP, key);
                         for (int i = 0; i < concurrency; i++) {

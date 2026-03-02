@@ -4,13 +4,12 @@ import com.cheetah.racer.common.annotation.PublishResult;
 import com.cheetah.racer.common.annotation.RacerPublisher;
 import com.cheetah.racer.common.publisher.RacerChannelPublisher;
 import com.cheetah.racer.common.publisher.RacerPublisherRegistry;
+import com.cheetah.racer.server.service.OrderEventService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Mono;
 
-import java.time.Instant;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -33,6 +32,12 @@ import java.util.stream.Collectors;
 public class ChannelRegistryController {
 
     private final RacerPublisherRegistry registry;
+
+    /**
+     * Injected separate bean so that the {@code @PublishResult} AOP aspect fires
+     * correctly (self-invocation on {@code this} bypasses the Spring proxy).
+     */
+    private final OrderEventService orderEventService;
 
     // -----------------------------------------------------------------------
     // @RacerPublisher field injection (no @Autowired needed!)
@@ -116,7 +121,7 @@ public class ChannelRegistryController {
      */
     @PostMapping("/publish-annotated")
     public Mono<Map<String, Object>> publishAnnotated(@RequestBody Map<String, Object> request) {
-        return buildOrderEvent(request);          // @PublishResult fires on the Mono result
+        return orderEventService.buildOrderEvent(request); // @PublishResult fires on the proxy
     }
 
     /**
@@ -124,14 +129,15 @@ public class ChannelRegistryController {
      * to the {@code orders} channel automatically.
      *
      * <p>The HTTP caller receives the same map that is also published to Redis.
+     *
+     * @deprecated Moved to {@link OrderEventService#buildOrderEvent} to ensure the AOP
+     *             proxy is honoured (self-invocation bypasses the aspect). Kept here
+     *             for reference only — do not call directly.
      */
+    @Deprecated
     @PublishResult(channelRef = "orders", sender = "channel-controller", async = true)
     public Mono<Map<String, Object>> buildOrderEvent(Map<String, Object> request) {
-        Map<String, Object> event = new LinkedHashMap<>(request);
-        event.put("eventType", "ORDER_CREATED");
-        event.put("processedAt", Instant.now().toString());
-        event.put("source", "racer-server");
-        return Mono.just(event);
+        return orderEventService.buildOrderEvent(request);
     }
 
     // -----------------------------------------------------------------------

@@ -60,8 +60,10 @@ public class PubSubRequestReplyService {
 
         log.info("[REQ-REPLY] Sending request correlationId={} replyTo={}", request.getCorrelationId(), replyChannel);
 
-        // 1. Subscribe to the reply channel first (so we don't miss the reply)
-        Mono<RacerReply> replyMono = listenerContainer
+        // Subscribe to the reply channel FIRST to guarantee no reply is missed,
+        // then publish the request inside doOnSubscribe so the channel is already
+        // SUBSCRIBED before the client ever sees the request.
+        return listenerContainer
                 .receive(ChannelTopic.of(replyChannel))
                 .next()                                       // take the first message
                 .map(msg -> {
@@ -72,6 +74,13 @@ public class PubSubRequestReplyService {
                     }
                 })
                 .timeout(timeout)
+                .doOnSubscribe(subscription -> {
+                    // Publish after the subscription to Redis is active
+                    publishRequest(request).subscribe(
+                            n  -> log.debug("[REQ-REPLY] Published request correlationId={}", request.getCorrelationId()),
+                            ex -> log.error("[REQ-REPLY] Failed to publish request correlationId={}: {}",
+                                    request.getCorrelationId(), ex.getMessage()));
+                })
                 .doOnNext(reply -> {
                     log.info("[REQ-REPLY] Received reply correlationId={} success={}",
                             reply.getCorrelationId(), reply.isSuccess());
@@ -81,10 +90,6 @@ public class PubSubRequestReplyService {
                 })
                 .doOnError(e -> log.warn("[REQ-REPLY] Timeout or error waiting for reply correlationId={}",
                         request.getCorrelationId()));
-
-        // 2. Publish the request, then flat-map into the waiting reply
-        return publishRequest(request)
-                .then(replyMono);
     }
 
     /**

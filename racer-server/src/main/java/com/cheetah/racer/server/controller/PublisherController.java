@@ -44,6 +44,11 @@ public class PublisherController {
         String sender   = request.getOrDefault("sender", "racer-server");
         String priority = request.get("priority"); // R-10: optional
 
+        if (payload == null || payload.isBlank()) {
+            return Mono.just(ResponseEntity.badRequest()
+                    .body(Map.of("error", "'payload' field is required")));
+        }
+
         // Route through priority publisher when a priority level is given and the bean is active
         if (priority != null && !priority.isBlank() && racerPriorityPublisher != null) {
             return racerPriorityPublisher.publish(channel, payload, sender, priority)
@@ -75,6 +80,11 @@ public class PublisherController {
         String payload = request.get("payload");
         String sender = request.getOrDefault("sender", "racer-server");
 
+        if (payload == null || payload.isBlank()) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "'payload' field is required"));
+        }
+
         Long subscribers = publisherService.publishSync(channel, payload, sender);
         return ResponseEntity.ok(Map.of(
                 "status", "published",
@@ -95,6 +105,11 @@ public class PublisherController {
         @SuppressWarnings("unchecked")
         var payloads = (java.util.List<String>) request.get("payloads");
         String sender = (String) request.getOrDefault("sender", "racer-server");
+
+        if (payloads == null || payloads.isEmpty()) {
+            return Mono.just(ResponseEntity.badRequest()
+                    .body(Map.of("error", "'payloads' field is required and must not be empty")));
+        }
 
         return reactor.core.publisher.Flux.fromIterable(payloads)
                 .flatMap(payload -> publisherService.publishAsync(channel, payload, sender))

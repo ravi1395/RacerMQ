@@ -3,6 +3,7 @@ package com.cheetah.racer.common.config;
 import com.cheetah.racer.common.model.RacerMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.ReactiveRedisConnectionFactory;
@@ -17,7 +18,14 @@ import org.springframework.data.redis.serializer.StringRedisSerializer;
 @Configuration
 public class RedisConfig {
 
+    /**
+     * Fall-back {@link ObjectMapper} used only when no other ObjectMapper bean is
+     * present in the application context (e.g. when Spring Boot's
+     * {@code JacksonAutoConfiguration} is not active). In a normal Spring Boot
+     * application the auto-configured mapper takes precedence.
+     */
     @Bean
+    @ConditionalOnMissingBean(ObjectMapper.class)
     public ObjectMapper objectMapper() {
         ObjectMapper mapper = new ObjectMapper();
         mapper.registerModule(new JavaTimeModule());
