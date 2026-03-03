@@ -1,0 +1,135 @@
+spring:
+  application:
+    name: racer-client
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # -----------------------------------------------------------------------
+      # High-Availability: Sentinel
+      # -----------------------------------------------------------------------
+      # Uncomment and fill in when running compose.sentinel.yaml:
+      # sentinel:
+      #   master: mymaster
+      #   nodes: localhost:26379,localhost:26380,localhost:26381
+
+      # HA: Cluster
+      # -----------------------------------------------------------------------
+      # Uncomment when running compose.cluster.yaml:
+      # cluster:
+      #   nodes: localhost:7001,localhost:7002,localhost:7003,localhost:7004,localhost:7005,localhost:7006
+
+server:
+  port: 8081
+
+# Initial processing mode: SYNC or ASYNC
+racer:
+  client:
+    processing-mode: ASYNC
+
+  # -----------------------------------------------------------------------
+  # Racer channel configuration
+  # -----------------------------------------------------------------------
+  default-channel: racer:messages
+
+  # The client can also declare publishers for reply / outbound channels
+  channels:
+    replies:
+      name: racer:client:replies
+      async: true
+      sender: racer-client
+    events:
+      name: racer:client:events
+      async: true
+      sender: racer-client
+
+  # -----------------------------------------------------------------------
+  # Durable stream consumer
+  # -----------------------------------------------------------------------
+  # Comma-separated list of stream keys to consume via consumer groups.
+  # Leave blank to disable the durable consumer.
+  durable:
+    stream-keys:
+
+  # -----------------------------------------------------------------------
+  # Retention (durable streams + DLQ pruning)
+  # -----------------------------------------------------------------------
+  retention:
+    stream-max-len: 10000
+    dlq-max-age-hours: 72
+    schedule-cron: "0 0 * * * *"
+
+  # -----------------------------------------------------------------------
+  # R-8: Consumer Scaling
+  # -----------------------------------------------------------------------
+  # Number of concurrent consumer instances per stream (each gets a unique name)
+  consumer:
+    concurrency: 1
+    name-prefix: consumer
+    # Entries read per poll (COUNT argument to XREADGROUP)
+    poll-batch-size: 1
+    poll-interval-ms: 200
+
+  # -----------------------------------------------------------------------
+  # R-8: Key-based stream sharding
+  # -----------------------------------------------------------------------
+  sharding:
+    enabled: false
+    shard-count: 4
+    # Comma-separated base stream keys to shard:
+    # streams: racer:orders:stream,racer:audit:stream
+
+  # -----------------------------------------------------------------------
+  # R-10: Priority channels
+  # -----------------------------------------------------------------------
+  priority:
+    enabled: false
+    levels: HIGH,NORMAL,LOW
+    strategy: strict
+    # Comma-separated base Redis channel names to subscribe to for priority routing:
+    # channels: racer:orders,racer:notifications
+
+  # -----------------------------------------------------------------------
+  # Pub/Sub concurrency (R-11)
+  # -----------------------------------------------------------------------
+  # Max messages processed concurrently on the Pub/Sub consumer path.
+  # Default 256 (Reactor default). Set to 1 for strictly serial processing.
+  pubsub:
+    concurrency: 256
+
+  # -----------------------------------------------------------------------
+  # R-11: Scheduled Polling (@RacerPoll)
+  # -----------------------------------------------------------------------
+  # poll:
+  #   enabled: true
+
+  # -----------------------------------------------------------------------
+  # R-7: Schema Registry (JSON Schema validation)
+  # -----------------------------------------------------------------------
+  schema:
+    enabled: false
+    # validation-mode: BOTH
+    # fail-on-violation: true
+    # schemas:
+    #   replies:
+    #     location: classpath:schemas/reply-schema.json
+
+# -----------------------------------------------------------------------
+# Actuator / Observability
+# -----------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+# Logging
+logging:
+  level:
+    com.cheetah.racer: DEBUG
