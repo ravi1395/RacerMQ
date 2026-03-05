@@ -2,7 +2,10 @@ package com.cheetah.racer.stream;
 
 import com.cheetah.racer.annotation.ConcurrencyMode;
 import com.cheetah.racer.annotation.RacerStreamListener;
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreaker;
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
 import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.dedup.RacerDedupService;
 import com.cheetah.racer.listener.RacerDeadLetterHandler;
 import com.cheetah.racer.metrics.RacerMetrics;
 import com.cheetah.racer.model.RacerMessage;
@@ -27,6 +30,7 @@ import reactor.util.retry.Retry;
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -69,6 +73,47 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
     private final List<Disposable>              subscriptions    = new ArrayList<>();
     private final Map<String, AtomicLong>       processedCounts  = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong>       failedCounts     = new ConcurrentHashMap<>();
+
+    // ── Phase 3 optional extensions ─────────────────────────────────────────
+
+    /** Injected when {@code racer.dedup.enabled=true}. */
+    @Nullable
+    private RacerDedupService dedupService;
+
+    /** Injected when {@code racer.circuit-breaker.enabled=true}. */
+    @Nullable
+    private RacerCircuitBreakerRegistry circuitBreakerRegistry;
+
+    /**
+     * When non-zero, overrides the annotation-defined poll interval for all stream listeners.
+     * Set by {@link com.cheetah.racer.backpressure.RacerBackPressureMonitor}.
+     * Value 0 means “use the annotation value”.
+     */
+    private final AtomicLong backPressurePollOverrideMs = new AtomicLong(0);
+
+    /** (streamKey, group) pairs that have been registered, used by {@link RacerConsumerLagMonitor}. */
+    private final Map<String, String> trackedStreamGroups = new ConcurrentHashMap<>();
+
+    public void setDedupService(RacerDedupService dedupService) {
+        this.dedupService = dedupService;
+    }
+
+    public void setCircuitBreakerRegistry(RacerCircuitBreakerRegistry circuitBreakerRegistry) {
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
+    }
+
+    /**
+     * Called by {@link com.cheetah.racer.backpressure.RacerBackPressureMonitor}.
+     * Pass {@code 0} to revert to the annotation-defined interval.
+     */
+    public void setBackPressurePollIntervalMs(long ms) {
+        backPressurePollOverrideMs.set(ms);
+    }
+
+    /** Returns registered (streamKey → group) pairs for consumer-lag tracking. */
+    public Map<String, String> getTrackedStreamGroups() {
+        return Collections.unmodifiableMap(trackedStreamGroups);
+    }
 
     public RacerStreamListenerRegistrar(
             ReactiveRedisTemplate<String, String> redisTemplate,
@@ -140,6 +185,9 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
         processedCounts.put(listenerId, new AtomicLong(0));
         failedCounts.put(listenerId,    new AtomicLong(0));
 
+        // Register for consumer-lag tracking (3.4)
+        trackedStreamGroups.put(streamKey, group);
+
         log.info("[RACER-STREAM-LISTENER] Registering {}.{}() <- stream '{}' group='{}' mode={} concurrency={}",
                 beanName, method.getName(), streamKey, group, ann.mode(), concurrencyN);
 
@@ -176,7 +224,11 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                                      String streamKey, String group, String consumer,
                                      int batchSize, Duration pollInterval, String listenerId) {
         return Flux.defer(() -> pollOnce(bean, method, streamKey, group, consumer, batchSize, listenerId))
-                .repeatWhen(completed -> completed.delayElements(pollInterval))
+                .repeatWhen(completed -> completed.flatMap(v -> {
+                    long overrideMs = backPressurePollOverrideMs.get();
+                    long delayMs = overrideMs > 0 ? overrideMs : pollInterval.toMillis();
+                    return Mono.delay(Duration.ofMillis(delayMs));
+                }))
                 .onErrorContinue((ex, o) ->
                         log.error("[RACER-STREAM-LISTENER] Poll error on '{}': {}", streamKey, ex.getMessage()));
     }
@@ -207,6 +259,16 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
         RecordId recordId = record.getId();
         Map<Object, Object> fields = record.getValue();
 
+        // 0a. Circuit breaker gate
+        RacerCircuitBreaker cb = circuitBreakerRegistry != null
+                ? circuitBreakerRegistry.getOrCreate(listenerId) : null;
+        if (cb != null && !cb.isCallPermitted()) {
+            log.debug("[RACER-STREAM-LISTENER] '{}' circuit {} — skipping record {}",
+                    listenerId, cb.getState(), recordId);
+            // ACK to avoid building up pending entries while the circuit is open
+            return ackRecord(streamKey, group, recordId);
+        }
+
         // The data field carries the serialized RacerMessage envelope
         Object raw = fields.get(DEFAULT_DATA_FIELD);
         if (raw == null) {
@@ -224,12 +286,36 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             return ackRecord(streamKey, group, recordId);
         }
 
+        // 0b. Deduplication check
+        if (dedupService != null) {
+            return dedupService.checkAndMarkProcessed(message.getId())
+                    .flatMap(shouldProcess -> {
+                        if (!shouldProcess) {
+                            log.debug("[RACER-STREAM-LISTENER] '{}' duplicate id={} — skipping record {}",
+                                    listenerId, message.getId(), recordId);
+                            return ackRecord(streamKey, group, recordId);
+                        }
+                        return processChecked(bean, method, streamKey, group, record, listenerId, message, cb);
+                    });
+        }
+
+        return processChecked(bean, method, streamKey, group, record, listenerId, message, cb);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private Mono<Void> processChecked(Object bean, Method method,
+                                      String streamKey, String group,
+                                      MapRecord<String, Object, Object> record, String listenerId,
+                                      RacerMessage message, @Nullable RacerCircuitBreaker cb) {
+        RecordId recordId = record.getId();
+
         // Schema validation
         if (racerSchemaRegistry != null) {
             try {
                 racerSchemaRegistry.validateForConsume(streamKey, message.getPayload());
             } catch (Exception e) {
                 log.warn("[RACER-STREAM-LISTENER] '{}' schema validation failed for {}: {}", listenerId, recordId, e.getMessage());
+                if (cb != null) cb.onFailure();
                 return enqueueDeadLetter(message, e)
                         .then(ackRecord(streamKey, group, recordId))
                         .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet());
@@ -242,6 +328,7 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             arg = resolveArgument(method, message);
         } catch (Exception e) {
             log.error("[RACER-STREAM-LISTENER] '{}' — cannot resolve argument for {}: {}", listenerId, recordId, e.getMessage());
+            if (cb != null) cb.onFailure();
             return enqueueDeadLetter(message, e)
                     .then(ackRecord(streamKey, group, recordId))
                     .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet());
@@ -265,6 +352,7 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                 .then(ackRecord(streamKey, group, recordId))
                 .doOnSuccess(v -> {
                     processedCounts.get(listenerId).incrementAndGet();
+                    if (cb != null) cb.onSuccess();
                     if (racerMetrics != null) {
                         racerMetrics.recordConsumed(streamKey, listenerId);
                     }
@@ -273,6 +361,7 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                 .onErrorResume(ex -> {
                     failedCounts.get(listenerId).incrementAndGet();
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    if (cb != null) cb.onFailure();
                     log.error("[RACER-STREAM-LISTENER] '{}' failed entry {}: {}", listenerId, recordId, cause.getMessage(), cause);
                     return enqueueDeadLetter(captured, cause)
                             .then(ackRecord(streamKey, group, recordId));

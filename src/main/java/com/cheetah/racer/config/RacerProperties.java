@@ -439,4 +439,150 @@ public class RacerProperties {
 
     /** Dedicated listener thread-pool configuration. */
     private ThreadPoolProperties threadPool = new ThreadPoolProperties();
+
+    // ── 3.1 Message Deduplication ────────────────────────────────────────────
+
+    /**
+     * Idempotency settings for message deduplication.
+     * Mapped under {@code racer.dedup.*}.
+     */
+    @Data
+    public static class DedupProperties {
+
+        /**
+         * When {@code false} (default) the dedup service is not registered.
+         * Set to {@code true} to enable opt-in deduplication via
+         * {@code @RacerListener(dedup = true)}.
+         */
+        private boolean enabled = false;
+
+        /**
+         * How long (in seconds) a processed message ID is remembered.
+         * Messages with the same ID that arrive within this window are silently dropped.
+         * Defaults to {@code 300} (5 minutes).
+         */
+        private int ttlSeconds = 300;
+
+        /**
+         * Redis key prefix for dedup entries.
+         * The full key is {@code <keyPrefix><messageId>}.
+         * Defaults to {@code "racer:dedup:"}.
+         */
+        private String keyPrefix = "racer:dedup:";
+    }
+
+    /** Deduplication configuration (3.1). */
+    private DedupProperties dedup = new DedupProperties();
+
+    // ── 3.2 Circuit Breaker ──────────────────────────────────────────────────
+
+    /**
+     * Built-in circuit breaker settings.
+     * Mapped under {@code racer.circuit-breaker.*}.
+     */
+    @Data
+    public static class CircuitBreakerProperties {
+
+        /**
+         * When {@code false} (default) no circuit breakers are created.
+         * Set to {@code true} to wrap each listener dispatch with a circuit breaker.
+         */
+        private boolean enabled = false;
+
+        /**
+         * Percentage of failures in the sliding window that triggers the OPEN state.
+         * Range: {@code 1–100}. Defaults to {@code 50} (50%).
+         */
+        private float failureRateThreshold = 50.0f;
+
+        /**
+         * Number of calls tracked in the count-based sliding window.
+         * Defaults to {@code 10}.
+         */
+        private int slidingWindowSize = 10;
+
+        /**
+         * How long (in seconds) the circuit stays OPEN before transitioning to HALF_OPEN.
+         * Defaults to {@code 30}.
+         */
+        private int waitDurationInOpenStateSeconds = 30;
+
+        /**
+         * Number of probe calls allowed in the HALF_OPEN state.
+         * If all succeed the circuit closes; any failure re-opens it.
+         * Defaults to {@code 3}.
+         */
+        private int permittedCallsInHalfOpenState = 3;
+    }
+
+    /** Circuit breaker configuration (3.2). */
+    private CircuitBreakerProperties circuitBreaker = new CircuitBreakerProperties();
+
+    // ── 3.3 Back-pressure ────────────────────────────────────────────────────
+
+    /**
+     * Back-pressure signalling settings.
+     * Mapped under {@code racer.backpressure.*}.
+     */
+    @Data
+    public static class BackPressureProperties {
+
+        /**
+         * When {@code false} (default) back-pressure monitoring is disabled.
+         */
+        private boolean enabled = false;
+
+        /**
+         * Queue-fill ratio ({@code 0.0–1.0}) above which back-pressure is activated.
+         * Defaults to {@code 0.80} (80% full).
+         */
+        private double queueThreshold = 0.80;
+
+        /**
+         * How often (milliseconds) the back-pressure monitor checks the queue fill ratio.
+         * Defaults to {@code 1000} ms.
+         */
+        private long checkIntervalMs = 1_000;
+
+        /**
+         * Poll interval (milliseconds) applied to all {@code @RacerStreamListener} loops
+         * while back-pressure is active.
+         * Defaults to {@code 2000} ms.
+         */
+        private long streamPollBackoffMs = 2_000;
+    }
+
+    /** Back-pressure monitoring configuration (3.3). */
+    private BackPressureProperties backpressure = new BackPressureProperties();
+
+    // ── 3.4 Consumer Group Lag ───────────────────────────────────────────────
+
+    /**
+     * Consumer-group lag dashboard settings.
+     * Mapped under {@code racer.consumer-lag.*}.
+     */
+    @Data
+    public static class ConsumerLagProperties {
+
+        /**
+         * When {@code false} (default) lag metrics are not scraped.
+         * Requires {@code racer.consumer-lag.enabled=true} AND Micrometer on the classpath.
+         */
+        private boolean enabled = false;
+
+        /**
+         * How often (seconds) XPENDING is issued per (stream, group) pair.
+         * Defaults to {@code 15}.
+         */
+        private int scrapeIntervalSeconds = 15;
+
+        /**
+         * Lag value above which a WARN log is emitted on each scrape cycle.
+         * Defaults to {@code 1000}.
+         */
+        private long lagWarnThreshold = 1_000;
+    }
+
+    /** Consumer-group lag configuration (3.4). */
+    private ConsumerLagProperties consumerLag = new ConsumerLagProperties();
 }

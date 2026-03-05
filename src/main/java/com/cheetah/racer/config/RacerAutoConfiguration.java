@@ -1,6 +1,9 @@
 package com.cheetah.racer.config;
 
 import com.cheetah.racer.aspect.PublishResultAspect;
+import com.cheetah.racer.backpressure.RacerBackPressureMonitor;
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
+import com.cheetah.racer.dedup.RacerDedupService;
 import com.cheetah.racer.listener.RacerDeadLetterHandler;
 import com.cheetah.racer.listener.RacerListenerRegistrar;
 import com.cheetah.racer.metrics.RacerMetrics;
@@ -17,6 +20,7 @@ import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.cheetah.racer.service.DeadLetterQueueService;
 import com.cheetah.racer.service.DlqReprocessorService;
 import com.cheetah.racer.service.RacerRetentionService;
+import com.cheetah.racer.stream.RacerConsumerLagMonitor;
 import com.cheetah.racer.stream.RacerStreamListenerRegistrar;
 import com.cheetah.racer.tx.RacerTransaction;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -201,20 +205,19 @@ public class RacerAutoConfiguration {
     // ── Dedicated listener thread pool ───────────────────────────────────────
 
     /**
-     * A Reactor {@link Scheduler} backed by a configurable, Racer-owned thread pool.
+     * The Racer-owned thread pool that backs all {@code @RacerListener} handler invocations.
      *
-     * <p>All {@code @RacerListener} handler invocations run on this scheduler instead of
-     * the JVM-wide {@code Schedulers.boundedElastic()}, so listener workloads cannot
-     * starve other framework or application code that also uses boundedElastic.
+     * <p>Exposed as a named bean so that {@link RacerBackPressureMonitor} and
+     * {@link RacerMetrics#registerThreadPoolGauges} can consume it without circular
+     * dependencies.  The scheduler wrapper's {@code dispose()} will call
+     * {@code executor.shutdown()}, so no explicit destroy-method is needed here.
      *
-     * <p>Pool size is controlled by {@code racer.thread-pool.*} properties. Defaults:
-     * core={@code 2×CPU}, max={@code 10×CPU}, queue=1 000, keep-alive=60 s.
-     *
-     * <p>The scheduler (and the underlying thread pool) is shut down automatically when
-     * the Spring context closes.
+     * <p>Pool size is controlled by {@code racer.thread-pool.*} properties.
      */
-    @Bean(destroyMethod = "dispose")
-    public Scheduler racerListenerScheduler(RacerProperties racerProperties) {
+    @Bean
+    public ThreadPoolExecutor racerListenerExecutor(
+            RacerProperties racerProperties,
+            Optional<RacerMetrics> racerMetrics) {
         RacerProperties.ThreadPoolProperties tp = racerProperties.getThreadPool();
         AtomicInteger counter = new AtomicInteger(1);
         ThreadPoolExecutor executor = new ThreadPoolExecutor(
@@ -228,7 +231,18 @@ public class RacerAutoConfiguration {
                     return t;
                 });
         executor.allowCoreThreadTimeOut(false);
-        return Schedulers.fromExecutorService(executor, "racer-listener");
+        racerMetrics.ifPresent(m -> m.registerThreadPoolGauges(executor));
+        return executor;
+    }
+
+    /**
+     * A Reactor {@link Scheduler} backed by the Racer-owned thread pool.
+     *
+     * <p>Scheduler disposal (on context close) will shut down the backing executor.
+     */
+    @Bean(destroyMethod = "dispose")
+    public Scheduler racerListenerScheduler(ThreadPoolExecutor racerListenerExecutor) {
+        return Schedulers.fromExecutorService(racerListenerExecutor, "racer-listener");
     }
 
     // ── @RacerListener registrar ─────────────────────────────────────────
@@ -251,8 +265,10 @@ public class RacerAutoConfiguration {
             Optional<RacerMetrics> racerMetrics,
             Optional<RacerSchemaRegistry> racerSchemaRegistry,
             Optional<RacerRouterService> racerRouterService,
-            Optional<RacerDeadLetterHandler> deadLetterHandler) {
-        return new RacerListenerRegistrar(
+            Optional<RacerDeadLetterHandler> deadLetterHandler,
+            Optional<RacerDedupService> racerDedupService,
+            Optional<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry) {
+        RacerListenerRegistrar registrar = new RacerListenerRegistrar(
                 listenerContainer,
                 objectMapper,
                 racerProperties,
@@ -261,6 +277,9 @@ public class RacerAutoConfiguration {
                 racerSchemaRegistry.orElse(null),
                 racerRouterService.orElse(null),
                 deadLetterHandler.orElse(null));
+        racerDedupService.ifPresent(registrar::setDedupService);
+        racerCircuitBreakerRegistry.ifPresent(registrar::setCircuitBreakerRegistry);
+        return registrar;
     }
 
     // ── Dead Letter Queue ────────────────────────────────────────────────────
@@ -312,17 +331,92 @@ public class RacerAutoConfiguration {
             ObjectMapper objectMapper,
             Optional<RacerMetrics> racerMetrics,
             Optional<RacerSchemaRegistry> racerSchemaRegistry,
-            Optional<RacerDeadLetterHandler> deadLetterHandler) {
-        return new RacerStreamListenerRegistrar(
+            Optional<RacerDeadLetterHandler> deadLetterHandler,
+            Optional<RacerDedupService> racerDedupService,
+            Optional<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry) {
+        RacerStreamListenerRegistrar registrar = new RacerStreamListenerRegistrar(
                 reactiveStringRedisTemplate,
                 objectMapper,
                 racerProperties,
                 racerMetrics.orElse(null),
                 racerSchemaRegistry.orElse(null),
                 deadLetterHandler.orElse(null));
+        racerDedupService.ifPresent(registrar::setDedupService);
+        racerCircuitBreakerRegistry.ifPresent(registrar::setCircuitBreakerRegistry);
+        return registrar;
     }
 
-    // ── @RacerResponder registrar ────────────────────────────────────────────
+    // ── Phase 3: Message deduplication ───────────────────────────────────────
+
+    /**
+     * Activated via {@code racer.dedup.enabled=true}.
+     * Uses Redis {@code SET NX EX} to suppress duplicate message processing.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.dedup.enabled", havingValue = "true")
+    public RacerDedupService racerDedupService(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            RacerProperties racerProperties) {
+        return new RacerDedupService(reactiveStringRedisTemplate, racerProperties);
+    }
+
+    // ── Phase 3: Circuit breaker ──────────────────────────────────────────────
+
+    /**
+     * Activated via {@code racer.circuit-breaker.enabled=true}.
+     * Provides per-listener count-based sliding-window circuit breakers.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.circuit-breaker.enabled", havingValue = "true")
+    public RacerCircuitBreakerRegistry racerCircuitBreakerRegistry(RacerProperties racerProperties) {
+        return new RacerCircuitBreakerRegistry(racerProperties);
+    }
+
+    // ── Phase 3: Back-pressure monitoring ─────────────────────────────────────
+
+    /**
+     * Activated via {@code racer.backpressure.enabled=true}.
+     * Monitors the listener thread-pool queue and throttles message consumption
+     * when the fill ratio exceeds {@code racer.backpressure.queue-threshold}.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.backpressure.enabled", havingValue = "true")
+    public RacerBackPressureMonitor racerBackPressureMonitor(
+            ThreadPoolExecutor racerListenerExecutor,
+            RacerProperties racerProperties,
+            Optional<RacerListenerRegistrar> racerListenerRegistrar,
+            Optional<RacerStreamListenerRegistrar> racerStreamListenerRegistrar,
+            Optional<RacerMetrics> racerMetrics) {
+        return new RacerBackPressureMonitor(
+                racerListenerExecutor,
+                racerProperties,
+                racerListenerRegistrar.orElse(null),
+                racerStreamListenerRegistrar.orElse(null),
+                racerMetrics.orElse(null));
+    }
+
+    // ── Phase 3: Consumer group lag dashboard ────────────────────────────────
+
+    /**
+     * Activated via {@code racer.consumer-lag.enabled=true} when Micrometer is present.
+     * Periodically publishes {@code XPENDING} lag as Micrometer gauges.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.consumer-lag.enabled", havingValue = "true")
+    @ConditionalOnBean(RacerMetrics.class)
+    public RacerConsumerLagMonitor racerConsumerLagMonitor(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            RacerMetrics racerMetrics,
+            RacerProperties racerProperties,
+            Optional<RacerStreamListenerRegistrar> streamRegistrar) {
+        RacerConsumerLagMonitor monitor =
+                new RacerConsumerLagMonitor(reactiveStringRedisTemplate, racerMetrics, racerProperties);
+        // Bootstrap lag tracking from streams already registered by RacerStreamListenerRegistrar
+        streamRegistrar.ifPresent(r -> r.getTrackedStreamGroups().forEach(monitor::trackStream));
+        return monitor;
+    }
+
+    // ── Request–Reply responder registrar ────────────────────────────────────
 
     @Bean
     public RacerResponderRegistrar racerResponderRegistrar(

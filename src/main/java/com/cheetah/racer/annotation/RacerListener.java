@@ -108,4 +108,18 @@ public @interface RacerListener {
      * If empty, defaults to {@code "<beanName>.<methodName>"}.
      */
     String id() default "";
+
+    /**
+     * When {@code true}, enables idempotency deduplication for this listener.
+     *
+     * <p>Before dispatching each message, the listener checks whether the message's
+     * {@code id} field has been processed recently (within {@code racer.dedup.ttl-seconds}).
+     * Duplicate messages are silently dropped without invoking the handler.
+     *
+     * <p>Requires {@code racer.dedup.enabled=true}. When the global flag is off, this
+     * per-listener setting is ignored and all messages flow through normally.
+     *
+     * @see com.cheetah.racer.dedup.RacerDedupService
+     */
+    boolean dedup() default false;
 }

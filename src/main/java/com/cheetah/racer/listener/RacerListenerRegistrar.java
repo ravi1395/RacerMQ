@@ -2,7 +2,10 @@ package com.cheetah.racer.listener;
 
 import com.cheetah.racer.annotation.ConcurrencyMode;
 import com.cheetah.racer.annotation.RacerListener;
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreaker;
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
 import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.dedup.RacerDedupService;
 import com.cheetah.racer.metrics.RacerMetrics;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.router.RacerRouterService;
@@ -30,6 +33,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -101,6 +105,39 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
 
     /** Adaptive tuners for AUTO-mode listeners — shut down on application stop. */
     private final Map<String, AdaptiveConcurrencyTuner> tuners = new ConcurrentHashMap<>();
+
+    // ── Phase 3 optional extensions ─────────────────────────────────────────
+
+    /** Injected when {@code racer.dedup.enabled=true}. */
+    @Nullable
+    private RacerDedupService dedupService;
+
+    /** Injected when {@code racer.circuit-breaker.enabled=true}. */
+    @Nullable
+    private RacerCircuitBreakerRegistry circuitBreakerRegistry;
+
+    /** Set by {@link com.cheetah.racer.backpressure.RacerBackPressureMonitor}. */
+    private final AtomicBoolean backPressureActive = new AtomicBoolean(false);
+
+    public void setDedupService(RacerDedupService dedupService) {
+        this.dedupService = dedupService;
+    }
+
+    public void setCircuitBreakerRegistry(RacerCircuitBreakerRegistry circuitBreakerRegistry) {
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
+    }
+
+    /**
+     * Called by {@link com.cheetah.racer.backpressure.RacerBackPressureMonitor} when the
+     * thread-pool queue fill ratio crosses the configured threshold.
+     * While {@code active=true} all incoming Pub/Sub messages are silently dropped.
+     */
+    public void setBackPressureActive(boolean active) {
+        boolean previous = backPressureActive.getAndSet(active);
+        if (active != previous) {
+            log.info("[RACER-LISTENER] Back-pressure {}", active ? "ACTIVATED — dropping pub/sub messages" : "RELIEVED — resuming pub/sub dispatch");
+        }
+    }
 
     /** Constructor used by tests and legacy code — falls back to {@code boundedElastic()}. */
     public RacerListenerRegistrar(
@@ -198,6 +235,8 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
         processedCounts.put(listenerId, new AtomicLong(0));
         failedCounts.put(listenerId,    new AtomicLong(0));
 
+        final boolean dedupEnabled = ann.dedup();
+
         if (ann.mode() == ConcurrencyMode.AUTO) {
             AdaptiveConcurrencyTuner tuner = new AdaptiveConcurrencyTuner(
                     listenerId,
@@ -206,8 +245,8 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                     racerProperties.getThreadPool().getMaxSize());
             tuners.put(listenerId, tuner);
 
-            log.info("[RACER-LISTENER] Registered {}.{}() <- channel '{}' (mode=AUTO, initial-concurrency={})",
-                    beanName, method.getName(), resolvedChannel, tuner.getConcurrency());
+            log.info("[RACER-LISTENER] Registered {}.{}() <- channel '{}' (mode=AUTO, initial-concurrency={}, dedup={})",
+                    beanName, method.getName(), resolvedChannel, tuner.getConcurrency(), dedupEnabled);
 
             // flatMap has no reactive cap (Integer.MAX_VALUE); the semaphore inside
             // AdaptiveConcurrencyTuner is the sole throttle and is dynamically resized.
@@ -217,7 +256,7 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                             Mono.fromCallable(() -> { tuner.acquireSlot(); return msg; })
                                     .subscribeOn(listenerScheduler)
                                     .flatMap(m ->
-                                            dispatch(bean, method, m, listenerId, resolvedChannel)
+                                            dispatch(bean, method, m, listenerId, resolvedChannel, dedupEnabled)
                                                     .doFinally(signal -> tuner.releaseSlot()))
                                     .onErrorResume(ex -> {
                                         if (ex instanceof InterruptedException) {
@@ -239,14 +278,14 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                     ? 1
                     : Math.max(1, ann.concurrency());
 
-            log.info("[RACER-LISTENER] Registered {}.{}() <- channel '{}' (mode={}, concurrency={})",
+            log.info("[RACER-LISTENER] Registered {}.{}() <- channel '{}' (mode={}, concurrency={}, dedup={})",
                     beanName, method.getName(), resolvedChannel,
-                    ann.mode(), effectiveConcurrency);
+                    ann.mode(), effectiveConcurrency, dedupEnabled);
 
             Disposable sub = listenerContainer
                     .receive(ChannelTopic.of(resolvedChannel))
                     .flatMap(
-                            msg -> dispatch(bean, method, msg, listenerId, resolvedChannel),
+                            msg -> dispatch(bean, method, msg, listenerId, resolvedChannel, dedupEnabled),
                             effectiveConcurrency)
                     .subscribe(
                             v  -> {},
@@ -262,8 +301,24 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
     @SuppressWarnings({"unchecked", "rawtypes"})
     private Mono<Void> dispatch(Object bean, Method method,
                                 ReactiveSubscription.Message<String, String> redisMsg,
-                                String listenerId, String channel) {
+                                String listenerId, String channel, boolean dedupEnabled) {
         return Mono.defer(() -> {
+
+            // 0a. Back-pressure gate — silently drop when queue is saturated
+            if (backPressureActive.get()) {
+                log.debug("[RACER-LISTENER] '{}' back-pressure active — dropping message", listenerId);
+                return Mono.empty();
+            }
+
+            // 0b. Circuit breaker gate
+            RacerCircuitBreaker cb = circuitBreakerRegistry != null
+                    ? circuitBreakerRegistry.getOrCreate(listenerId) : null;
+            if (cb != null && !cb.isCallPermitted()) {
+                log.debug("[RACER-LISTENER] '{}' circuit {} — skipping message",
+                        listenerId, cb.getState());
+                return Mono.empty();
+            }
+
             RacerMessage message;
             try {
                 message = objectMapper.readValue(redisMsg.getMessage(), RacerMessage.class);
@@ -275,76 +330,101 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
 
             log.debug("[RACER-LISTENER] '{}' received message id={}", listenerId, message.getId());
 
-            // 1. Content-based routing — re-publish & skip local dispatch if a rule matches
-            if (racerRouterService != null && racerRouterService.route(message)) {
-                log.debug("[RACER-LISTENER] '{}' message id={} routed — skipping local dispatch",
-                        listenerId, message.getId());
-                return Mono.empty();
+            // 1. Deduplication check
+            if (dedupEnabled && dedupService != null) {
+                return dedupService.checkAndMarkProcessed(message.getId())
+                        .flatMap(shouldProcess -> {
+                            if (!shouldProcess) {
+                                log.debug("[RACER-LISTENER] '{}' duplicate id={} — skipped",
+                                        listenerId, message.getId());
+                                return Mono.<Void>empty();
+                            }
+                            return dispatchChecked(bean, method, message, listenerId, channel, cb);
+                        });
             }
 
-            // 2. Schema validation
-            if (racerSchemaRegistry != null) {
-                try {
-                    racerSchemaRegistry.validateForConsume(channel, message.getPayload());
-                } catch (SchemaValidationException e) {
-                    log.warn("[RACER-LISTENER] '{}' schema validation failed for id={}: {}",
-                            listenerId, message.getId(), e.getMessage());
-                    return enqueueDeadLetter(message, e)
-                            .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
-                            .then();
-                }
-            }
+            return dispatchChecked(bean, method, message, listenerId, channel, cb);
+        });
+    }
 
-            // 3. Resolve method argument
-            Object arg;
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private Mono<Void> dispatchChecked(Object bean, Method method,
+                                       RacerMessage message,
+                                       String listenerId, String channel,
+                                       @Nullable RacerCircuitBreaker cb) {
+        // 2. Content-based routing — re-publish & skip local dispatch if a rule matches
+        if (racerRouterService != null && racerRouterService.route(message)) {
+            log.debug("[RACER-LISTENER] '{}' message id={} routed — skipping local dispatch",
+                    listenerId, message.getId());
+            return Mono.empty();
+        }
+
+        // 3. Schema validation
+        if (racerSchemaRegistry != null) {
             try {
-                arg = resolveArgument(method, message);
-            } catch (Exception e) {
-                log.error("[RACER-LISTENER] '{}' — cannot resolve argument for id={}: {}",
+                racerSchemaRegistry.validateForConsume(channel, message.getPayload());
+            } catch (SchemaValidationException e) {
+                log.warn("[RACER-LISTENER] '{}' schema validation failed for id={}: {}",
                         listenerId, message.getId(), e.getMessage());
+                if (cb != null) cb.onFailure();
                 return enqueueDeadLetter(message, e)
                         .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
                         .then();
             }
+        }
 
-            // 4. Invoke and handle return type
-            final Object resolvedArg = arg;
-            final boolean isNoArg = method.getParameterCount() == 0;
-            final RacerMessage captured = message;
+        // 4. Resolve method argument
+        Object arg;
+        try {
+            arg = resolveArgument(method, message);
+        } catch (Exception e) {
+            log.error("[RACER-LISTENER] '{}' — cannot resolve argument for id={}: {}",
+                    listenerId, message.getId(), e.getMessage());
+            if (cb != null) cb.onFailure();
+            return enqueueDeadLetter(message, e)
+                    .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
+                    .then();
+        }
 
-            Mono<Void> invocation = Mono
-                    .fromCallable(() -> isNoArg
-                            ? method.invoke(bean)
-                            : method.invoke(bean, resolvedArg))
-                    .subscribeOn(listenerScheduler)
-                    .flatMap(result -> {
-                        if (result instanceof Mono<?> mono) {
-                            return mono.then();
-                        }
-                        return Mono.<Void>empty();
-                    });
+        // 5. Invoke and handle return type
+        final Object resolvedArg = arg;
+        final boolean isNoArg = method.getParameterCount() == 0;
+        final RacerMessage captured = message;
 
-            return invocation
-                    .doOnSuccess(v -> {
-                        processedCounts.get(listenerId).incrementAndGet();
-                        if (racerMetrics != null) {
-                            racerMetrics.recordConsumed(channel,
-                                    listenerId.contains(".") ? listenerId.split("\\.")[1] : listenerId);
-                        }
-                        log.debug("[RACER-LISTENER] '{}' processed id={}",
-                                listenerId, captured.getId());
-                    })
-                    .onErrorResume((Throwable ex) -> {
-                        failedCounts.get(listenerId).incrementAndGet();
-                        Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-                        log.error("[RACER-LISTENER] '{}' failed processing id={}: {}",
-                                listenerId, captured.getId(), cause.getMessage(), cause);
-                        if (racerMetrics != null) {
-                            racerMetrics.recordFailed(channel, cause.getClass().getSimpleName());
-                        }
-                        return enqueueDeadLetter(captured, cause).then();
-                    });
-        });
+        Mono<Void> invocation = Mono
+                .fromCallable(() -> isNoArg
+                        ? method.invoke(bean)
+                        : method.invoke(bean, resolvedArg))
+                .subscribeOn(listenerScheduler)
+                .flatMap(result -> {
+                    if (result instanceof Mono<?> mono) {
+                        return mono.then();
+                    }
+                    return Mono.<Void>empty();
+                });
+
+        return invocation
+                .doOnSuccess(v -> {
+                    processedCounts.get(listenerId).incrementAndGet();
+                    if (cb != null) cb.onSuccess();
+                    if (racerMetrics != null) {
+                        racerMetrics.recordConsumed(channel,
+                                listenerId.contains(".") ? listenerId.split("\\.")[1] : listenerId);
+                    }
+                    log.debug("[RACER-LISTENER] '{}' processed id={}",
+                            listenerId, captured.getId());
+                })
+                .onErrorResume((Throwable ex) -> {
+                    failedCounts.get(listenerId).incrementAndGet();
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    if (cb != null) cb.onFailure();
+                    log.error("[RACER-LISTENER] '{}' failed processing id={}: {}",
+                            listenerId, captured.getId(), cause.getMessage(), cause);
+                    if (racerMetrics != null) {
+                        racerMetrics.recordFailed(channel, cause.getClass().getSimpleName());
+                    }
+                    return enqueueDeadLetter(captured, cause).then();
+                });
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
