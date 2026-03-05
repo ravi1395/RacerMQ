@@ -27,6 +27,10 @@ implementation("com.cheetah:racer-starter:0.0.1-SNAPSHOT")
 | `@EnableRacer` | Explicit opt-in (still works, but no longer required) |
 | `@RacerPublisher` | Field-inject a `RacerChannelPublisher` for any named channel |
 | `@PublishResult` | Auto-publish method return values to Redis channels |
+| `@RacerListener` | Declaratively subscribe a method to a Redis Pub/Sub channel |
+| `@RacerStreamListener` | Subscribe a method to a Redis Stream with configurable concurrency |
+| `@RacerResponder` | Mark a method as a request-reply handler (Pub/Sub or Stream transport) |
+| `@RacerClient` / `@EnableRacerClients` | Generate type-safe request-reply client proxies |
 | `RacerProperties` | `racer.default-channel`, `racer.channels.<alias>.*` config |
 | `RacerPublisherRegistry` | Programmatic access to all registered channel publishers |
 | Models | `RacerMessage`, `RacerRequest`, `RacerReply`, `DeadLetterMessage` |
@@ -68,31 +72,14 @@ class OrderService {
 }
 ```
 
-## Importing server/client services as libraries
+## Running the demo
 
-`racer-server` and `racer-client` also produce importable library JARs
-(in addition to executable Boot JARs). To import server-side services:
+`racer-demo` is the reference application bundled with this repository. It demonstrates
+all of the above features with sample listeners, publishers, and responders on port 8080:
 
-```xml
-<dependency>
-    <groupId>com.cheetah</groupId>
-    <artifactId>racer-server</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-</dependency>
-```
-
-To import client-side services (consumer, DLQ, responders):
-
-```xml
-<dependency>
-    <groupId>com.cheetah</groupId>
-    <artifactId>racer-client</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-</dependency>
-```
-
-The executable Boot JARs are available with classifier `exec`:
 ```bash
-java -jar racer-server-0.0.1-SNAPSHOT-exec.jar
-java -jar racer-client-0.0.1-SNAPSHOT-exec.jar
+# from the root of the Racer repository
+mvn -pl :racer-demo spring-boot:run
 ```
+
+The demo requires Redis to be running (see `compose.yaml` at the repository root).

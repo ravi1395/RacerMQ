@@ -1,1 +1,2 @@
 com.cheetah.racer.common.config.RacerAutoConfiguration
+com.cheetah.racer.common.config.RacerWebAutoConfiguration

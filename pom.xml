@@ -24,8 +24,7 @@
 	<modules>
 		<module>racer-common</module>
 		<module>racer-starter</module>
-		<module>racer-server</module>
-		<module>racer-client</module>
+		<module>racer-demo</module>
 	</modules>
 
 	<dependencyManagement>
@@ -38,16 +37,6 @@
 			<dependency>
 				<groupId>com.cheetah</groupId>
 				<artifactId>racer-starter</artifactId>
-				<version>${project.version}</version>
-			</dependency>
-			<dependency>
-				<groupId>com.cheetah</groupId>
-				<artifactId>racer-server</artifactId>
-				<version>${project.version}</version>
-			</dependency>
-			<dependency>
-				<groupId>com.cheetah</groupId>
-				<artifactId>racer-client</artifactId>
 				<version>${project.version}</version>
 			</dependency>
 		</dependencies>

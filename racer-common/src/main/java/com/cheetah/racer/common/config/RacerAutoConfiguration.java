@@ -1,6 +1,8 @@
 package com.cheetah.racer.common.config;
 
 import com.cheetah.racer.common.aspect.PublishResultAspect;
+import com.cheetah.racer.common.listener.RacerDeadLetterHandler;
+import com.cheetah.racer.common.listener.RacerListenerRegistrar;
 import com.cheetah.racer.common.metrics.RacerMetrics;
 import com.cheetah.racer.common.poll.RacerPollRegistrar;
 import com.cheetah.racer.common.processor.RacerPublisherFieldProcessor;
@@ -9,11 +11,17 @@ import com.cheetah.racer.common.publisher.RacerPriorityPublisher;
 import com.cheetah.racer.common.publisher.RacerPublisherRegistry;
 import com.cheetah.racer.common.publisher.RacerShardedStreamPublisher;
 import com.cheetah.racer.common.publisher.RacerStreamPublisher;
+import com.cheetah.racer.common.requestreply.RacerResponderRegistrar;
 import com.cheetah.racer.common.router.RacerRouterService;
 import com.cheetah.racer.common.schema.RacerSchemaRegistry;
+import com.cheetah.racer.common.service.DeadLetterQueueService;
+import com.cheetah.racer.common.service.DlqReprocessorService;
+import com.cheetah.racer.common.service.RacerRetentionService;
+import com.cheetah.racer.common.stream.RacerStreamListenerRegistrar;
 import com.cheetah.racer.common.tx.RacerTransaction;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -23,6 +31,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.listener.ReactiveRedisMessageListenerContainer;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import java.util.Optional;
 
@@ -44,6 +54,8 @@ import java.util.Optional;
  *   <li>{@link RacerPipelinedPublisher} — parallel batch publisher (R-9)</li>
  *   <li>{@link RacerShardedStreamPublisher} (conditional) — shard-aware stream publisher (R-8)</li>
  *   <li>{@link RacerPriorityPublisher} (conditional) — priority sub-channel publisher (R-10)</li>
+ *   <li>{@link RacerListenerRegistrar} (conditional) — BeanPostProcessor for {@code @RacerListener}
+ *       channel consumers; active when a {@link ReactiveRedisMessageListenerContainer} is present</li>
  * </ul>
  */
 @Configuration
@@ -177,5 +189,125 @@ public class RacerAutoConfiguration {
             ObjectMapper objectMapper,
             Optional<RacerMetrics> racerMetrics) {
         return new RacerPollRegistrar(racerPublisherRegistry, objectMapper, racerMetrics.orElse(null));
+    }
+
+    // ── @RacerListener registrar ─────────────────────────────────────────
+
+    /**
+     * Registers the {@link RacerListenerRegistrar} that scans for {@code @RacerListener}
+     * methods and subscribes them to their configured Redis Pub/Sub channels.
+     *
+     * <p>Only activated when a {@link ReactiveRedisMessageListenerContainer} bean is
+     * present in the context (i.e. in apps that have the listener infrastructure set up,
+     * such as racer-client).
+     */
+    @Bean
+    @ConditionalOnBean(ReactiveRedisMessageListenerContainer.class)
+    public RacerListenerRegistrar racerListenerRegistrar(
+            ReactiveRedisMessageListenerContainer listenerContainer,
+            RacerProperties racerProperties,
+            ObjectMapper objectMapper,
+            Optional<RacerMetrics> racerMetrics,
+            Optional<RacerSchemaRegistry> racerSchemaRegistry,
+            Optional<RacerRouterService> racerRouterService,
+            Optional<RacerDeadLetterHandler> deadLetterHandler) {
+        return new RacerListenerRegistrar(
+                listenerContainer,
+                objectMapper,
+                racerProperties,
+                racerMetrics.orElse(null),
+                racerSchemaRegistry.orElse(null),
+                racerRouterService.orElse(null),
+                deadLetterHandler.orElse(null));
+    }
+
+    // ── Dead Letter Queue ────────────────────────────────────────────────────
+
+    @Bean
+    public DeadLetterQueueService deadLetterQueueService(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            ObjectMapper objectMapper) {
+        return new DeadLetterQueueService(reactiveStringRedisTemplate, objectMapper);
+    }
+
+    // ── DLQ Reprocessor ──────────────────────────────────────────────────────
+
+    @Bean
+    public DlqReprocessorService dlqReprocessorService(
+            DeadLetterQueueService deadLetterQueueService,
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            ObjectMapper objectMapper,
+            Optional<RacerMetrics> racerMetrics) {
+        return new DlqReprocessorService(
+                deadLetterQueueService,
+                reactiveStringRedisTemplate,
+                objectMapper,
+                racerMetrics.orElse(null));
+    }
+
+    // ── Retention Service ────────────────────────────────────────────────────
+
+    @Bean
+    public RacerRetentionService racerRetentionService(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            DeadLetterQueueService deadLetterQueueService,
+            ObjectMapper objectMapper,
+            RacerProperties racerProperties) {
+        return new RacerRetentionService(
+                reactiveStringRedisTemplate,
+                deadLetterQueueService,
+                objectMapper,
+                racerProperties.getRetention().getStreamMaxLen(),
+                racerProperties.getRetention().getDlqMaxAgeHours());
+    }
+
+    // ── @RacerStreamListener registrar ──────────────────────────────────────
+
+    @Bean
+    public RacerStreamListenerRegistrar racerStreamListenerRegistrar(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            RacerProperties racerProperties,
+            ObjectMapper objectMapper,
+            Optional<RacerMetrics> racerMetrics,
+            Optional<RacerSchemaRegistry> racerSchemaRegistry,
+            Optional<RacerDeadLetterHandler> deadLetterHandler) {
+        return new RacerStreamListenerRegistrar(
+                reactiveStringRedisTemplate,
+                objectMapper,
+                racerProperties,
+                racerMetrics.orElse(null),
+                racerSchemaRegistry.orElse(null),
+                deadLetterHandler.orElse(null));
+    }
+
+    // ── @RacerResponder registrar ────────────────────────────────────────────
+
+    @Bean
+    public RacerResponderRegistrar racerResponderRegistrar(
+            Optional<ReactiveRedisMessageListenerContainer> listenerContainer,
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            RacerProperties racerProperties,
+            ObjectMapper objectMapper,
+            Optional<RacerMetrics> racerMetrics) {
+        return new RacerResponderRegistrar(
+                listenerContainer.orElse(null),
+                reactiveStringRedisTemplate,
+                objectMapper,
+                racerProperties,
+                racerMetrics.orElse(null));
+    }
+
+    // ── Retention scheduling (opt-in via racer.retention-enabled=true) ──────
+
+    /**
+     * Inner configuration class that activates {@code @EnableScheduling} only
+     * when {@code racer.retention-enabled=true}.  This avoids globally enabling
+     * Spring's scheduling infrastructure for all consumers of the library.
+     */
+    @Configuration
+    @ConditionalOnProperty(name = "racer.retention-enabled", havingValue = "true")
+    @EnableScheduling
+    static class RacerRetentionSchedulingConfiguration {
+        // @EnableScheduling activates @Scheduled on RacerRetentionService
     }
 }

@@ -1,21 +1,21 @@
 # Racer — Reactive Redis Messaging
 
-A multi-module Spring Boot application demonstrating reactive Redis messaging patterns:
+A multi-module Spring Boot library and demo application for annotation-driven reactive Redis messaging. Define publishers, subscribers, request-reply responders, and durable stream consumers with simple annotations — no boilerplate infrastructure code required.
 
-- **Fire-and-forget Pub/Sub** — async and sync message publishing
-- **Two-way Request-Reply** over both Pub/Sub and Redis Streams
-- **Dead Letter Queue (DLQ)** with retry, republish, and age-based pruning
-- **Sync vs Async** consumer mode switchable at runtime
-- **Racer Annotations** — `@EnableRacer`, `@RacerPublisher`, `@PublishResult`, `@RacerPriority` for declarative, property-driven publishing
+- **Annotation-Driven Publishing** — `@EnableRacer`, `@RacerPublisher`, `@PublishResult`, `@RacerPriority` for declarative, property-driven publishing
+- **Declarative Pub/Sub Consumers** — `@RacerListener` turns any Spring method into a Redis Pub/Sub subscriber with `SEQUENTIAL` or `CONCURRENT` processing, schema validation, router integration, and automatic DLQ on failure
+- **Durable Stream Consumers** — `@RacerStreamListener` registers a Redis Streams consumer group reader directly on any Spring bean method, with configurable concurrency and batch size
+- **Annotation-Driven Request/Reply** — `@RacerResponder` marks any method as a request handler; `@RacerClient` interfaces generate proxy callers that send requests and await typed replies
+- **Dead Letter Queue (DLQ)** — automatic enqueue on failure; opt-in REST API (`racer.web.dlq-enabled=true`) for inspection and republishing
 - **Multiple Channels** — declare unlimited named channels in `application.properties`
 - **Durable Publishing** — `@PublishResult(durable = true)` writes to Redis Streams for at-least-once delivery
-- **Content-Based Router** — `@RacerRoute` / `@RacerRouteRule` for regex-pattern message routing
+- **Content-Based Router** — `@RacerRoute` / `@RacerRouteRule` for regex-pattern message routing; opt-in REST API (`racer.web.router-enabled=true`)
 - **Atomic Batch Publish** — `RacerTransaction.execute()` for ordered multi-channel publish
-- **Pipelined Batch Publish** — `RacerPipelinedPublisher` / `/api/publish/batch-pipelined` issues all commands in parallel for maximum throughput
-- **Consumer Scaling** — configurable concurrency per stream, named consumers, and key-based sharding via `RacerShardedStreamPublisher`
-- **Message Priority** — `RacerPriorityPublisher` + `RacerPriorityConsumerService` route messages to `HIGH`/`NORMAL`/`LOW` sub-channels
+- **Pipelined Batch Publish** — `RacerPipelinedPublisher` issues all commands in parallel for maximum throughput
+- **Consumer Scaling** — configurable concurrency per stream via `@RacerStreamListener(concurrency=N)` and key-based sharding via `RacerShardedStreamPublisher`
+- **Message Priority** — `RacerPriorityPublisher` routes messages to `HIGH`/`NORMAL`/`LOW` sub-channels
 - **Micrometer Metrics** — Prometheus/Actuator instrumentation for published/consumed/failed/DLQ/latency counters
-- **Retention Service** — scheduled `XTRIM` + DLQ age-based eviction
+- **Retention Service** — scheduled `XTRIM` + DLQ age-based eviction; opt-in REST API (`racer.web.retention-enabled=true`)
 - **High Availability** — Sentinel and Cluster Docker Compose topologies included
 
 > **Building a new service?** Follow the **[New App from Scratch →](TUTORIAL-NEW-APP.md)** guide for a complete end-to-end walkthrough.
@@ -37,33 +37,35 @@ A multi-module Spring Boot application demonstrating reactive Redis messaging pa
    - [@RacerRoute — content-based routing](#racerroute--content-based-routing)
    - [@RacerPriority — message priority routing](#racerpriority--message-priority-routing)
    - [@RacerPoll — scheduled publishing](#racerpoll--scheduled-publishing)
+   - [@RacerListener — declarative Pub/Sub consumers](#racerlistener--declarative-channel-consumers)
+   - [@RacerStreamListener — durable stream consumers](#racerstreamlistener--durable-stream-consumers)
+   - [@RacerResponder — request-reply responder](#racerresponder--request-reply-responder)
+   - [@RacerClient / @RacerRequestReply — request-reply caller](#racerclient--racerrequestreply--request-reply-caller)
+   - [@EnableRacerClients](#enableracerclients)
    - [Multi-channel configuration](#multi-channel-configuration)
 7. [Redis Keys & Channels Reference](#redis-keys--channels-reference)
 8. [Message Schemas](#message-schemas)
-9. [API Reference — Server (port 8080)](#api-reference--server-port-8080)
-   - [Publish APIs](#publish-apis)
-   - [Request-Reply APIs](#request-reply-apis)
+9. [API Reference (port 8080, opt-in)](#api-reference-port-8080-opt-in)
+   - [DLQ APIs](#dlq-apis)
+   - [Retention APIs](#retention-apis)
    - [Router APIs](#router-apis)
    - [Channel Registry APIs](#channel-registry-apis)
-10. [API Reference — Client (port 8081)](#api-reference--client-port-8081)
-    - [Consumer APIs](#consumer-apis)
-    - [DLQ APIs](#dlq-apis)
-    - [Responder Status API](#responder-status-api)
-11. [Observability & Metrics](#observability--metrics)
-12. [High Availability](#high-availability)
-13. [Consumer Scaling & Sharding](#consumer-scaling--sharding)
-14. [Pipelined Publishing](#pipelined-publishing)
-15. [Message Priority](#message-priority)
-16. [End-to-End Flows](#end-to-end-flows)
-17. [Extending the Application](#extending-the-application)
-18. [Error Handling & DLQ Behaviour](#error-handling--dlq-behaviour)
-19. [Comparison with Other Brokers](#comparison-with-other-brokers)
+   - [Schema APIs](#schema-apis)
+10. [Observability & Metrics](#observability--metrics)
+11. [High Availability](#high-availability)
+12. [Consumer Scaling & Sharding](#consumer-scaling--sharding)
+13. [Pipelined Publishing](#pipelined-publishing)
+14. [Message Priority](#message-priority)
+15. [End-to-End Flows](#end-to-end-flows)
+16. [Extending the Application](#extending-the-application)
+17. [Error Handling & DLQ Behaviour](#error-handling--dlq-behaviour)
+18. [Comparison with Other Brokers](#comparison-with-other-brokers)
     - [Architecture at a Glance](#architecture-at-a-glance)
     - [Advantages of Racer](#advantages-of-racer)
     - [Disadvantages & Mitigations](#disadvantages--mitigations)
     - [When to Use What](#when-to-use-what)
-20. [Roadmap & Implementation Status](#roadmap--implementation-status)
-21. [Tutorials](TUTORIALS.md) *(separate file)*
+19. [Roadmap & Implementation Status](#roadmap--implementation-status)
+20. [Tutorials](TUTORIALS.md) *(separate file)*
 
 ---
 
@@ -81,34 +83,37 @@ A multi-module Spring Boot application demonstrating reactive Redis messaging pa
 │  racer:<channel>  ←─ @RacerRoute routes here                                 │
 └──────────┬─────────────────────────┬──────────────────────────┬─────────────┘
            │ pub/sub                 │ streams                   │ list ops
- ┌─────────┴────────────┐  ┌────────┴────────────┐  ┌──────────┴──────────────┐
- │   racer-server :8080  │  │  racer-server        │  │  racer-client (DLQ)     │
- │                       │  │  (durable writer)    │  │  RacerRetentionService  │
- │  PublisherService     │  └─────────────────────-┘  └─────────────────────-  ┘
- │  PubSubRequestReply   │         │
- │  StreamRequestReply   │         │ consume group
- │  RacerTransaction     │  ┌──────┴──────────────┐
- │  RouterController     │  │  racer-client :8081  │
- └───────────────────────┘  │  (durable reader)    │
-           │ subscribe       │  RacerStreamConsumer  │
- ┌─────────┴────────────┐   └──────────────────────┘
- │   racer-client :8081  │
- │                       │
- │  ConsumerSubscriber   │◄─── RacerRouterService (content-based routing)
- │  PubSubResponder      │
- │  StreamResponder      │
- │  DLQ Services         │
- └───────────────────────┘
+           │                         │                           │
+ ┌─────────┴─────────────────────────┴───────────────────────────┴─────────────┐
+ │                            racer-demo :8080                                  │
+ │                                                                               │
+ │  @RacerPublisher / @PublishResult  → fire-and-forget Pub/Sub or XADD        │
+ │  @RacerPoll                        → scheduled publishing                    │
+ │  @RacerListener                    → Pub/Sub subscriber (SEQUENTIAL/CONCURRENT)
+ │  @RacerStreamListener              → XREADGROUP consumer group               │
+ │  @RacerResponder                   → request-reply handler (Pub/Sub or Stream)
+ │  @RacerClient proxy                → sends requests, awaits typed replies     │
+ │  RacerRouterService                → content-based routing                   │
+ │  DeadLetterQueueService            → DLQ enqueue on failure                  │
+ │  RacerRetentionService             → scheduled XTRIM + DLQ age pruning       │
+ │                                                                               │
+ │  Opt-in REST APIs (racer.web.*-enabled=true):                                │
+ │    /api/dlq/**          racer.web.dlq-enabled=true                           │
+ │    /api/retention/**    racer.web.retention-enabled=true                     │
+ │    /api/router/**       racer.web.router-enabled=true                        │
+ │    GET /api/channels    racer.web.channels-enabled=true                      │
+ │    /api/schema/**       racer.web.schema-enabled=true                        │
+ └───────────────────────────────────────────────────────────────────────────────┘
 
 Metrics: RacerMetrics (Micrometer) wired into all publish/consume/DLQ paths
-         → exposed via /actuator/metrics and /actuator/prometheus
+         → exposed via /actuator/metrics and /actuator/prometheus on port 8080
 ```
 
 | Module | Role | Port |
 |--------|------|------|
-| `racer-common` | Shared models, constants, Redis config | — |
-| `racer-server` | Publisher, request-reply initiator | 8080 |
-| `racer-client` | Subscriber, request-reply responder, DLQ | 8081 |
+| `racer-common` | Shared models, annotations, services, web controllers | — |
+| `racer-starter` | Thin aggregator / Spring Boot starter | — |
+| `racer-demo` | Demo application combining publisher + consumer + responder + client | 8080 |
 
 ---
 
@@ -121,75 +126,87 @@ racer/
 ├── compose.sentinel.yaml            # High-availability: Sentinel mode
 ├── compose.cluster.yaml             # High-availability: Cluster mode
 │
-├── racer-common/                    # Shared library
+├── racer-common/                    # Shared library (annotations, services, web)
 │   └── src/main/java/com/cheetah/racer/common/
 │       ├── RedisChannels.java       # Channel/key constants
 │       ├── annotation/
-│       │   ├── EnableRacer.java         # Activates the annotation framework
-│       │   ├── RacerPublisher.java      # Field injection annotation
-│       │   ├── PublishResult.java       # Method auto-publish (+ durable mode)
-│       │   ├── RacerRoute.java          # Content-based routing (container)
-│       │   └── RacerRouteRule.java      # Per-rule: field, matches, to, sender
+│       │   ├── EnableRacer.java             # Activates the annotation framework
+│       │   ├── EnableRacerClients.java      # Enables @RacerClient scanning
+│       │   ├── RacerPublisher.java          # Field injection annotation
+│       │   ├── PublishResult.java           # Method auto-publish (+ durable mode)
+│       │   ├── RacerRoute.java              # Content-based routing (container)
+│       │   ├── RacerRouteRule.java          # Per-rule: field, matches, to, sender
+│       │   ├── ConcurrencyMode.java         # SEQUENTIAL / CONCURRENT dispatch enum
+│       │   ├── RacerListener.java           # Declarative Pub/Sub subscriber
+│       │   ├── RacerStreamListener.java     # Durable Redis Streams consumer
+│       │   ├── RacerResponder.java          # Request-reply handler annotation
+│       │   ├── RacerClient.java             # Interface marker for proxy generation
+│       │   └── RacerRequestReply.java       # Interface method: declare request-reply call
 │       ├── aspect/
-│       │   └── PublishResultAspect.java # AOP: pub/sub OR durable stream
+│       │   └── PublishResultAspect.java     # AOP: pub/sub OR durable stream
 │       ├── config/
-│       │   ├── RedisConfig.java              # ReactiveRedisTemplate beans
-│       │   ├── RacerAutoConfiguration.java   # Wires all beans
-│       │   └── RacerProperties.java          # racer.* property binding (+ retention)
+│       │   ├── RedisConfig.java                  # ReactiveRedisTemplate beans
+│       │   ├── RacerAutoConfiguration.java        # Wires all beans
+│       │   ├── RacerWebAutoConfiguration.java     # Wires opt-in web controllers
+│       │   └── RacerProperties.java               # racer.* property binding
+│       ├── listener/
+│       │   ├── RacerDeadLetterHandler.java        # SPI: forward failed msgs to DLQ
+│       │   └── RacerListenerRegistrar.java        # BeanPostProcessor for @RacerListener
 │       ├── metrics/
-│       │   └── RacerMetrics.java        # Micrometer counters/timers/gauge
+│       │   └── RacerMetrics.java                  # Micrometer counters/timers/gauge
 │       ├── model/
-│       │   ├── RacerMessage.java        # Fire-and-forget message
-│       │   ├── RacerRequest.java        # Request-reply request
-│       │   ├── RacerReply.java          # Request-reply response
+│       │   ├── RacerMessage.java     # Fire-and-forget message
+│       │   ├── RacerRequest.java     # Request-reply request
+│       │   ├── RacerReply.java       # Request-reply response
 │       │   └── DeadLetterMessage.java
 │       ├── processor/
 │       │   └── RacerPublisherFieldProcessor.java  # BeanPostProcessor for @RacerPublisher
 │       ├── publisher/
-│       │   ├── RacerChannelPublisher.java       # Publisher interface
-│       │   ├── RacerChannelPublisherImpl.java    # Pub/Sub implementation (+ metrics)
-│       │   ├── RacerPublisherRegistry.java       # Multi-channel registry
-│       │   └── RacerStreamPublisher.java         # Durable stream publisher (XADD)
+│       │   ├── RacerChannelPublisher.java         # Publisher interface
+│       │   ├── RacerChannelPublisherImpl.java     # Pub/Sub implementation (+ metrics)
+│       │   ├── RacerPublisherRegistry.java        # Multi-channel registry
+│       │   └── RacerStreamPublisher.java          # Durable stream publisher (XADD)
+│       ├── requestreply/
+│       │   ├── RacerResponderRegistrar.java       # BeanPostProcessor for @RacerResponder
+│       │   ├── RacerClientRegistrar.java          # ImportBeanDefinitionRegistrar for @RacerClient
+│       │   └── RacerClientFactoryBean.java        # JDK dynamic proxy FactoryBean
 │       ├── router/
-│       │   └── RacerRouterService.java    # @PostConstruct scans @RacerRoute beans
-│       └── tx/
-│           └── RacerTransaction.java      # Atomic ordered multi-channel publish
-│
-├── racer-server/                    # Publisher / server module
-│   └── src/main/java/com/cheetah/racer/server/
-│       ├── RacerServerApplication.java   # @EnableRacer activated here
-│       ├── config/
-│       │   └── ServerRedisListenerConfig.java
+│       │   └── RacerRouterService.java            # @PostConstruct scans @RacerRoute beans
 │       ├── service/
-│       │   ├── PublisherService.java
-│       │   ├── PubSubRequestReplyService.java   # metrics timer
-│       │   └── StreamRequestReplyService.java   # metrics timer
-│       └── controller/
-│           ├── PublisherController.java          # + /batch-atomic endpoint
-│           ├── RequestReplyController.java
-│           ├── RouterController.java             # GET /api/router/rules, POST /api/router/test
-│           └── ChannelRegistryController.java
+│       │   ├── DeadLetterQueueService.java        # DLQ enqueue + republish
+│       │   ├── DlqReprocessorService.java         # Republish-only DLQ reprocessor
+│       │   └── RacerRetentionService.java         # Scheduled XTRIM + DLQ age pruning
+│       ├── stream/
+│       │   └── RacerStreamListenerRegistrar.java  # BeanPostProcessor for @RacerStreamListener
+│       ├── tx/
+│       │   └── RacerTransaction.java              # Atomic ordered multi-channel publish
+│       └── web/
+│           ├── DlqController.java                 # Conditional on racer.web.dlq-enabled
+│           ├── RetentionController.java           # Conditional on racer.web.retention-enabled
+│           ├── RouterController.java              # Conditional on racer.web.router-enabled
+│           ├── ChannelRegistryController.java     # Conditional on racer.web.channels-enabled
+│           └── SchemaController.java              # Conditional on racer.web.schema-enabled
 │
-└── racer-client/                    # Consumer / client module
-    └── src/main/java/com/cheetah/racer/client/
-        ├── RacerClientApplication.java
+├── racer-starter/                   # Spring Boot starter (thin aggregator)
+│   └── pom.xml
+│
+└── racer-demo/                      # Demo application (port 8080)
+    └── src/main/java/com/cheetah/racer/demo/
+        ├── RacerDemoApplication.java   # @EnableRacer @EnableRacerClients
+        ├── client/
+        │   └── DemoClient.java          # @RacerClient interface with @RacerRequestReply
         ├── config/
-        │   └── RedisListenerConfig.java
-        ├── service/
-        │   ├── MessageProcessor.java            (interface)
-        │   ├── SyncMessageProcessor.java
-        │   ├── AsyncMessageProcessor.java
-        │   ├── ConsumerSubscriber.java          # + router + metrics
-        │   ├── PubSubResponderService.java
-        │   ├── StreamResponderService.java
-        │   ├── DeadLetterQueueService.java
-        │   ├── DlqReprocessorService.java       # + metrics
-        │   ├── RacerRetentionService.java       # @Scheduled XTRIM + DLQ age pruning
-        │   └── RacerStreamConsumerService.java  # Consumer group reader for durable streams
-        └── controller/
-            ├── ConsumerController.java
-            ├── DlqController.java               # + /trim + /retention-config
-            └── ResponderController.java
+        │   └── RedisListenerConfig.java # ReactiveRedisMessageListenerContainer
+        ├── listener/
+        │   └── DemoMessageListener.java # @RacerListener, @RacerStreamListener examples
+        ├── poller/
+        │   └── DemoPoller.java          # @RacerPoll example
+        ├── publisher/
+        │   └── DemoPublisher.java       # @PublishResult, @RacerPublisher examples
+        ├── responder/
+        │   └── DemoResponder.java       # @RacerResponder example
+        └── router/
+            └── DemoRouter.java          # @RacerRoute example
 ```
 
 ---
@@ -228,42 +245,48 @@ redis-cli ping
 
 Always set `JAVA_HOME` to JDK 21 before running.
 
-### Step 1 — Build
+### Step 1 — Build all modules
 
 ```bash
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 mvn clean install -DskipTests
 ```
 
-### Step 2 — Run the Server (Terminal A)
+Expected output:
+```
+[INFO] racer .............................................. SUCCESS
+[INFO] racer-common ....................................... SUCCESS
+[INFO] racer-starter ...................................... SUCCESS
+[INFO] racer-demo ......................................... SUCCESS
+[INFO] BUILD SUCCESS
+```
+
+### Step 2 — Start the demo application
 
 ```bash
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
-mvn -pl :racer-server -am spring-boot:run
+mvn -pl :racer-demo -am spring-boot:run
 ```
 
 Or via jar:
 ```bash
-java -jar racer-server/target/racer-server-0.0.1-SNAPSHOT.jar
+java -jar racer-demo/target/racer-demo-0.0.1-SNAPSHOT.jar
 ```
 
-### Step 3 — Run the Client (Terminal B)
-
-```bash
-export JAVA_HOME=$(/usr/libexec/java_home -v 21)
-mvn -pl :racer-client -am spring-boot:run
+The application starts on **port 8080**. Startup log includes:
 ```
-
-Or via jar:
-```bash
-java -jar racer-client/target/racer-client-0.0.1-SNAPSHOT.jar
+Started RacerDemoApplication in X.XXX seconds
+[racer] Default channel registered: 'racer:messages'
+[racer] Channel 'orders'        registered → 'racer:orders'
+[racer] Channel 'notifications' registered → 'racer:notifications'
+[racer] Channel 'audit'         registered → 'racer:audit'
 ```
 
 ---
 
 ## Configuration Reference
 
-### racer-server (`racer-server/src/main/resources/application.properties`)
+### racer-demo (`racer-demo/src/main/resources/application.properties`)
 
 | Property | Default | Description |
 |----------|---------|-------------|
@@ -274,47 +297,30 @@ java -jar racer-client/target/racer-client-0.0.1-SNAPSHOT.jar
 | `racer.channels.<alias>.name` | — | Redis channel name for this alias |
 | `racer.channels.<alias>.async` | `true` | Default async flag for this channel |
 | `racer.channels.<alias>.sender` | `racer` | Default sender label for this channel |
-| `racer.pipeline.enabled` | `false` | Enable pipelined batch publishing (R-9) |
-| `racer.pipeline.max-batch-size` | `100` | Maximum messages per pipelined batch (R-9) |
-| `racer.priority.enabled` | `false` | Enable priority sub-channel publishing (R-10) |
-| `racer.priority.levels` | `HIGH,NORMAL,LOW` | Comma-separated priority level names, highest first (R-10) |
-| `racer.priority.strategy` | `strict` | Drain strategy: `strict` or `weighted` (R-10) |
-| `racer.priority.channels` | — | Comma-separated channel aliases eligible for priority routing (R-10) |
-| `racer.poll.enabled` | `true` | Enable/disable all `@RacerPoll` pollers (R-11) |
-| `management.endpoints.web.exposure.include` | `health,info` | Actuator endpoints to expose (add `metrics,prometheus`) |
-| `management.metrics.tags.application` | — | Tag all metrics with app name |
-| `logging.level.com.cheetah.racer` | `DEBUG` | Log level |
-
-### racer-client (`racer-client/src/main/resources/application.properties`)
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `server.port` | `8081` | HTTP port |
-| `spring.data.redis.host` | `localhost` | Redis host |
-| `spring.data.redis.port` | `6379` | Redis port |
-| `racer.client.processing-mode` | `ASYNC` | Initial processing mode (`SYNC` or `ASYNC`) |
-| `racer.default-channel` | `racer:messages` | Fallback channel |
-| `racer.channels.<alias>.name` | — | Redis channel name for this alias |
-| `racer.channels.<alias>.async` | `true` | Default async flag |
-| `racer.channels.<alias>.sender` | `racer` | Default sender label |
 | `racer.durable.stream-keys` | — | Comma-separated stream keys to consume with consumer groups |
 | `racer.retention.stream-max-len` | `10000` | Max entries to keep in durable streams (XTRIM) |
 | `racer.retention.dlq-max-age-hours` | `72` | DLQ entries older than this are pruned |
 | `racer.retention.schedule-cron` | `0 0 * * * *` | Cron for automatic retention runs (hourly by default) |
-| `racer.consumer.concurrency` | `1` | Number of concurrent consumer instances per stream (R-8) |
-| `racer.consumer.name-prefix` | `consumer` | Prefix for generated consumer names, e.g. `consumer-0` (R-8) |
-| `racer.consumer.poll-batch-size` | `1` | XREADGROUP COUNT — entries read per poll (R-8) |
-| `racer.consumer.poll-interval-ms` | `200` | Milliseconds between polls when stream is empty (R-8) |
+| `racer.retention-enabled` | `false` | Enable the scheduled retention service |
+| `racer.pipeline.enabled` | `false` | Enable pipelined batch publishing (R-9) |
+| `racer.pipeline.max-batch-size` | `100` | Maximum messages per pipelined batch (R-9) |
+| `racer.priority.enabled` | `false` | Enable priority sub-channel publishing/consuming (R-10) |
+| `racer.priority.levels` | `HIGH,NORMAL,LOW` | Comma-separated priority level names, highest first (R-10) |
+| `racer.priority.strategy` | `strict` | Drain strategy: `strict` or `weighted` (R-10) |
+| `racer.priority.channels` | — | Comma-separated channel aliases eligible for priority routing (R-10) |
 | `racer.sharding.enabled` | `false` | Enable key-based stream sharding (R-8) |
 | `racer.sharding.shard-count` | `4` | Number of shard suffixes: `stream:0` … `stream:N-1` (R-8) |
 | `racer.sharding.streams` | — | Comma-separated base stream keys to shard (R-8) |
-| `racer.priority.enabled` | `false` | Enable priority sub-channel consumer (R-10) |
-| `racer.priority.levels` | `HIGH,NORMAL,LOW` | Priority level names (R-10) |
-| `racer.priority.strategy` | `strict` | `strict` (drain high first) or `weighted` (R-10) |
-| `racer.priority.channels` | — | Comma-separated base Redis channel names to subscribe with priority (R-10) |
 | `racer.pubsub.concurrency` | `256` | Max in-flight Pub/Sub messages processed concurrently (R-11) |
 | `racer.poll.enabled` | `true` | Enable/disable all `@RacerPoll` pollers (R-11) |
+| `racer.request-reply.default-timeout` | `30s` | Default timeout for `@RacerRequestReply` calls |
+| `racer.web.dlq-enabled` | `false` | Expose `/api/dlq/**` REST endpoints |
+| `racer.web.retention-enabled` | `false` | Expose `/api/retention/**` REST endpoints |
+| `racer.web.router-enabled` | `false` | Expose `/api/router/**` REST endpoints |
+| `racer.web.channels-enabled` | `false` | Expose `GET /api/channels` REST endpoint |
+| `racer.web.schema-enabled` | `false` | Expose `/api/schema/**` REST endpoints |
 | `management.endpoints.web.exposure.include` | `health,info` | Actuator endpoints to expose (add `metrics,prometheus`) |
+| `management.metrics.tags.application` | — | Tag all metrics with app name |
 | `logging.level.com.cheetah.racer` | `DEBUG` | Log level |
 
 ### High-Availability Redis (`application.properties` overrides)
@@ -426,6 +432,12 @@ public Mono<Order> createDurableOrder(OrderRequest req) {
 public Flux<Notification> broadcastAll() {
     return notificationService.getAll();
 }
+
+// Concurrent fan-out — publish up to 8 elements to Redis simultaneously
+@PublishResult(channel = "racer:events", mode = ConcurrencyMode.CONCURRENT, concurrency = 8)
+public Flux<Event> generateEvents() {
+    return eventService.stream();   // each Event is published via flatMap(concurrency=8)
+}
 ```
 
 **Attribute reference**
@@ -438,15 +450,18 @@ public Flux<Notification> broadcastAll() {
 | `async` | `boolean` | `true` | `true` = fire-and-forget; `false` = blocks until Redis confirms. |
 | `durable` | `boolean` | `false` | When `true`, publishes to a **Redis Stream** (XADD) instead of Pub/Sub. |
 | `streamKey` | `String` | `""` | The Redis Stream key to write to when `durable=true` (e.g. `racer:orders:stream`). |
+| `mode` | `ConcurrencyMode` | `SEQUENTIAL` | Dispatch strategy for `Flux<T>` returns. `SEQUENTIAL` = fire-and-forget `doOnNext`; `CONCURRENT` = `flatMap` with up to `concurrency` in-flight publishes. Ignored for `Mono` and POJO returns. |
+| `concurrency` | `int` | `4` | Maximum concurrent in-flight publish operations when `mode = CONCURRENT`. |
 
 **Resolution order:** `channel` (direct name) → `channelRef` (alias lookup) → default channel (`racer.default-channel`).
 
 **Supported return types:**
 
 | Return type | Behaviour |
-|-------------|----------|
+|-------------|-----------|
 | `Mono<T>` | Taps into the reactive pipeline via `doOnNext` — no blocking |
-| `Flux<T>` | Taps every element via `doOnNext` — no blocking |
+| `Flux<T>` — `SEQUENTIAL` (default) | Taps every element via `doOnNext` — fire-and-forget, no backpressure |
+| `Flux<T>` — `CONCURRENT` | Uses `flatMap(publish, concurrency)` — up to N Redis publishes in flight simultaneously; downstream waits for publish before receiving each element |
 | Any POJO / `void` | Published synchronously or asynchronously after return |
 
 > **Important:** The annotated method must be on a **Spring proxy** (i.e. invoked from outside the bean). Self-invocation inside the same class bypasses the AOP proxy and `@PublishResult` will not fire.
@@ -521,19 +536,28 @@ public RacerMessage placeUrgentOrder(OrderRequest req) {
 | `NORMAL` | 1 | Default |
 | `LOW` | 2 | Processed last |
 
-**Publishing with priority via REST:**
-```bash
-curl -s -X POST http://localhost:8080/api/publish/async \
-  -H "Content-Type: application/json" \
-  -d '{"channel":"racer:orders","payload":"urgent-order","sender":"checkout","priority":"HIGH"}'
+**Publishing with priority:**
+```java
+@RacerPriority(defaultLevel = PriorityLevel.HIGH)
+@PublishResult(channelRef = "orders")
+public Order createUrgentOrder(OrderRequest req) {
+    return orderService.create(req);
+}
 ```
 
-**Consumer side (`racer-client`):**
+Or programmatically:
+```java
+@Autowired RacerPriorityPublisher priorityPublisher;
+
+priorityPublisher.publish("racer:orders", "urgent-order", "checkout", PriorityLevel.HIGH).subscribe();
+```
+
+**Consumer side (`racer-demo`):**
 
 Enable `racer.priority.enabled=true` and configure `racer.priority.channels`. The `RacerPriorityConsumerService` subscribes to all priority sub-channels, buffers messages in a `PriorityBlockingQueue` ordered by level weight, and drains them in strict priority order.
 
 ```properties
-# racer-client/application.properties
+# racer-demo/application.properties
 racer.priority.enabled=true
 racer.priority.levels=HIGH,NORMAL,LOW
 racer.priority.strategy=strict
@@ -591,6 +615,256 @@ public Mono<String> fetchPrices() {
 | `async` | `boolean` | `true` | Whether to publish asynchronously |
 
 **Supported return types:** `String` (as-is), any serializable object (JSON-encoded), `Mono<?>` (subscribed to), `void`/`null` (nothing published).
+
+---
+
+### `@RacerListener` — declarative channel consumers
+
+Annotate **any Spring-managed method** to subscribe it to a Redis Pub/Sub channel. `RacerListenerRegistrar` (a `BeanPostProcessor`) discovers every `@RacerListener` method at startup, subscribes to the channel, and dispatches incoming messages reactively on the bounded-elastic scheduler.
+
+**Sequential listener (default):**
+```java
+@Component
+public class OrderHandler {
+
+    @RacerListener(channel = "racer:orders")
+    public void onOrder(RacerMessage message) {
+        // receives the full message envelope — process in-place
+        System.out.println("Order arrived: " + message.getPayload());
+    }
+}
+```
+
+**Concurrent listener with POJO deserialization:**
+```java
+@Component
+public class ShipmentHandler {
+
+    @RacerListener(
+        channel     = "racer:shipments",
+        mode        = ConcurrencyMode.CONCURRENT,
+        concurrency = 8,
+        id          = "shipment-listener"
+    )
+    public Mono<Void> onShipment(Shipment shipment) {
+        // payload is automatically deserialised to Shipment via ObjectMapper
+        return shipmentService.process(shipment);
+    }
+}
+```
+
+**Using a channel alias from `application.properties`:**
+```java
+@RacerListener(channelRef = "orders", mode = ConcurrencyMode.SEQUENTIAL)
+public void handleOrder(String rawPayload) {
+    // rawPayload is the plain String content of the message's payload field
+}
+```
+
+**Attribute reference**
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `channel` | `String` | `""` | Direct Redis Pub/Sub channel name. Takes priority over `channelRef`. |
+| `channelRef` | `String` | `""` | Channel alias from `racer.channels.<alias>`. Resolved at startup. |
+| `mode` | `ConcurrencyMode` | `SEQUENTIAL` | Dispatch strategy — see table below. |
+| `concurrency` | `int` | `4` | Maximum parallel in-flight messages when `mode = CONCURRENT`. |
+| `id` | `String` | `""` | Optional listener ID used in metrics tags and log messages. Defaults to `<BeanName>#<methodName>`. |
+
+**`ConcurrencyMode` values**
+
+| Value | Max in-flight | Ordering |
+|-------|---------------|---------|
+| `SEQUENTIAL` | 1 | Strictly ordered — one message fully processed before next starts |
+| `CONCURRENT` | `concurrency` | Up to N messages processed in parallel on `boundedElastic` |
+
+**Supported parameter types**
+
+| Parameter type | What is passed |
+|----------------|----------------|
+| `RacerMessage` | Full message envelope (channel, sender, payload, id, …) |
+| `String` | The raw string value of `RacerMessage#payload` |
+| Any other type `T` | `objectMapper.readValue(payload, T.class)` — automatic JSON deserialization |
+
+**Supported return types:** `void`, any type (result discarded), `Mono<?>` (subscribed to before the next dispatch).
+
+**Integration with schema validation, routing, and DLQ:**
+- If a `RacerSchemaValidator` bean is present, the payload is validated before dispatch; schema failures are forwarded to the DLQ without invoking the method.
+- If a `RacerRouterService` bean is present, the router decides whether the message is meant for this listener's channel; non-matching messages are silently skipped.
+- Any exception thrown by the method (or emitted by a returned `Mono`) increments the listener's `failedCount` and forwards the message to `RacerDeadLetterHandler` (implemented by `DeadLetterQueueService` in `racer-common`).
+
+**Metrics:** each listener exposes `getProcessedCount(id)` and `getFailedCount(id)` via `RacerListenerRegistrar`, and records to Micrometer under `racer.listener.processed` / `racer.listener.failed` tags.
+
+**Lifecycle:** subscriptions are started in `postProcessAfterInitialization` and disposed in `@PreDestroy` — no manual cleanup required.
+
+---
+
+### `@RacerStreamListener` — durable stream consumers
+
+Annotate **any Spring-managed method** to register it as a Redis Streams consumer via `XREADGROUP`. `RacerStreamListenerRegistrar` (a `BeanPostProcessor`) creates the consumer group (if needed), spawns up to `concurrency` named consumer loops, and dispatches each entry reactively. Failed messages are forwarded to `RacerDeadLetterHandler`.
+
+**Sequential stream consumer (default):**
+```java
+@Component
+public class OrderStreamHandler {
+
+    @RacerStreamListener(streamKey = "racer:orders:stream", group = "orders-group")
+    public Mono<Void> onOrderEntry(RacerMessage message) {
+        return orderService.process(message.getPayload());
+    }
+}
+```
+
+**Concurrent stream consumer with POJO deserialization and batch reads:**
+```java
+@RacerStreamListener(
+    streamKey    = "racer:shipments:stream",
+    group        = "shipments-group",
+    concurrency  = 4,
+    batchSize    = 10,
+    pollIntervalMs = 100,
+    id           = "shipments-worker"
+)
+public Mono<Void> onShipment(Shipment shipment) {
+    return shipmentService.process(shipment);
+}
+```
+
+**Using a stream key alias from `application.properties`:**
+```java
+@RacerStreamListener(streamKeyRef = "orders-stream", group = "orders-group")
+public void handleEntry(String rawPayload) { ... }
+```
+
+**`@RacerStreamListener` attribute reference**
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `streamKey` | `String` | `""` | Direct Redis Stream key (e.g. `racer:orders:stream`). Takes priority over `streamKeyRef`. |
+| `streamKeyRef` | `String` | `""` | Alias resolved from `racer.channels.<alias>.name` at startup. |
+| `group` | `String` | `"racer-group"` | Consumer group name. Created automatically if it does not exist. |
+| `mode` | `ConcurrencyMode` | `SEQUENTIAL` | `SEQUENTIAL` = 1 consumer loop; `CONCURRENT` = up to `concurrency` loops. |
+| `concurrency` | `int` | `1` | Number of independent named consumer loops in the group. |
+| `batchSize` | `int` | `1` | XREADGROUP COUNT — entries per poll cycle. |
+| `pollIntervalMs` | `long` | `200` | Milliseconds to wait between polls when the stream is empty. |
+| `id` | `String` | `""` | Optional consumer ID used in metrics tags and log output. |
+
+**Supported parameter types:** same as `@RacerListener` — `RacerMessage`, `String`, any POJO `T` (auto-deserialized).
+
+---
+
+### `@RacerResponder` — request-reply responder
+
+Annotate **any Spring-managed method** to register it as a request-reply handler. `RacerResponderRegistrar` (a `BeanPostProcessor`) subscribes to the configured channel or stream, detects incoming `RacerRequest` envelopes (payloads with a `replyTo` field), invokes the method, and publishes a `RacerReply` back to `replyTo`.
+
+**Pub/Sub responder:**
+```java
+@Component
+public class DemoResponder {
+
+    @RacerResponder(channel = "racer:messages")
+    public String handleRequest(String requestPayload) {
+        return "Processed: " + requestPayload;
+    }
+}
+```
+
+**Stream-based responder:**
+```java
+@RacerResponder(
+    stream  = "racer:stream:requests",
+    group   = "responder-group",
+    id      = "demo-stream-responder"
+)
+public Mono<String> handleStreamRequest(RacerMessage request) {
+    return myService.handle(request.getPayload());
+}
+```
+
+**`@RacerResponder` attribute reference**
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `channel` | `String` | `""` | Pub/Sub channel to listen on for requests. Takes priority over `channelRef`. |
+| `channelRef` | `String` | `""` | Channel alias from `racer.channels.<alias>`. |
+| `stream` | `String` | `""` | Redis Stream key for stream-based request-reply. Takes priority over `streamRef`. |
+| `streamRef` | `String` | `""` | Stream alias resolved at startup. |
+| `group` | `String` | `"racer-responder-group"` | Consumer group name (stream mode only). |
+| `mode` | `ConcurrencyMode` | `SEQUENTIAL` | Dispatch strategy for concurrent request handling. |
+| `concurrency` | `int` | `1` | Max parallel request handlers when `mode = CONCURRENT`. |
+| `id` | `String` | `""` | Responder ID for metrics and log output. |
+
+---
+
+### `@RacerClient` / `@RacerRequestReply` — request-reply caller
+
+`@RacerClient` marks an **interface** as a Racer proxy. Place it on any interface and add `@RacerRequestReply` on methods that should send a request and await a typed reply. The framework generates a JDK dynamic proxy bean automatically — no implementation class needed.
+
+```java
+@RacerClient
+public interface OrderClient {
+
+    // Send to racer:messages (pub/sub), wait up to 10 s for a reply
+    @RacerRequestReply(channel = "racer:messages", timeout = "10s")
+    Mono<String> processOrder(String orderPayload);
+
+    // Send to a stream, wait with default timeout
+    @RacerRequestReply(stream = "racer:stream:requests")
+    Mono<String> processStream(String payload);
+}
+```
+
+Inject the proxy via constructor injection or field injection in any Spring bean:
+
+```java
+@Service
+public class CheckoutService {
+
+    private final OrderClient orderClient;
+
+    public CheckoutService(OrderClient orderClient) {
+        this.orderClient = orderClient;
+    }
+
+    public Mono<String> checkout(Order order) {
+        return orderClient.processOrder(order.toJson());
+    }
+}
+```
+
+**`@RacerRequestReply` attribute reference**
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `channel` | `String` | `""` | Pub/Sub channel to send the request to. |
+| `channelRef` | `String` | `""` | Channel alias from `racer.channels.<alias>`. |
+| `stream` | `String` | `""` | Redis Stream key for stream-based request-reply. |
+| `streamRef` | `String` | `""` | Stream alias resolved at startup. |
+| `timeout` | `String` | `""` | Override the default timeout (e.g. `"10s"`, `"500ms"`). Falls back to `racer.request-reply.default-timeout`. |
+
+---
+
+### `@EnableRacerClients`
+
+Place on any `@SpringBootApplication` or `@Configuration` class to activate scanning of all `@RacerClient` interfaces in the given base packages.
+
+```java
+@SpringBootApplication
+@EnableRacer
+@EnableRacerClients(basePackages = "com.example.myapp.client")
+public class MyApp {
+    public static void main(String[] args) {
+        SpringApplication.run(MyApp.class, args);
+    }
+}
+```
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `basePackages` | `String[]` | `{}` | Package paths to scan for `@RacerClient` interfaces. |
+| `basePackageClasses` | `Class[]` | `{}` | Type-safe alternative to `basePackages` (uses the package of each class). |
+
+When neither attribute is provided, scanning starts from the package of the annotated class.
 
 ---
 
@@ -657,9 +931,9 @@ Every `RacerChannelPublisher` wraps the payload in a lightweight JSON envelope b
 | `racer:<name>:stream` | Stream | **Durable stream** written by `@PublishResult(durable=true)` |
 | `racer:<name>:stream:<n>` | Stream | **Sharded durable stream** shard `n` (R-8) — e.g. `racer:orders:stream:0` |
 
-Consumer group on `racer:stream:requests`: **`racer-client-group`**  
-Consumer group on durable streams: **`racer-durable-consumers`** (one per stream key in `racer.durable.stream-keys`)  
-Consumer names within group: **`<namePrefix>-<index>`** e.g. `consumer-0`, `consumer-1` (configurable via `racer.consumer.*`)
+Consumer group on `racer:stream:requests` (when using `@RacerResponder(transport=STREAM)`): configurable via `group` attribute  
+Consumer group on durable streams: set via `@RacerStreamListener(group="...")` attribute  
+Consumer names within group: **`<group>-<index>`** e.g. `orders-group-0`, `orders-group-1` (concurrency set via `@RacerStreamListener(concurrency=N)`)
 
 ---
 
@@ -672,7 +946,7 @@ Consumer names within group: **`<namePrefix>-<index>`** e.g. `consumer-0`, `cons
   "id":         "uuid-auto-generated",
   "channel":    "racer:messages",
   "payload":    "your message content",
-  "sender":     "racer-server",
+  "sender":     "racer-demo",
   "timestamp":  "2026-03-01T10:00:00Z",
   "retryCount": 0,
   "priority":   "NORMAL"
@@ -688,7 +962,7 @@ Consumer names within group: **`<namePrefix>-<index>`** e.g. `consumer-0`, `cons
   "correlationId": "uuid-auto-generated",
   "channel":       "racer:messages",
   "payload":       "your request content",
-  "sender":        "racer-server",
+  "sender":        "racer-demo",
   "timestamp":     "2026-03-01T10:00:00Z",
   "replyTo":       "racer:reply:<correlationId>"
 }
@@ -701,8 +975,8 @@ Consumer names within group: **`<namePrefix>-<index>`** e.g. `consumer-0`, `cons
 ```json
 {
   "correlationId": "same-as-request",
-  "payload":       "Processed: your request [echoed by racer-client]",
-  "responder":     "racer-client",
+  "payload":       "Processed: your request [echoed by racer-demo]",
+  "responder":     "racer-demo",
   "success":       true,
   "errorMessage":  null,
   "timestamp":     "2026-03-01T10:00:01Z"
@@ -724,264 +998,197 @@ Consumer names within group: **`<namePrefix>-<index>`** e.g. `consumer-0`, `cons
 
 ---
 
-## API Reference — Server (port 8080)
+## API Reference (port 8080, opt-in)
 
-### Publish APIs
+All REST endpoints are **opt-in** and only exposed when the corresponding property is set to `true` in `application.properties`. Each controller is registered conditionally via `@ConditionalOnProperty`.
 
-Base path: `/api/publish`
-
----
-
-#### `POST /api/publish/async`
-
-Publish a single message **non-blocking**. Returns immediately after enqueuing to Redis; the reactive chain completes in the background.
-
-When `racer.priority.enabled=true` and a `priority` field is provided, the message is routed to the appropriate priority sub-channel via `RacerPriorityPublisher`.
-
-**Request Body**
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `payload` | string | Yes | — | The message content |
-| `sender` | string | No | `racer-server` | Identifies who sent the message |
-| `channel` | string | No | `racer:messages` | Target Pub/Sub channel |
-| `priority` | string | No | — | Priority level: `HIGH`, `NORMAL`, or `LOW` (R-10, requires `racer.priority.enabled=true`) |
-
-```json
-{
-  "payload":  "Urgent order",
-  "sender":   "checkout",
-  "channel":  "racer:orders",
-  "priority": "HIGH"
-}
-```
-
-**Response `200 OK`** (standard)
-
-```json
-{
-  "status":      "published",
-  "mode":        "async",
-  "channel":     "racer:messages",
-  "subscribers": 1
-}
-```
-
-**Response `200 OK`** (with priority)
-
-```json
-{
-  "status":      "published",
-  "mode":        "async-priority",
-  "channel":     "racer:orders",
-  "priority":    "HIGH",
-  "subscribers": 1
-}
-```
-
-**curl example:**
-```bash
-# Standard
-curl -s -X POST http://localhost:8080/api/publish/async \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"Hello async world","sender":"me"}'
-
-# With priority (requires racer.priority.enabled=true)
-curl -s -X POST http://localhost:8080/api/publish/async \
-  -H "Content-Type: application/json" \
-  -d '{"channel":"racer:orders","payload":"urgent","sender":"checkout","priority":"HIGH"}'
-```
+| Endpoint group | Enable property | Base path |
+|----------------|-----------------|-----------|
+| DLQ | `racer.web.dlq-enabled=true` | `/api/dlq` |
+| Retention | `racer.web.retention-enabled=true` | `/api/retention` |
+| Router | `racer.web.router-enabled=true` | `/api/router` |
+| Channels | `racer.web.channels-enabled=true` | `/api/channels` |
+| Schema | `racer.web.schema-enabled=true` | `/api/schema` |
 
 ---
 
-#### `POST /api/publish/sync`
+### DLQ APIs
 
-Publish a single message **blocking** — waits for Redis to confirm the publish before returning.
+Base path: `/api/dlq` (requires `racer.web.dlq-enabled=true`)
 
-**Request Body** — same fields as `/async`
-
-**Response `200 OK`**
-
-```json
-{
-  "status":      "published",
-  "mode":        "sync",
-  "channel":     "racer:messages",
-  "subscribers": 1
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8080/api/publish/sync \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"Hello sync world","sender":"me"}'
-```
+Messages that cause an unhandled exception in a `@RacerListener`, `@RacerStreamListener`, or `@RacerResponder` method are automatically moved to the Dead Letter Queue (a Redis List, key: `racer:dlq`). The DLQ supports inspection, republishing, and clearing.
 
 ---
 
-#### `POST /api/publish/batch`
+#### `GET /api/dlq/messages`
 
-Publish **multiple messages** in one call. Each message is published asynchronously and all run in parallel.
+List all messages currently in the DLQ without removing them.
 
-**Request Body**
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `payloads` | string[] | Yes | — | Array of message strings |
-| `sender` | string | No | `racer-server` | Sender identifier |
-| `channel` | string | No | `racer:messages` | Target channel |
-
-```json
-{
-  "payloads": ["message one", "message two", "message three"],
-  "sender":   "batch-producer",
-  "channel":  "racer:messages"
-}
-```
-
-**Response `200 OK`**
-
-```json
-{
-  "status":       "published",
-  "mode":         "async-batch",
-  "channel":      "racer:messages",
-  "messageCount": 3
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8080/api/publish/batch \
-  -H "Content-Type: application/json" \
-  -d '{"payloads":["msg1","msg2","msg3"],"sender":"batcher"}'
-```
-
----
-
-#### `POST /api/publish/batch-atomic`
-
-Publish **multiple messages to different channels** as an **ordered, atomic sequence** using `RacerTransaction`. All messages are dispatched in the exact order provided via `Flux.concat` — no parallelism. 
-
-**Request Body**
-
-Array of publish items:
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `alias` | string | Yes | — | Channel alias from `racer.channels.<alias>` |
-| `payload` | string | Yes | — | Message content |
-| `sender` | string | No | `racer-tx` | Sender label |
+**Response `200 OK`** — JSON array of `DeadLetterMessage`
 
 ```json
 [
-  { "alias": "orders",        "payload": "Order #100",  "sender": "checkout" },
-  { "alias": "audit",         "payload": "Audit #100",  "sender": "checkout" },
-  { "alias": "notifications", "payload": "Notify #100", "sender": "checkout" }
+  {
+    "id": "550e8400-...",
+    "originalMessage": {
+      "id":         "550e8400-...",
+      "channel":    "racer:messages",
+      "payload":    "this will cause error",
+      "sender":     "me",
+      "timestamp":  "2026-03-01T10:00:00Z",
+      "retryCount": 1
+    },
+    "errorMessage":  "Simulated processing failure for message: 550e8400-...",
+    "exceptionClass": "java.lang.RuntimeException",
+    "failedAt":       "2026-03-01T10:00:01Z",
+    "attemptCount":   1
+  }
 ]
 ```
 
-**Response `200 OK`**
-
-```json
-{
-  "status":       "published",
-  "mode":         "atomic-batch",
-  "messageCount": 3,
-  "subscriberCounts": [1, 1, 1]
-}
-```
-
 **curl example:**
 ```bash
-curl -s -X POST http://localhost:8080/api/publish/batch-atomic \
-  -H "Content-Type: application/json" \
-  -d '[
-    {"alias":"orders","payload":"Order #1","sender":"checkout"},
-    {"alias":"audit","payload":"Audit #1","sender":"checkout"}
-  ]'
+curl http://localhost:8080/api/dlq/messages
 ```
 
 ---
 
-#### `POST /api/publish/batch-pipelined`
+#### `GET /api/dlq/size`
 
-Publish **multiple payloads to a single channel** using parallel reactive merging (R-9 — Throughput Optimisation). All `PUBLISH` commands are issued concurrently; Lettuce (the reactive Redis driver) automatically pipelines them over one connection, reducing N round-trips to ~1.
-
-Use this instead of `/api/publish/batch` when throughput matters more than per-message error isolation.
-
-**Request Body** — same shape as `/api/publish/batch`
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `payloads` | string[] | Yes | — | Array of message strings |
-| `sender` | string | No | `racer-server` | Sender identifier |
-| `channel` | string | No | `racer:messages` | Target channel |
-
-```json
-{
-  "payloads": ["order-1", "order-2", "order-3"],
-  "sender":   "batch-producer",
-  "channel":  "racer:orders"
-}
-```
+Returns the number of messages currently in the DLQ.
 
 **Response `200 OK`**
 
 ```json
 {
-  "status":           "published",
-  "mode":             "pipelined-batch",
-  "channel":          "racer:orders",
-  "messageCount":     3,
-  "subscriberCounts": [1, 1, 1]
+  "dlqSize": 5
 }
 ```
 
 **curl example:**
 ```bash
-curl -s -X POST http://localhost:8080/api/publish/batch-pipelined \
-  -H "Content-Type: application/json" \
-  -d '{"payloads":["msg1","msg2","msg3"],"sender":"bench","channel":"racer:orders"}'
+curl http://localhost:8080/api/dlq/size
 ```
 
 ---
 
-#### `POST /api/publish/batch-atomic-pipelined`
+#### `GET /api/dlq/stats`
 
-Same as `/api/publish/batch-atomic` (multi-channel, alias-based) but executed in **parallel pipelined mode** instead of sequential `Flux.concat` (R-9). Use when you need multi-channel batches with maximum throughput and can tolerate non-deterministic ordering.
-
-**Request Body** — same as `/api/publish/batch-atomic`
+Returns combined DLQ size and republishing statistics.
 
 **Response `200 OK`**
 
 ```json
 {
-  "status":           "published",
-  "mode":             "atomic-batch-pipelined",
-  "messageCount":     3,
-  "subscriberCounts": [1, 1, 1]
+  "queueSize":        3,
+  "totalReprocessed": 7,
+  "permanentlyFailed": 1
 }
 ```
 
 **curl example:**
 ```bash
-curl -s -X POST http://localhost:8080/api/publish/batch-atomic-pipelined \
-  -H "Content-Type: application/json" \
-  -d '[
-    {"alias":"orders","payload":"Order #1","sender":"checkout"},
-    {"alias":"audit","payload":"Audit #1","sender":"checkout"}
-  ]'
+curl http://localhost:8080/api/dlq/stats
+```
+
+---
+
+#### `POST /api/dlq/republish/one`
+
+**Republish** a single DLQ message back to its original Pub/Sub channel. The message flows through the normal pipeline (`@RacerListener` / `@RacerStreamListener`) again.
+
+- Increments `retryCount` on the original message.
+- If `retryCount > MAX_RETRY_ATTEMPTS (3)`: message is permanently discarded.
+
+**Response `200 OK`**
+
+```json
+{
+  "republished": true,
+  "subscribers": 1
+}
+```
+
+Returns `republished: false` when the queue was empty.
+
+**curl example:**
+```bash
+curl -s -X POST http://localhost:8080/api/dlq/republish/one
+```
+
+---
+
+#### `DELETE /api/dlq/clear`
+
+Remove **all messages** from the DLQ permanently. Use with caution.
+
+**Response `200 OK`**
+
+```json
+{
+  "cleared": true
+}
+```
+
+**curl example:**
+```bash
+curl -s -X DELETE http://localhost:8080/api/dlq/clear
+```
+
+---
+
+### Retention APIs
+
+Base path: `/api/retention` (requires `racer.web.retention-enabled=true`)
+
+---
+
+#### `POST /api/retention/trim`
+
+Trigger an **immediate on-demand retention run**: trims all configured durable streams to `racer.retention.stream-max-len` entries, and prunes DLQ entries older than `racer.retention.dlq-max-age-hours`.
+
+**Response `200 OK`**
+
+```json
+{
+  "status": "trimmed",
+  "timestamp": "2026-03-01T10:00:00Z"
+}
+```
+
+**curl example:**
+```bash
+curl -s -X POST http://localhost:8080/api/retention/trim
+```
+
+---
+
+#### `GET /api/retention/config`
+
+Returns the current retention configuration being applied by `RacerRetentionService`.
+
+**Response `200 OK`**
+
+```json
+{
+  "streamMaxLen":     10000,
+  "dlqMaxAgeHours":   72,
+  "scheduleCron":     "0 0 * * * *"
+}
+```
+
+**curl example:**
+```bash
+curl http://localhost:8080/api/retention/config
 ```
 
 ---
 
 ### Router APIs
 
-Base path: `/api/router`
+Base path: `/api/router` (requires `racer.web.router-enabled=true`)
 
-Content-based routing is configured via `@RacerRoute` annotations (see [Racer Annotations](#racerroute--content-based-routing)). These endpoints let you inspect and test the compiled rules at runtime.
+Content-based routing is configured via `@RacerRoute` annotations (see [`@RacerRoute — content-based routing`](#racerroute--content-based-routing)). These endpoints let you inspect and test the compiled rules at runtime.
 
 ---
 
@@ -1020,11 +1227,11 @@ Dry-run a message through the router without actually publishing it. Returns whi
 
 ```json
 {
-  "matched": true,
+  "matched":   true,
   "ruleIndex": 0,
-  "field":    "type",
-  "pattern":  "^ORDER.*",
-  "to":       "racer:orders"
+  "field":     "type",
+  "pattern":   "^ORDER.*",
+  "to":        "racer:orders"
 }
 ```
 
@@ -1045,9 +1252,7 @@ curl -s -X POST http://localhost:8080/api/router/test \
 
 ### Channel Registry APIs
 
-Base path: `/api/channels`
-
-These endpoints demonstrate the annotation-driven publishing infrastructure and expose the live channel registry.
+Base path: `/api/channels` (requires `racer.web.channels-enabled=true`)
 
 ---
 
@@ -1073,572 +1278,29 @@ curl http://localhost:8080/api/channels
 
 ---
 
-#### `POST /api/channels/publish/{alias}`
+### Schema APIs
 
-Publish an arbitrary JSON body to the channel registered under `{alias}` using the injected `RacerChannelPublisher`.
+Base path: `/api/schema` (requires `racer.web.schema-enabled=true`)
 
-**Path Parameter**
+`RacerSchemaRegistry` validates every message against a JSON Schema Draft-07 file at publish and consume time (opt-in via `racer.schema.enabled=true`). These endpoints expose the schema registry at runtime.
 
-| Param | Description |
-|-------|-------------|
-| `alias` | Channel alias as declared in `racer.channels.<alias>`. Use `__default__` for the default channel. |
-
-**Request Body** — any valid JSON object
-
-```json
-{ "orderId": "123", "item": "Widget", "qty": 5 }
-```
-
-**Response `200 OK`**
-
-```json
-{
-  "published":   true,
-  "alias":       "orders",
-  "channel":     "racer:orders",
-  "subscribers": 1
-}
-```
-
-**curl examples:**
-```bash
-# Publish to the orders channel
-curl -s -X POST http://localhost:8080/api/channels/publish/orders \
-  -H "Content-Type: application/json" \
-  -d '{"orderId":"42","item":"Widget"}'
-
-# Publish to notifications
-curl -s -X POST http://localhost:8080/api/channels/publish/notifications \
-  -H "Content-Type: application/json" \
-  -d '{"message":"System maintenance at 03:00"}'
-
-# Publish to default channel
-curl -s -X POST http://localhost:8080/api/channels/publish/__default__ \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"hello default"}'
-```
-
----
-
-#### `POST /api/channels/publish-annotated`
-
-Live demonstration of `@PublishResult`. The method `buildOrderEvent()` is annotated with `@PublishResult(channelRef = "orders")` — its return value is **automatically published to `racer:orders`** as a side-effect. The HTTP caller receives the same object.
-
-**Request Body** — any JSON object
-
-```json
-{ "item": "Gadget", "qty": 5 }
-```
-
-**Response `200 OK`** (same object, also published to `racer:orders`)
-
-```json
-{
-  "item":        "Gadget",
-  "qty":         5,
-  "eventType":   "ORDER_CREATED",
-  "processedAt": "2026-03-01T12:00:00Z",
-  "source":      "racer-server"
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8080/api/channels/publish-annotated \
-  -H "Content-Type: application/json" \
-  -d '{"item":"Gadget","qty":5}'
-```
-
----
-
-#### `POST /api/channels/demo/orders`
-
-Publishes body directly to `racer:orders` using the `@RacerPublisher("orders")` injected field.
-
-```bash
-curl -s -X POST http://localhost:8080/api/channels/demo/orders \
-  -H "Content-Type: application/json" \
-  -d '{"orderId":"99","status":"CONFIRMED"}'
-```
-
-**Response `200 OK`**
-```json
-{ "channel": "racer:orders", "subscribers": 1 }
-```
-
----
-
-#### `POST /api/channels/demo/notifications`
-
-Publishes body directly to `racer:notifications` using the `@RacerPublisher("notifications")` injected field.
-
-```bash
-curl -s -X POST http://localhost:8080/api/channels/demo/notifications \
-  -H "Content-Type: application/json" \
-  -d '{"message":"Order #99 shipped"}'
-```
-
-**Response `200 OK`**
-```json
-{ "channel": "racer:notifications", "subscribers": 1 }
-```
-
----
-
-### Request-Reply APIs
-
-Base path: `/api/request`
-
-The server sends a request and **waits synchronously** for the client to process it and send back a reply. If the client doesn't reply within the timeout, a `504` is returned.
-
----
-
-#### `POST /api/request/pubsub`
-
-Two-way request-reply over **Redis Pub/Sub**.
-
-**How it works:**
-1. Server creates a `RacerRequest` with a `correlationId`.
-2. Sets `replyTo` = `racer:reply:<correlationId>` (ephemeral channel).
-3. Subscribes to that reply channel.
-4. Publishes the request to `racer:messages`.
-5. Client receives it, processes it, publishes `RacerReply` back to `replyTo`.
-6. Server receives the reply and returns the HTTP response.
-
-**Request Body**
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `payload` | string | Yes | — | The request content |
-| `sender` | string | No | `racer-server` | Sender identifier |
-| `timeoutSeconds` | int | No | `30` | How long to wait for a reply |
-
-```json
-{
-  "payload":        "What is the status?",
-  "sender":         "server",
-  "timeoutSeconds": 15
-}
-```
-
-**Response `200 OK` (success)**
-
-```json
-{
-  "transport":    "pubsub",
-  "correlationId":"550e8400-e29b-41d4-a716-446655440000",
-  "success":      true,
-  "reply":        "Processed: What is the status? [echoed by racer-client]",
-  "responder":    "racer-client",
-  "errorMessage": ""
-}
-```
-
-**Response `504 Gateway Timeout` (no reply in time)**
-
-```json
-{
-  "transport": "pubsub",
-  "error":     "Did not observe any item or terminal signal within 30000ms"
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8080/api/request/pubsub \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"ping","sender":"me","timeoutSeconds":10}'
-```
-
-**Trigger a failure reply** (payload containing "error"):
-```bash
-curl -s -X POST http://localhost:8080/api/request/pubsub \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"this should error","sender":"me"}'
-```
-
----
-
-#### `POST /api/request/stream`
-
-Two-way request-reply over **Redis Streams**.
-
-**How it works:**
-1. Server writes a request entry to stream `racer:stream:requests` with fields: `correlationId`, `replyTo`, `payload`.
-2. Client (consumer group `racer-client-group`) reads the entry, processes it.
-3. Client writes a reply entry to stream `racer:stream:response:<correlationId>`.
-4. Server polls the response stream (every 200ms) until the reply appears or timeout expires.
-5. Response stream is auto-deleted after reading.
-
-**Request Body** — same fields as `/pubsub`
-
-**Response `200 OK` (success)**
-
-```json
-{
-  "transport":    "stream",
-  "correlationId":"550e8400-e29b-41d4-a716-446655440000",
-  "success":      true,
-  "reply":        "Stream-processed: ping [by racer-client-stream]",
-  "responder":    "racer-client-stream",
-  "errorMessage": ""
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8080/api/request/stream \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"ping via stream","sender":"me"}'
-```
-
----
-
-## API Reference — Client (port 8081)
-
-### Consumer APIs
-
-Base path: `/api/consumer`
-
----
-
-#### `GET /api/consumer/status`
-
-Returns the current state of the message consumer.
-
-**Response `200 OK`**
-
-```json
-{
-  "mode":           "ASYNC",
-  "processedCount": 42,
-  "failedCount":    3
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `mode` | Current processing mode: `ASYNC` or `SYNC` |
-| `processedCount` | Total messages successfully processed since startup |
-| `failedCount` | Total messages that failed and were sent to the DLQ |
-
-**curl example:**
-```bash
-curl http://localhost:8081/api/consumer/status
-```
-
----
-
-#### `PUT /api/consumer/mode?mode=SYNC`
-
-Switch the consumer's processing mode at **runtime** without restarting.
-
-| Mode | Behaviour |
-|------|-----------|
-| `ASYNC` | Non-blocking; uses reactive scheduler; concurrent processing |
-| `SYNC` | Blocking (on `boundedElastic` scheduler); one at a time |
-
-**Query Parameter**
-
-| Param | Values | Description |
-|-------|--------|-------------|
-| `mode` | `SYNC`, `ASYNC` | Target mode (case-insensitive) |
-
-**Response `200 OK`**
-
-```json
-{
-  "status": "switched",
-  "mode":   "SYNC"
-}
-```
-
-**Response `400 Bad Request`** (invalid value)
-
-```json
-{
-  "error": "Invalid mode: FOO. Must be SYNC or ASYNC."
-}
-```
-
-**curl examples:**
-```bash
-# Switch to SYNC
-curl -s -X PUT "http://localhost:8081/api/consumer/mode?mode=SYNC"
-
-# Switch back to ASYNC
-curl -s -X PUT "http://localhost:8081/api/consumer/mode?mode=ASYNC"
-```
-
----
-
-### DLQ APIs
-
-Base path: `/api/dlq`
-
-Messages that throw an exception during processing are automatically moved to the Dead Letter Queue (a Redis List, key: `racer:dlq`). The DLQ supports inspection, reprocessing, republishing, and clearing.
-
----
-
-#### `GET /api/dlq/messages`
-
-List all messages currently in the DLQ without removing them.
-
-**Response `200 OK`** — JSON array of `DeadLetterMessage`
-
-```json
-[
-  {
-    "id": "550e8400-...",
-    "originalMessage": {
-      "id":         "550e8400-...",
-      "channel":    "racer:messages",
-      "payload":    "this will cause error",
-      "sender":     "me",
-      "timestamp":  "2026-03-01T10:00:00Z",
-      "retryCount": 1
-    },
-    "errorMessage":  "Simulated processing failure for message: 550e8400-...",
-    "exceptionClass": "java.lang.RuntimeException",
-    "failedAt":       "2026-03-01T10:00:01Z",
-    "attemptCount":   1
-  }
-]
-```
-
-**curl example:**
-```bash
-curl http://localhost:8081/api/dlq/messages
-```
-
----
-
-#### `GET /api/dlq/size`
-
-Returns the number of messages currently in the DLQ.
-
-**Response `200 OK`**
-
-```json
-{
-  "dlqSize": 5
-}
-```
-
-**curl example:**
-```bash
-curl http://localhost:8081/api/dlq/size
-```
-
----
-
-#### `GET /api/dlq/stats`
-
-Returns combined DLQ size and reprocessing statistics.
-
-**Response `200 OK`**
-
-```json
-{
-  "queueSize":       3,
-  "totalReprocessed": 7,
-  "permanentlyFailed": 1
-}
-```
-
-**curl example:**
-```bash
-curl http://localhost:8081/api/dlq/stats
-```
-
----
-
-#### `POST /api/dlq/reprocess/one?mode=ASYNC`
-
-**Dequeue and directly reprocess** a single message from the DLQ.
-
-- The message is popped from the DLQ.
-- Processed by the active processor (SYNC or ASYNC).
-- If successful: counted in `totalReprocessed`.
-- If it fails again **and** `retryCount < MAX_RETRY_ATTEMPTS (3)**: re-enqueued.
-- If `retryCount >= 3`: permanently discarded (logged), counted in `permanentlyFailed`.
-
-**Query Parameter**
-
-| Param | Values | Default | Description |
-|-------|--------|---------|-------------|
-| `mode` | `SYNC`, `ASYNC` | `ASYNC` | Which processor to use |
-
-**Response `200 OK`**
-
-```json
-{
-  "reprocessed":      true,
-  "mode":             "ASYNC",
-  "totalReprocessed": 1,
-  "permanentlyFailed": 0
-}
-```
-
-Returns `reprocessed: false` if the queue was empty.
-
-**curl example:**
-```bash
-curl -s -X POST "http://localhost:8081/api/dlq/reprocess/one?mode=ASYNC"
-```
-
----
-
-#### `POST /api/dlq/reprocess/all?mode=ASYNC`
-
-Reprocess **all messages** currently in the DLQ one by one.
-
-**Query Parameter** — same as `/reprocess/one`
-
-**Response `200 OK`**
-
-```json
-{
-  "reprocessedCount": 5,
-  "mode":             "ASYNC",
-  "totalReprocessed": 12,
-  "permanentlyFailed": 1
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST "http://localhost:8081/api/dlq/reprocess/all?mode=SYNC"
-```
-
----
-
-#### `POST /api/dlq/republish/one`
-
-**Republish** a single DLQ message back to its original Pub/Sub channel instead of processing it directly. This lets it flow through the normal pipeline (subscriber → processor) again.
-
-- Increments `retryCount` on the original message.
-- If `retryCount > MAX_RETRY_ATTEMPTS`: message is discarded.
-
-**Response `200 OK`**
-
-```json
-{
-  "republished": true,
-  "subscribers": 1
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8081/api/dlq/republish/one
-```
-
----
-
-#### `DELETE /api/dlq/clear`
-
-Remove **all messages** from the DLQ permanently. Use with caution.
-
-**Response `200 OK`**
-
-```json
-{
-  "cleared": true
-}
-```
-
-**curl example:**
-```bash
-curl -s -X DELETE http://localhost:8081/api/dlq/clear
-```
-
----
-
-#### `POST /api/dlq/trim`
-
-Trigger an **immediate on-demand retention run**: trims all configured durable streams to `racer.retention.stream-max-len` entries, and prunes DLQ entries older than `racer.retention.dlq-max-age-hours`.
-
-**Response `200 OK`**
-
-```json
-{
-  "status": "trimmed",
-  "timestamp": "2026-03-01T10:00:00Z"
-}
-```
-
-**curl example:**
-```bash
-curl -s -X POST http://localhost:8081/api/dlq/trim
-```
-
----
-
-#### `GET /api/dlq/retention-config`
-
-Returns the current retention configuration being applied by `RacerRetentionService`.
-
-**Response `200 OK`**
-
-```json
-{
-  "streamMaxLen":     10000,
-  "dlqMaxAgeHours":   72,
-  "scheduleCron":     "0 0 * * * *"
-}
-```
-
-**curl example:**
-```bash
-curl http://localhost:8081/api/dlq/retention-config
-```
-
----
-
-### Responder Status API
-
-Base path: `/api/responder`
-
----
-
-#### `GET /api/responder/status`
-
-Returns how many request-reply interactions the client has handled since startup.
-
-**Response `200 OK`**
-
-```json
-{
-  "pubsub": {
-    "repliesSent": 12
-  },
-  "stream": {
-    "requestsProcessed": 8
-  }
-}
-```
-
-**curl example:**
-```bash
-curl http://localhost:8081/api/responder/status
-```
+See the full schema API documentation and `RacerSchemaRegistry` javadoc for endpoint details.
 
 ---
 
 ## Observability & Metrics
 
-Racer integrates with **Micrometer** via `RacerMetrics` (auto-configured when `micrometer-core` is on the classpath). Both `racer-server` and `racer-client` include `spring-boot-starter-actuator` and `micrometer-registry-prometheus`.
+Racer integrates with **Micrometer** via `RacerMetrics` (auto-configured when `micrometer-core` is on the classpath). The `racer-demo` module includes `spring-boot-starter-actuator` and `micrometer-registry-prometheus`, all served on port **8080**.
 
 ### Actuator endpoints
 
 | Endpoint | Port | Description |
 |----------|------|-------------|
-| `GET /actuator/health` | 8080 / 8081 | Liveness check |
-| `GET /actuator/info` | 8080 / 8081 | Build info |
-| `GET /actuator/metrics` | 8080 / 8081 | All registered metric names |
-| `GET /actuator/metrics/{name}` | 8080 / 8081 | Detail for one metric |
-| `GET /actuator/prometheus` | 8080 / 8081 | Prometheus-format scrape endpoint |
+| `GET /actuator/health` | 8080 | Liveness check |
+| `GET /actuator/info` | 8080 | Build info |
+| `GET /actuator/metrics` | 8080 | All registered metric names |
+| `GET /actuator/metrics/{name}` | 8080 | Detail for one metric |
+| `GET /actuator/prometheus` | 8080 | Prometheus-format scrape endpoint |
 
 Enable all relevant endpoints in `application.properties`:
 ```properties
@@ -1677,7 +1339,7 @@ curl http://localhost:8080/actuator/prometheus | grep racer
 
 1. Add `http://localhost:8080/actuator/prometheus` as a Prometheus scrape target.
 2. Import a generic Spring Boot Micrometer dashboard (e.g. Grafana dashboard ID **4701**).
-3. Filter panels by `application="racer-server"` or `application="racer-client"`.
+3. Filter panels by `application="racer-demo"`.
 
 ---
 
@@ -1749,18 +1411,27 @@ By default a single consumer (`consumer-0`) reads from each stream. For high-thr
 
 ### Concurrency configuration
 
-```properties
-# racer-client/application.properties
-racer.consumer.concurrency=4           # spawn consumer-0 … consumer-3
-racer.consumer.name-prefix=worker      # worker-0 … worker-3
-racer.consumer.poll-batch-size=10      # read 10 entries per XREADGROUP call
-racer.consumer.poll-interval-ms=100    # poll every 100 ms when idle
+Concurrency is configured **per-listener** directly on the `@RacerStreamListener` annotation:
+
+```java
+@RacerStreamListener(
+    streamKey       = "racer:orders:stream",
+    group           = "orders-group",
+    concurrency     = 4,    // spawn consumer-0 … consumer-3
+    batchSize       = 10,   // read 10 entries per XREADGROUP call
+    pollIntervalMs  = 100   // poll every 100 ms when idle
+)
+public Mono<Void> handleOrder(RacerMessage msg) {
+    return processOrder(msg);
+}
 ```
+
+Each `@RacerStreamListener` method independently controls its own thread pool, so different streams can have different concurrency levels without any global properties.
 
 ### Sharding configuration
 
 ```properties
-# racer-server/application.properties — publisher side
+# racer-demo/application.properties — publisher side
 racer.sharding.enabled=true
 racer.sharding.shard-count=4
 racer.sharding.streams=racer:orders:stream,racer:events:stream
@@ -1792,12 +1463,12 @@ racer.durable.stream-keys=racer:orders:stream:0,racer:orders:stream:1,racer:orde
 
 ### Comparison
 
-| Endpoint | Execution model | Use when |
-|----------|-----------------|----------|
-| `POST /api/publish/batch` | Sequential `Flux.concat` | Order matters, low volume |
-| `POST /api/publish/batch-pipelined` | Parallel `Flux.flatMap` (pipelined) | High throughput, single channel |
-| `POST /api/publish/batch-atomic` | Sequential, multi-channel | Ordered cross-channel fanout |
-| `POST /api/publish/batch-atomic-pipelined` | Parallel, multi-channel | Cross-channel, max throughput |
+| Method | Execution model | Use when |
+|--------|-----------------|----------|
+| `RacerPublisher.publish(...)` (loop) | Sequential | Order matters, low volume |
+| `RacerPipelinedPublisher.publishBatch(...)` | Parallel `Flux.flatMap` (pipelined) | High throughput, single channel |
+| `RacerTransaction` (concat) | Sequential, multi-channel | Ordered cross-channel fanout |
+| `RacerPipelinedPublisher.publishBatchMultiChannel(...)` | Parallel, multi-channel | Cross-channel, max throughput |
 
 ### Usage from Java
 
@@ -1852,19 +1523,32 @@ RacerMQ implements priority via separate Pub/Sub **sub-channels**, one per prior
 
 Lower weight = higher priority. Custom levels can be declared in `racer.priority.levels`.
 
-### Server-side publishing
+### Publishing with priority
 
 ```properties
-# racer-server/application.properties
+# racer-demo/application.properties
 racer.priority.enabled=true
 racer.priority.levels=HIGH,NORMAL,LOW
 racer.priority.channels=orders,notifications
 ```
 
-```bash
-curl -X POST http://localhost:8080/api/publish/async \
-  -H "Content-Type: application/json" \
-  -d '{"channel":"racer:orders","payload":"urgent order","sender":"checkout","priority":"HIGH"}'
+Publish programmatically via `RacerPriorityPublisher`:
+
+```java
+@Autowired RacerPriorityPublisher priorityPublisher;
+
+priorityPublisher.publish("racer:orders", "urgent order", "checkout", PriorityLevel.HIGH)
+    .subscribe();
+```
+
+Or use `@RacerPriority` alongside `@PublishResult`:
+
+```java
+@RacerPriority(defaultLevel = PriorityLevel.HIGH)
+@PublishResult(channelRef = "orders")
+public Order createUrgentOrder(OrderRequest req) {
+    return orderService.create(req);
+}
 ```
 
 This publishes to `racer:orders:priority:HIGH`.
@@ -1872,7 +1556,7 @@ This publishes to `racer:orders:priority:HIGH`.
 ### Client-side consumption
 
 ```properties
-# racer-client/application.properties
+# racer-demo/application.properties
 racer.priority.enabled=true
 racer.priority.levels=HIGH,NORMAL,LOW
 racer.priority.strategy=strict
@@ -1901,101 +1585,156 @@ If the returned `RacerMessage.priority` is blank/null, `defaultLevel` from `@Rac
 
 ## End-to-End Flows
 
-### Flow 1 — Fire-and-Forget (Pub/Sub async)
+### Flow 1 — Fire-and-Forget (Pub/Sub)
 
 ```
-Client      POST /api/publish/async
-Server      → RacerMessage created (id, timestamp auto-set)
-            → Published to racer:messages
-Client      ConsumerSubscriber receives message
-            → Routed to AsyncMessageProcessor (default)
-            → If success: processedCount++
-            → If throws: DLQ.enqueue(message, error)
+Producer    @PublishResult(channelRef="orders")
+            → PublishResultAspect intercepts return value
+            → RacerChannelPublisher.publishAsync("racer:orders", payload)
+            → PUBLISH racer:orders <JSON>
+
+Consumer    @RacerListener(channel="racer:orders", mode=CONCURRENT, concurrency=4)
+            → RacerListenerRegistrar subscribes via ReactiveRedisMessageListenerContainer
+            → Message dispatched on boundedElastic() via flatMap(concurrency=4)
+            → If throws: RacerDeadLetterHandler.enqueue(message, error)
+            → DLQ written to racer:dlq (Redis List, leftPush)
 ```
 
 ### Flow 2 — Request-Reply via Pub/Sub
 
 ```
-Client      POST /api/request/pubsub {"payload":"ping"}
-Server      → Generates correlationId = "abc123"
-            → Subscribes to racer:reply:abc123
+Client      @RacerClient(timeout=10s) interface with @RacerRequestReply(channel="racer:messages")
+            → RacerClientFactoryBean creates a dynamic JDK proxy
+            → Caller invokes proxy method → correlationId generated
+            → Subscribes to racer:reply:<correlationId>
             → Publishes RacerRequest to racer:messages
-Client      PubSubResponderService receives message
-            → Detects replyTo is set → treats as request
-            → Processes request (business logic)
-            → Publishes RacerReply to racer:reply:abc123
-Server      → Receives reply on racer:reply:abc123
-            → HTTP 200 with reply payload returned
+
+Responder   @RacerResponder(requestChannel="racer:messages", transport=PUBSUB)
+            → RacerResponderRegistrar subscribes at startup
+            → Receives request, invokes annotated method (business logic)
+            → Publishes RacerReply to replyTo channel
+
+Caller      → Receives reply on racer:reply:<correlationId>
+            → Proxy returns reply payload to caller
+            → Timeout (default 30 s) → TimeoutException propagated
 ```
 
-### Flow 3 — Request-Reply via Streams
+### Flow 3 — Durable Stream Listener
 
 ```
-Client      POST /api/request/stream {"payload":"ping"}
-Server      → Generates correlationId = "xyz789"
-            → Writes entry to racer:stream:requests
-            → Polls racer:stream:response:xyz789 every 200ms
-Client      StreamResponderService reads from racer:stream:requests
-              (consumer group: racer-client-group, consumer: client-1)
-            → Processes request
-            → Writes RacerReply to racer:stream:response:xyz789
-            → ACKs the stream entry
-Server      → Detects reply in response stream
-            → Deletes racer:stream:response:xyz789
-            → HTTP 200 with reply payload returned
+Producer    @PublishResult(channelRef="orders", durable=true, streamKey="racer:orders:stream")
+            → PublishResultAspect routes to RacerStreamPublisher
+            → XADD racer:orders:stream * payload=<JSON>
+
+Consumer    @RacerStreamListener(streamKey="racer:orders:stream", group="orders-group",
+                concurrency=4, batchSize=10, pollIntervalMs=100)
+            → RacerStreamListenerRegistrar creates consumer group (XGROUP CREATE)
+            → Spawns N threads (consumer-0 … consumer-3)
+            → Each thread: XREADGROUP GROUP orders-group consumer-N COUNT 10
+            → Dispatches to annotated method
+            → On success: XACK racer:orders:stream orders-group <id>
+            → On failure: message forwarded to DLQ
 ```
 
-### Flow 4 — DLQ and Reprocessing
+### Flow 4 — DLQ and Republish
 
 ```
-Message arrives → AsyncMessageProcessor.process() throws RuntimeException
-                → failedCount++
-                → DLQ.enqueue(message, error)
-                → JSON written to racer:dlq (Redis List, leftPush)
+Message fails → RacerDeadLetterHandler.enqueue(message, error)
+             → JSON written to racer:dlq (Redis List, leftPush)
+             → retryCount incremented in message
 
-Later:
-POST /api/dlq/reprocess/one?mode=SYNC
-                → Pops from racer:dlq (rightPop, FIFO)
-                → retryCount++
-                → If retryCount > 3: permanently discarded
-                → Else: SyncMessageProcessor.process(message)
-                → If succeeds: reprocessedCount++
-                → If fails again: re-enqueued with new retryCount
+Later (opt-in REST, racer.web.dlq-enabled=true):
+POST /api/dlq/republish/one
+             → DeadLetterQueueService pops entry from racer:dlq (rightPop, FIFO)
+             → Re-publishes to original channel via RacerChannelPublisher
+             → Consumer receives it again and retries
+
+POST /api/dlq/republish/all
+             → Drains entire DLQ, republishing each message
 ```
 
 ---
 
 ## Extending the Application
 
-### Add a custom message processor
+### Add a consumer for a new channel
 
-1. Create a class in `racer-client` implementing `MessageProcessor`:
+Use `@RacerListener` on any Spring bean method:
 
 ```java
-@Slf4j
-@Component("myProcessor")
-public class MyCustomProcessor implements MessageProcessor {
+@Component
+public class InventoryConsumer {
 
-    @Override
-    public Mono<Void> process(RacerMessage message) {
-        return Mono.fromRunnable(() -> {
-            log.info("Custom processing: {}", message.getPayload());
-            // your business logic here
-        });
+    @RacerListener(channel = "racer:inventory", mode = ConcurrencyMode.CONCURRENT, concurrency = 4)
+    public Mono<Void> onInventoryUpdate(RacerMessage message) {
+        return inventoryService.apply(message.getPayload());
     }
-
-    @Override
-    public String getMode() { return "CUSTOM"; }
 }
 ```
 
-2. Inject it into `ConsumerSubscriber` alongside `syncProcessor` and `asyncProcessor`.
+The `RacerListenerRegistrar` automatically subscribes at startup — no wiring in XML or configuration classes.
 
----
+**Supported parameter types:**
+
+| Parameter type | What gets passed |
+|---------------|-----------------|
+| `RacerMessage` | Full envelope (id, payload, sender, timestamp, …) |
+| `String` | Raw payload string |
+| `MyDto` (any type) | `objectMapper.readValue(payload, MyDto.class)` |
+
+### Add a durable stream consumer
+
+```java
+@Component
+public class OrderStreamConsumer {
+
+    @RacerStreamListener(
+        streamKey      = "racer:orders:stream",
+        group          = "orders-group",
+        concurrency    = 2,
+        batchSize      = 20,
+        pollIntervalMs = 50
+    )
+    public Mono<Void> handleOrderEvent(RacerMessage message) {
+        return orderService.process(message.getPayload());
+    }
+}
+```
+
+Declare the stream-key in `application.properties`:
+```properties
+racer.durable.stream-keys=racer:orders:stream
+```
+
+### Add a request-reply responder
+
+```java
+@Component
+public class PricingResponder {
+
+    @RacerResponder(requestChannel = "racer:pricing:requests", transport = Transport.PUBSUB)
+    public Mono<String> getPrice(RacerMessage request) {
+        return pricingService.getPrice(request.getPayload());
+    }
+}
+```
+
+### Add a declarative request-reply client
+
+```java
+@RacerClient(timeout = 5)
+public interface PricingClient {
+
+    @RacerRequestReply(channel = "racer:pricing:requests")
+    Mono<String> getPrice(String payload);
+}
+
+@EnableRacerClients(basePackages = "com.example")
+@SpringBootApplication
+public class MyApp { ... }
+```
 
 ### Add a custom channel
-
-**Option A — annotation-driven (recommended)**
 
 1. Add the alias to `application.properties`:
 ```properties
@@ -2017,60 +1756,33 @@ inventoryPublisher.publishAsync(stockEvent).subscribe();
 public Mono<StockEvent> reserveStock(StockRequest req) { ... }
 ```
 
-**Option B — programmatic**
-
-1. Add the channel constant to `RedisChannels.java` in `racer-common`.
-2. Publish to it via `PublisherService.publishAsync("racer:inventory", payload, sender)`.
-3. In `ConsumerSubscriber`, add a new subscription:
-
-```java
-listenerContainer
-    .receive(ChannelTopic.of("racer:inventory"))
-    .flatMap(this::handleMessage)
-    .subscribe();
-```
-
----
-
-### Override request-reply processing logic
-
-In `PubSubResponderService` and `StreamResponderService`, replace the `processRequest()` method body with real business logic:
-
-```java
-private String processRequest(RacerRequest request) {
-    // Call your service, query DB, etc.
-    return myService.handle(request.getPayload());
-}
-```
-
 ---
 
 ## Error Handling & DLQ Behaviour
 
 | Scenario | Behaviour |
 |----------|-----------|
-| Processor throws any exception | Message is moved to DLQ with error details |
+| `@RacerListener` method throws | Message forwarded to `RacerDeadLetterHandler` → enqueued to `racer:dlq` |
+| `@RacerStreamListener` method throws | NACK / no ACK → message stays pending; after configurable pending threshold forwarded to DLQ |
 | Deserialization fails | Error is logged, message skipped (not DLQ'd) |
-| DLQ reprocess fails again | Re-enqueued with incremented `retryCount` |
+| DLQ republish fails | Message stays in DLQ; error logged |
 | `retryCount > 3` | Message permanently discarded, logged as error |
-| Request-reply timeout | Server returns HTTP 504 with error message |
+| Request-reply timeout | `TimeoutException` propagated to caller via `Mono.error(...)` |
 | Redis unavailable | Spring Boot reactive pipeline propagates error; check logs |
 
 The maximum retry limit is controlled by `RedisChannels.MAX_RETRY_ATTEMPTS` (default: **3**).
 
-To trigger DLQ intentionally for testing, include the word **"error"** anywhere in the `payload`. Both `SyncMessageProcessor` and `AsyncMessageProcessor` detect this and throw a `RuntimeException`.
+To trigger DLQ intentionally for testing, publish a message and have your `@RacerListener` throw an exception:
 
 ```bash
-# This message WILL fail and land in the DLQ
-curl -s -X POST http://localhost:8080/api/publish/async \
-  -H "Content-Type: application/json" \
-  -d '{"payload":"trigger an error here","sender":"tester"}'
+# Enable DLQ REST API first
+# racer.web.dlq-enabled=true in application.properties
 
-# Confirm it's in the DLQ
-curl http://localhost:8081/api/dlq/size
+# Check DLQ size
+curl http://localhost:8080/api/dlq/size
 
-# Reprocess it
-curl -s -X POST "http://localhost:8081/api/dlq/reprocess/one?mode=ASYNC"
+# Republish one DLQ entry back to its original channel
+curl -s -X POST http://localhost:8080/api/dlq/republish/one
 ```
 
 ---
@@ -2115,7 +1827,7 @@ This section explains how it compares architecturally to dedicated message broke
 | **Content-based routing** | `@RacerRoute` + `@RacerRouteRule` — declarative regex-pattern fan-out to named channels with zero routing code in business logic. |
 | **Message priority** | `@RacerPriority` + `RacerPriorityConsumerService` — `HIGH`/`NORMAL`/`LOW` sub-channels with strict-order drain; no separate queue infrastructure needed. |
 | **Pipelined batch publish** | `RacerPipelinedPublisher` issues all commands concurrently over a single Lettuce connection, collapsing N round-trips into ~1 for maximum throughput. |
-| **Consumer sharding** | `RacerShardedStreamPublisher` distributes messages across N streams by CRC-16 key hash; `racer.consumer.concurrency` scales readers per stream. |
+| **Consumer sharding** | `RacerShardedStreamPublisher` distributes messages across N streams by CRC-16 key hash; `@RacerStreamListener(concurrency=N)` scales readers per stream. |
 | **Schema validation** | `RacerSchemaRegistry` validates every message against a JSON Schema Draft-07 file at publish and consume time — opt-in via `racer.schema.enabled=true`. |
 | **Retention lifecycle** | `RacerRetentionService` automatically trims streams (`XTRIM MAXLEN`) and prunes stale DLQ entries on a configurable cron schedule. |
 | **Config-driven channels** | Add `racer.channels.payments.name=racer:payments` → channel exists at startup. No broker admin, no exchange bindings. |
@@ -2131,11 +1843,11 @@ This section explains how it compares architecturally to dedicated message broke
 | **Pub/Sub drops messages when no subscriber** | Messages lost if consumer is offline | Use Redis Streams for durable delivery | ✅ **Implemented** — `@PublishResult(durable=true)` + `RacerStreamConsumerService` (R-2) |
 | **No built-in monitoring** | No management UI | Redis `INFO`/`XINFO` via `redis-cli` | ✅ **Implemented** — `RacerMetrics` + Actuator + Prometheus/Grafana (R-3) |
 | **No message TTL / expiry** | Streams and DLQ grow indefinitely | `DELETE /api/dlq/clear` for manual cleanup | ✅ **Implemented** — `RacerRetentionService` — `@Scheduled` XTRIM + DLQ age pruning (R-4) |
-| **No cross-channel transactions** | Can't atomically publish to multiple channels | Sequential publish (at-most-once) | ✅ **Implemented** — `RacerTransaction` + `/api/publish/batch-atomic` (R-5) |
+| **No cross-channel transactions** | Can't atomically publish to multiple channels | Sequential publish (at-most-once) | ✅ **Implemented** — `RacerTransaction` (R-5) |
 | **Single Redis = single point of failure** | No built-in clustering at the broker level | Spring Data Redis supports Sentinel/Cluster natively | ✅ **Implemented** — `compose.sentinel.yaml` + `compose.cluster.yaml` (R-6) |
 | **No schema registry** | Raw JSON; no schema evolution guards | `@JsonTypeInfo` versioned DTOs | ✅ **Implemented** — `RacerSchemaRegistry` JSON Schema Draft-07 validation on publish & consume paths; opt-in via `racer.schema.enabled=true`; REST API at `/api/schema` (R-7) |
-| **Limited consumer scaling** | One stream = one partition; no auto-rebalancing | Multiple consumer group members share 1 stream | ✅ **Implemented** — `racer.consumer.concurrency` + `RacerShardedStreamPublisher` (R-8) |
-| **Throughput ceiling** | Redis single-threaded per shard; dedicated brokers win at millions of msg/sec | 100K+ msg/sec easily handled for most apps | ✅ **Implemented** — `RacerPipelinedPublisher` + `/api/publish/batch-pipelined` (R-9) |
+| **Limited consumer scaling** | One stream = one partition; no auto-rebalancing | Multiple consumer group members share 1 stream | ✅ **Implemented** — `@RacerStreamListener(concurrency=N)` + `RacerShardedStreamPublisher` (R-8) |
+| **Throughput ceiling** | Redis single-threaded per shard; dedicated brokers win at millions of msg/sec | 100K+ msg/sec easily handled for most apps | ✅ **Implemented** — `RacerPipelinedPublisher` (R-9) |
 | **No message priority** | FIFO only | Use `async=false` for critical channels | ✅ **Implemented** — `RacerPriorityPublisher` + `RacerPriorityConsumerService` (R-10) |
 | **No replay / offset seek** | Cannot re-read historical messages from an offset | Use `XRANGE` / `XREVRANGE` directly via `redis-cli` | ❌ Not planned — use Kafka when full replay is required |
 | **No exactly-once semantics** | At-least-once delivery; duplicate messages possible on consumer restart | Idempotent consumers (deduplicate on `RacerMessage.id`) | ❌ Not planned — Redis MULTI/EXEC does not span network partitions |
@@ -2194,7 +1906,7 @@ All roadmap items have been **fully implemented**. Below is a summary of what wa
 **What was implemented:**
 - `@RacerRoute` container annotation + `@RacerRouteRule` per-rule annotation (field, matches regex, to channel, sender)
 - `RacerRouterService` — scans all beans with `@RacerRoute` at startup via `@PostConstruct`, compiles regex patterns, exposes `route(msg)` and `dryRun()` methods
-- Hooked into `ConsumerSubscriber` — router check runs before local processor dispatch
+- `RacerListenerRegistrar` (BeanPostProcessor) — scans all beans for `@RacerListener` methods; routes to `RacerDeadLetterHandler` on failure
 - `RouterController` — `GET /api/router/rules` (view compiled rules) + `POST /api/router/test` (dry-run)
 
 **Key files:** `RacerRoute.java`, `RacerRouteRule.java`, `RacerRouterService.java`, `RouterController.java`
@@ -2229,14 +1941,14 @@ racer.durable.stream-keys=racer:orders:stream,racer:audit:stream
 **Status:** **DONE** — Available since initial roadmap implementation.
 
 **What was implemented:**
-- `RacerMetrics` — `@ConditionalOnClass(MeterRegistry.class)` bean with counters, timers, and a gauge
-- Wired into `RacerChannelPublisherImpl`, `ConsumerSubscriber`, `DlqReprocessorService`, `PubSubRequestReplyService`, `StreamRequestReplyService`
-- `spring-boot-starter-actuator` + `micrometer-registry-prometheus` added to `racer-server` and `racer-client` POMs
+- `RacerMetrics` — wired into `RacerChannelPublisherImpl`, `RacerListenerRegistrar`, `DlqReprocessorService`, `RacerClientFactoryBean`
+- `ConsumerSubscriber` replaced by `@RacerListener` / `@RacerStreamListener` annotations
+- `spring-boot-starter-actuator` + `micrometer-registry-prometheus` added to `racer-demo` POM
 - Exposed at `/actuator/metrics` and `/actuator/prometheus`
 
 **Metrics:** `racer.published`, `racer.published.stream`, `racer.consumed`, `racer.failed`, `racer.dlq.reprocessed`, `racer.dlq.size` (gauge), `racer.requestreply.latency` (timer)
 
-**Key files:** `RacerMetrics.java`, server and client `pom.xml`, both `application.properties`
+**Key files:** `RacerMetrics.java`, `racer-demo/pom.xml`, `application.properties`
 
 ---
 
@@ -2249,7 +1961,7 @@ racer.durable.stream-keys=racer:orders:stream,racer:audit:stream
 **What was implemented:**
 - `RetentionProperties` inner class added to `RacerProperties` (streamMaxLen, dlqMaxAgeHours, scheduleCron)
 - `RacerRetentionService` — `@Scheduled` service that runs `XTRIM MAXLEN ~<n>` on all durable streams and removes DLQ entries older than the configured age
-- `DlqController` extended with `POST /api/dlq/trim` (on-demand run) and `GET /api/dlq/retention-config`
+- `DlqController` extended with `POST /api/dlq/trim` (on-demand run, requires `racer.web.dlq-enabled=true`) and `GET /api/retention/config`
 
 **Configuration:**
 ```properties
@@ -2271,7 +1983,7 @@ racer.retention.schedule-cron=0 0 * * * *
 **What was implemented:**
 - `RacerTransaction` — collects `(alias, payload, sender)` tuples in a list, executes all via `Flux.concat` for strict ordering
 - Registered as a Spring bean in `RacerAutoConfiguration`
-- `PublisherController` extended with `POST /api/publish/batch-atomic` — accepts an array of publish items, returns per-channel subscriber counts
+- `PublisherController` removed; publishing is annotation-driven via `@PublishResult` / `@RacerPublisher`
 
 **Key files:** `RacerTransaction.java`, `PublisherController.java`
 
@@ -2300,14 +2012,16 @@ racer.retention.schedule-cron=0 0 * * * *
 | R-1 | Content-Based Routing | ✅ Done | `@RacerRoute`, `RacerRouterService`, `RouterController` |
 | R-2 | Durable Publish | ✅ Done | `@PublishResult(durable=true)`, `RacerStreamPublisher`, `RacerStreamConsumerService` |
 | R-3 | Micrometer Metrics | ✅ Done | `RacerMetrics`, Actuator, Prometheus |
-| R-4 | Retention & Pruning | ✅ Done | `RacerRetentionService`, `/api/dlq/trim` |
-| R-5 | Atomic Batch Publish | ✅ Done | `RacerTransaction`, `/api/publish/batch-atomic` |
+| R-4 | Retention & Pruning | ✅ Done | `RacerRetentionService`, `/api/retention/trim` |
+| R-5 | Atomic Batch Publish | ✅ Done | `RacerTransaction` |
 | R-6 | HA — Sentinel + Cluster | ✅ Done | `compose.sentinel.yaml`, `compose.cluster.yaml` |
 | R-7 | Schema Registry | ✅ Implemented | `RacerSchemaRegistry` — JSON Schema Draft-07 validation on publish & consume paths; opt-in via `racer.schema.enabled=true`; REST API at `/api/schema` |
-| R-8 | Consumer Scaling + Sharding | ✅ Done | `racer.consumer.concurrency`, `RacerShardedStreamPublisher` |
-| R-9 | Throughput — Pipelining | ✅ Done | `RacerPipelinedPublisher`, `/api/publish/batch-pipelined` |
-| R-10 | Message Priority | ✅ Done | `RacerPriorityPublisher`, `RacerPriorityConsumerService` |
-| R-11 | Scheduled Publishing + Pub/Sub Concurrency | ✅ Done | `@RacerPoll`, `RacerPollRegistrar`, configurable `flatMap` concurrency |
+| R-8 | Consumer Scaling + Sharding | ✅ Done | `@RacerStreamListener(concurrency=N)`, `RacerShardedStreamPublisher` |
+| R-9 | Throughput — Pipelining | ✅ Done | `RacerPipelinedPublisher` |
+| R-10 | Message Priority | ✅ Done | `@RacerPriority`, `RacerPriorityPublisher`, `RacerPriorityConsumerService` |
+| R-11 | Scheduled Publishing | ✅ Done | `@RacerPoll`, `RacerPollRegistrar` |
+| R-12 | Declarative Consumers | ✅ Done | `@RacerListener`, `@RacerStreamListener`, `RacerListenerRegistrar`, `RacerStreamListenerRegistrar` |
+| R-13 | Publisher Concurrency Control | ✅ Done | `@PublishResult(mode=CONCURRENT)`, `PublishResultAspect` |
 
 ---
 
@@ -2318,25 +2032,22 @@ racer.retention.schedule-cron=0 0 * * * *
 **Status:** **DONE**
 
 **What was implemented:**
-- `RacerProperties.ConsumerProperties` — `racer.consumer.concurrency`, `name-prefix`, `poll-batch-size`, `poll-interval-ms`
-- `RacerStreamConsumerService` refactored — spawns N consumers per stream (e.g. `consumer-0`, `consumer-1`, `consumer-2`), each as an independent polling subscription within the same consumer group; reads up to `poll-batch-size` entries per poll via the `COUNT` XREADGROUP argument
-- `StreamResponderService` — consumer name now derived from `racer.consumer.name-prefix` (no longer hardcoded)
-- `RacerShardedStreamPublisher` — shard-aware stream publisher; computes shard index via CRC-16/CCITT (same algorithm as Redis Cluster hash slots) modulo `racer.sharding.shard-count`; activated by `@ConditionalOnProperty(racer.sharding.enabled=true)`
+- `RacerStreamListenerRegistrar` (BeanPostProcessor) — scans all beans for `@RacerStreamListener` methods and spawns N consumers per stream (e.g. `consumer-0 … consumer-3`) within the same consumer group
+- `RacerShardedStreamPublisher` — shard-aware stream publisher; computes shard index via CRC-16/CCITT modulo `racer.sharding.shard-count`; activated by `@ConditionalOnProperty(racer.sharding.enabled=true)`
 - `ShardingProperties` — `racer.sharding.enabled`, `shard-count`, `streams`
 
 **Configuration:**
 ```properties
-racer.consumer.concurrency=3
-racer.consumer.name-prefix=consumer
-racer.consumer.poll-batch-size=10
-racer.consumer.poll-interval-ms=200
+# Per-listener configuration (on the annotation):
+# @RacerStreamListener(streamKey="racer:orders:stream", group="orders-group",
+#     concurrency=3, batchSize=10, pollIntervalMs=200)
 
 racer.sharding.enabled=true
 racer.sharding.shard-count=4
 racer.sharding.streams=racer:orders:stream,racer:audit:stream
 ```
 
-**Key files:** `RacerStreamConsumerService.java`, `RacerShardedStreamPublisher.java`, `RacerProperties.java`
+**Key files:** `RacerStreamListenerRegistrar.java`, `RacerShardedStreamPublisher.java`, `RacerProperties.java`
 
 ---
 
@@ -2347,14 +2058,11 @@ racer.sharding.streams=racer:orders:stream,racer:audit:stream
 **Status:** **DONE**
 
 **What was implemented:**
-- `RacerPipelinedPublisher` — uses `Flux.mergeDelayError` to issue all PUBLISH commands concurrently; Lettuce (the reactive Redis driver) auto-pipelines concurrent commands over a single connection, reducing N round-trips to ~1
+- `RacerPipelinedPublisher` — uses `Flux.mergeDelayError` to issue all PUBLISH commands concurrently
 - `publishBatch(channel, payloads, sender)` — publishes a list of payloads to the same channel in parallel
 - `publishItems(List<PipelineItem>)` — multi-channel pipeline batch (same behaviour as `RacerTransaction` but parallel)
-- `RacerTransaction` upgraded — accepts an optional `RacerPipelinedPublisher`; `execute(configurer)` auto-promotes to pipeline when available; new `execute(configurer, pipelined)` overload for explicit control
+- `RacerTransaction` upgraded — accepts an optional `RacerPipelinedPublisher`; auto-promotes to pipeline when available
 - `PipelineProperties` — `racer.pipeline.enabled`, `max-batch-size`
-- New REST endpoints:
-  - `POST /api/publish/batch-pipelined` — parallel batch to single channel
-  - `POST /api/publish/batch-atomic-pipelined` — parallel multi-channel batch
 
 **Configuration:**
 ```properties
@@ -2377,19 +2085,16 @@ racer.pipeline.max-batch-size=100
 - `@RacerPriority` annotation — `defaultLevel` attribute for use alongside `@PublishResult`
 - `RacerMessage.priority` field — `String`, defaults to `"NORMAL"`; backward-compatible (missing field → `NORMAL`)
 - `RacerPriorityPublisher` — routes messages to sub-channels keyed `{baseChannel}:priority:{LEVEL}` (e.g. `racer:orders:priority:HIGH`)
-- `RacerPriorityConsumerService` (racer-client) — subscribes to all configured priority sub-channels; buffers arriving messages in a `PriorityBlockingQueue<PrioritizedMessage>` ordered by weight; a drain loop running on `Schedulers.boundedElastic()` processes messages in strict priority order; active only when `racer.priority.enabled=true`
-- `POST /api/publish/async` — accepts optional `"priority"` field; routes through `RacerPriorityPublisher` when present
+- `RacerPriorityConsumerService` (in `racer-common`) — subscribes to all configured priority sub-channels; buffers arriving messages in a `PriorityBlockingQueue<PrioritizedMessage>` ordered by weight; a drain loop running on `Schedulers.boundedElastic()` processes messages in strict priority order; active only when `racer.priority.enabled=true`
+- `@RacerPriority` annotation — `defaultLevel` attribute for use alongside `@PublishResult`; priority routing handled via `RacerPriorityPublisher`
 - `PriorityProperties` — `racer.priority.enabled`, `levels`, `strategy`, `channels`
 
 **Configuration:**
 ```properties
-# server
+# racer-priority config (racer-demo/application.properties)
 racer.priority.enabled=true
 racer.priority.levels=HIGH,NORMAL,LOW
 racer.priority.strategy=strict
-
-# client
-racer.priority.enabled=true
 racer.priority.channels=racer:orders,racer:notifications
 ```
 
@@ -2414,16 +2119,59 @@ racer.priority.channels=racer:orders,racer:notifications
 - `PollProperties` — `racer.poll.enabled`
 
 #### Pub/Sub Concurrency Control
-- `ConsumerSubscriber` — `flatMap` concurrency now configurable via `racer.pubsub.concurrency` (default 256); controls how many Pub/Sub messages are processed in-flight simultaneously
-- `PubSubProperties` — `racer.pubsub.concurrency`
+- `RacerListenerRegistrar` — `flatMap` concurrency now configurable per-listener via `@RacerListener(concurrency=N)` (default 256)
+- `PubSubProperties` — `racer.pubsub.concurrency` (global default)
 
-**Configuration:**
-```properties
-# Pub/Sub concurrent processing (racer-client)
-racer.pubsub.concurrency=256
+**Key files:** `@RacerPoll.java`, `RacerPollRegistrar.java`, `RacerProperties.java`, `RacerListenerRegistrar.java`
 
-# Enable/disable all @RacerPoll pollers
-racer.poll.enabled=true
-```
+---
 
-**Key files:** `@RacerPoll.java`, `RacerPollRegistrar.java`, `RacerProperties.java`, `ConsumerSubscriber.java`
+### ✅ R-12 — Declarative Channel Consumers (`@RacerListener`)
+
+**Closes gap:** No annotation-driven way for application beans to subscribe to a Pub/Sub channel; all consumers were hardcoded in `ConsumerSubscriber`
+
+**Status:** **DONE**
+
+**What was implemented:**
+
+- `@RacerListener` annotation — marks a method as a reactive channel subscriber. Attributes: `channel`, `channelRef`, `mode` (`SEQUENTIAL` / `CONCURRENT`), `concurrency`, `id`
+- `ConcurrencyMode` enum — `SEQUENTIAL` (concurrency = 1, ordered) and `CONCURRENT` (up to N parallel workers)
+- `RacerDeadLetterHandler` interface (`com.cheetah.racer.common.listener`) — SPI in `racer-common` so the registrar can forward failed messages to the DLQ without a direct dependency on `racer-client`
+- `RacerListenerRegistrar` (BeanPostProcessor) — scans all Spring beans for `@RacerListener` methods at startup; resolves channel names (direct or via alias); subscribes to `ReactiveRedisMessageListenerContainer`; dispatches on `boundedElastic()` using `flatMap(handler, effectiveConcurrency)`; runs schema validation and router checks; records `processedCount`/`failedCount` per listener; forwards exceptions to `RacerDeadLetterHandler`; disposes all subscriptions on `@PreDestroy`
+- Flexible parameter dispatch: `RacerMessage` → full envelope; `String` → raw payload; any type `T` → `objectMapper.readValue(payload, T.class)`
+- `DeadLetterQueueService` updated to `implements RacerDeadLetterHandler`
+- `RacerAutoConfiguration` — registers `racerListenerRegistrar` bean under `@ConditionalOnBean(ReactiveRedisMessageListenerContainer.class)` with all collaborators (`ObjectMapper`, `RacerPublisherRegistry`, `RacerRouterService`, `RacerSchemaValidator`, `RacerDeadLetterHandler`, `MeterRegistry`) as `Optional<>` parameters
+
+**Configuration:** no new properties required — channel names and concurrency are set directly on the annotation or via existing `racer.channels.*` aliases.
+
+**Key files:** `ConcurrencyMode.java`, `@RacerListener.java`, `RacerDeadLetterHandler.java`, `RacerListenerRegistrar.java`, `DeadLetterQueueService.java` (updated), `RacerAutoConfiguration.java` (updated)
+
+---
+
+### ✅ R-13 — Publisher Concurrency Control (`@PublishResult` CONCURRENT mode)
+
+**Closes gap:** `@PublishResult` on `Flux<T>` methods always published elements sequentially via fire-and-forget `doOnNext`; no way to control how many Redis `PUBLISH` calls ran in parallel
+
+**Status:** **DONE**
+
+**What was implemented:**
+
+- `@PublishResult` — two new attributes:
+  - `mode() ConcurrencyMode` (default `SEQUENTIAL`) — controls dispatch strategy for `Flux<T>` returns
+  - `concurrency() int` (default `4`) — maximum in-flight Redis `PUBLISH` operations when `mode = CONCURRENT`
+- `PublishResultAspect` — updated `Flux` branch:
+  - `SEQUENTIAL` (default): existing `doOnNext` fire-and-forget side-effect behavior unchanged
+  - `CONCURRENT`: uses `flatMap(value -> publishValueReactive(value, ...).thenReturn(value), effectiveConcurrency)` — up to N Redis publish commands in-flight simultaneously; subscriber receives each element after its publish completes (backpressure-aware)
+- `publishValueReactive(...)` helper — new `Mono<Void>` variant of the publish path used in concurrent mode (always reactive / non-blocking)
+- 12 new unit tests in `PublishResultAspectTest` covering: sequential fire-and-forget, concurrent fan-out, concurrency bound enforcement, durable stream path, Mono pass-through, POJO sync/async publish
+
+**Behavior matrix:**
+
+| Return type | Mode | Behavior |
+|-------------|------|----------|
+| `Mono<T>` | any | `doOnNext` side-effect — mode is ignored |
+| `Flux<T>` | `SEQUENTIAL` | `doOnNext` fire-and-forget per element — no backpressure |
+| `Flux<T>` | `CONCURRENT` | `flatMap(publish, concurrency)` — N publishes in parallel with backpressure |
+| POJO / `void` | any | single publish, sync or async based on `async` flag — mode is ignored |
+
+**Key files:** `@PublishResult.java` (updated), `PublishResultAspect.java` (updated), `PublishResultAspectTest.java` (new)

@@ -320,4 +320,61 @@ public class RacerProperties {
 
     /** Pub/Sub consumer concurrency configuration. */
     private PubSubProperties pubsub = new PubSubProperties();
+
+    // ── Web API toggles ──────────────────────────────────────────────────────
+
+    /**
+     * Optional web controller toggles.
+     * Mapped under {@code racer.web.*}.
+     */
+    @Data
+    public static class WebProperties {
+
+        /** Expose {@code /api/dlq/**} endpoints when true. Default: {@code false}. */
+        private boolean dlqEnabled = false;
+
+        /** Expose {@code /api/schema/**} endpoints when true. Default: {@code false}. */
+        private boolean schemaEnabled = false;
+
+        /** Expose {@code GET /api/router/rules} and {@code POST /api/router/test} when true. Default: {@code false}. */
+        private boolean routerEnabled = false;
+
+        /** Expose {@code GET /api/channels} when true. Default: {@code false}. */
+        private boolean channelsEnabled = false;
+
+        /** Expose {@code GET /api/retention/config} when true. Default: {@code false}. */
+        private boolean retentionEnabled = false;
+    }
+
+    /** Web controller opt-in configuration. */
+    private WebProperties web = new WebProperties();
+
+    // ── Retention scheduling ─────────────────────────────────────────────────
+
+    /**
+     * When {@code true} (and {@code @EnableScheduling} is active), the
+     * {@link com.cheetah.racer.common.service.RacerRetentionService} scheduled job runs
+     * on the configured cron expression. Default: {@code false}.
+     */
+    private boolean retentionEnabled = false;
+
+    // ── Request-reply defaults ───────────────────────────────────────────────
+
+    /**
+     * Request-reply configuration.
+     * Mapped under {@code racer.request-reply.*}.
+     */
+    @Data
+    public static class RequestReplyProperties {
+
+        /**
+         * Default timeout for request-reply operations.
+         * Used when {@link com.cheetah.racer.common.annotation.RacerRequestReply#timeout()}
+         * is not explicitly specified. Defaults to {@code "5s"}.
+         */
+        private String defaultTimeout = "5s";
+    }
+
+    /** Request-reply configuration. */
+    private RequestReplyProperties requestReply = new RequestReplyProperties();
 }

@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: racer-demo
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # -----------------------------------------------------------------------
+      # High-Availability: Sentinel (uncomment when running compose.sentinel.yaml)
+      # -----------------------------------------------------------------------
+      # sentinel:
+      #   master: mymaster
+      #   nodes: localhost:26379,localhost:26380,localhost:26381
+
+      # HA: Cluster (uncomment when running compose.cluster.yaml)
+      # -----------------------------------------------------------------------
+      # cluster:
+      #   nodes: localhost:7001,localhost:7002,localhost:7003,localhost:7004,localhost:7005,localhost:7006
+
+server:
+  port: 8080
+
+# ────────────────────────────────────────────────────────────────────────────
+# Racer configuration
+# ────────────────────────────────────────────────────────────────────────────
+racer:
+  # Default channel used when no alias is specified
+  default-channel: racer:messages
+
+  # ── Named channel definitions ──────────────────────────────────────────────
+  channels:
+    orders:
+      name:   racer:orders
+      async:  true
+      sender: demo-publisher
+    default:
+      name:   racer:messages
+      async:  true
+      sender: demo-publisher
+
+  # ── Durable stream consumer (RacerStreamListenerRegistrar) ─────────────────
+  # (Stream key and group are declared per-method via @RacerStreamListener)
+
+  # ── Retention (set to true to enable scheduled XTRIM + DLQ pruning) ────────
+  retention-enabled: false
+  retention:
+    stream-max-len:   10000
+    dlq-max-age-hours: 72
+    schedule-cron:    "0 0 * * * *"
+
+  # ── Consumer scaling ────────────────────────────────────────────────────────
+  consumer:
+    concurrency:      1
+    name-prefix:      consumer
+    poll-batch-size:  1
+    poll-interval-ms: 200
+
+  # ── Schema registry (opt-in) ────────────────────────────────────────────────
+  schema:
+    enabled: false
+
+  # ── Request-reply defaults ──────────────────────────────────────────────────
+  request-reply:
+    default-timeout: "5s"
+
+  # ── Web API toggles (opt-in per endpoint group) ─────────────────────────────
+  web:
+    dlq-enabled:       true   # GET/POST/DELETE /api/dlq/**
+    schema-enabled:    true   # GET /api/schema/**  POST /api/schema/validate
+    router-enabled:    true   # GET /api/router/rules  POST /api/router/test
+    channels-enabled:  true   # GET /api/channels
+    retention-enabled: true   # GET /api/retention/config  POST /api/retention/trim
+
+# ── Actuator ──────────────────────────────────────────────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.cheetah.racer: DEBUG

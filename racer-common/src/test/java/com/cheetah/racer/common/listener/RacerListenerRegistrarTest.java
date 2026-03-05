@@ -1,0 +1,449 @@
+package com.cheetah.racer.common.listener;
+
+import com.cheetah.racer.common.annotation.ConcurrencyMode;
+import com.cheetah.racer.common.annotation.RacerListener;
+import com.cheetah.racer.common.config.RacerProperties;
+import com.cheetah.racer.common.metrics.RacerMetrics;
+import com.cheetah.racer.common.model.RacerMessage;
+import com.cheetah.racer.common.router.RacerRouterService;
+import com.cheetah.racer.common.schema.RacerSchemaRegistry;
+import com.cheetah.racer.common.schema.SchemaValidationException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+import org.springframework.core.env.Environment;
+import org.springframework.data.redis.connection.ReactiveSubscription;
+import org.springframework.data.redis.listener.ChannelTopic;
+import org.springframework.data.redis.listener.ReactiveRedisMessageListenerContainer;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Unit tests for {@link RacerListenerRegistrar}.
+ */
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
+class RacerListenerRegistrarTest {
+
+    // ── Test bean ─────────────────────────────────────────────────────────────
+
+    /** Simple test bean whose methods are discovered by the registrar. */
+    static class SampleReceiver {
+
+        final List<RacerMessage> received        = new ArrayList<>();
+        final List<String>       receivedStrings = new ArrayList<>();
+        final List<SampleDto>    receivedDtos    = new ArrayList<>();
+        final AtomicInteger      invocations     = new AtomicInteger(0);
+
+        @RacerListener(channel = "racer:test")
+        public void onMessage(RacerMessage msg) {
+            received.add(msg);
+            invocations.incrementAndGet();
+        }
+
+        @RacerListener(channel = "racer:strings")
+        public void onString(String payload) {
+            receivedStrings.add(payload);
+            invocations.incrementAndGet();
+        }
+
+        @RacerListener(channel = "racer:dtos")
+        public void onDto(SampleDto dto) {
+            receivedDtos.add(dto);
+            invocations.incrementAndGet();
+        }
+
+        @RacerListener(channel = "racer:mono", mode = ConcurrencyMode.CONCURRENT, concurrency = 4)
+        public Mono<Void> onMonoReturn(RacerMessage msg) {
+            invocations.incrementAndGet();
+            return Mono.empty();
+        }
+
+        @RacerListener(channel = "racer:error")
+        public void onErrorMessage(RacerMessage msg) {
+            invocations.incrementAndGet();
+            throw new RuntimeException("simulated processing failure");
+        }
+    }
+
+    static class SampleDto {
+        public String name;
+        public int value;
+    }
+
+    // ── Mocks and collaborators ───────────────────────────────────────────────
+
+    @Mock ReactiveRedisMessageListenerContainer listenerContainer;
+    @Mock RacerMetrics                          racerMetrics;
+    @Mock RacerSchemaRegistry                   racerSchemaRegistry;
+    @Mock RacerRouterService                    racerRouterService;
+    @Mock RacerDeadLetterHandler                deadLetterHandler;
+    @Mock Environment                           environment;
+
+    ObjectMapper objectMapper;
+    RacerProperties properties;
+    RacerListenerRegistrar registrar;
+    SampleReceiver bean;
+
+    @BeforeEach
+    void setUp() {
+        objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        properties   = new RacerProperties();
+        properties.setChannels(new LinkedHashMap<>());
+
+        // Stub environment to pass through values unchanged
+        when(environment.resolvePlaceholders(anyString())).thenAnswer(inv -> inv.getArgument(0));
+
+        // Default: router never claims a message (no routing rules)
+        when(racerRouterService.route(any())).thenReturn(false);
+
+        // Default: DLQ enqueue succeeds
+        when(deadLetterHandler.enqueue(any(), any())).thenReturn(Mono.empty());
+
+        // Default: schema validation passes (no-op)
+        doNothing().when(racerSchemaRegistry).validateForConsume(anyString(), any());
+
+        registrar = new RacerListenerRegistrar(
+                listenerContainer,
+                objectMapper,
+                properties,
+                racerMetrics,
+                racerSchemaRegistry,
+                racerRouterService,
+                deadLetterHandler);
+        registrar.setEnvironment(environment);
+
+        bean = new SampleReceiver();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /** Creates a Flux that emits a single serialized RacerMessage then completes. */
+    private Flux<ReactiveSubscription.Message<String, String>> singleMessageFlux(RacerMessage msg)
+            throws Exception {
+        String json = objectMapper.writeValueAsString(msg);
+        ReactiveSubscription.Message<String, String> redisMsg = mockRedisMessage(json);
+        return Flux.just(redisMsg);
+    }
+
+    @SuppressWarnings("unchecked")
+    private ReactiveSubscription.Message<String, String> mockRedisMessage(String body) {
+        ReactiveSubscription.Message<String, String> m = mock(ReactiveSubscription.Message.class);
+        when(m.getMessage()).thenReturn(body);
+        return m;
+    }
+
+    private RacerMessage buildMessage(String channel, String payload) {
+        return RacerMessage.create(channel, payload, "test-sender");
+    }
+
+    // ── Tests: RacerMessage parameter ────────────────────────────────────────
+
+    @Test
+    void listener_receivesRacerMessage_dispatchesToMethod() throws Exception {
+        RacerMessage msg = buildMessage("racer:test", "hello");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300); // allow reactive dispatch to settle
+
+        assertThat(bean.received).hasSize(1);
+        assertThat(bean.received.get(0).getPayload()).isEqualTo("hello");
+    }
+
+    // ── Tests: String parameter ───────────────────────────────────────────────
+
+    @Test
+    void listener_withStringParam_passesRawPayload() throws Exception {
+        RacerMessage msg = buildMessage("racer:strings", "raw-payload");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:strings".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        assertThat(bean.receivedStrings).hasSize(1);
+        assertThat(bean.receivedStrings.get(0)).isEqualTo("raw-payload");
+    }
+
+    // ── Tests: POJO parameter (flexible deserialization) ─────────────────────
+
+    @Test
+    void listener_withPojoParam_deserializesPayloadIntoType() throws Exception {
+        SampleDto dto = new SampleDto();
+        dto.name  = "widget";
+        dto.value = 42;
+        RacerMessage msg = buildMessage("racer:dtos", objectMapper.writeValueAsString(dto));
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:dtos".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        assertThat(bean.receivedDtos).hasSize(1);
+        assertThat(bean.receivedDtos.get(0).name).isEqualTo("widget");
+        assertThat(bean.receivedDtos.get(0).value).isEqualTo(42);
+    }
+
+    // ── Tests: Mono return type ───────────────────────────────────────────────
+
+    @Test
+    void listener_withMonoReturn_subscribesToReturnedMono() throws Exception {
+        RacerMessage msg = buildMessage("racer:mono", "ping");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:mono".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        assertThat(bean.invocations.get()).isGreaterThanOrEqualTo(1);
+    }
+
+    // ── Tests: concurrent mode ────────────────────────────────────────────────
+
+    @Test
+    void concurrentListener_processesMultipleMessagesInParallel() throws Exception {
+        int messageCount = 8;
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch allDispatched = new CountDownLatch(messageCount);
+        AtomicInteger concurrent = new AtomicInteger(0);
+        AtomicInteger maxConcurrent = new AtomicInteger(0);
+
+        // A bean with a method that simulates blocking work
+        Object slowBean = new Object() {
+            @RacerListener(channel = "racer:concurrent", mode = ConcurrencyMode.CONCURRENT, concurrency = 4)
+            public void onMsg(RacerMessage msg) throws InterruptedException {
+                int c = concurrent.incrementAndGet();
+                maxConcurrent.updateAndGet(prev -> Math.max(prev, c));
+                startLatch.await(2, TimeUnit.SECONDS);
+                concurrent.decrementAndGet();
+                allDispatched.countDown();
+            }
+        };
+
+        Sinks.Many<ReactiveSubscription.Message<String, String>> sink =
+                Sinks.many().multicast().onBackpressureBuffer();
+
+        when(listenerContainer.receive(ChannelTopic.of("racer:concurrent"))).thenReturn(sink.asFlux());
+
+        registrar.postProcessAfterInitialization(slowBean, "slowBean");
+
+        // Emit all messages
+        for (int i = 0; i < messageCount; i++) {
+            RacerMessage msg = buildMessage("racer:concurrent", "msg-" + i);
+            sink.tryEmitNext(mockRedisMessage(objectMapper.writeValueAsString(msg)));
+        }
+
+        // Release the latch so all workers can finish
+        startLatch.countDown();
+        boolean allDone = allDispatched.await(5, TimeUnit.SECONDS);
+
+        assertThat(allDone).as("All %d messages should be processed within 5 s", messageCount).isTrue();
+        assertThat(maxConcurrent.get()).as("Max concurrent workers").isGreaterThan(1);
+    }
+
+    // ── Tests: sequential mode ────────────────────────────────────────────────
+
+    @Test
+    void sequentialListener_processesOneMessageAtATime() throws Exception {
+        List<Integer> order = new ArrayList<>();
+        AtomicInteger active = new AtomicInteger(0);
+        AtomicInteger maxActive = new AtomicInteger(0);
+
+        Object seqBean = new Object() {
+            @RacerListener(channel = "racer:seq") // default: SEQUENTIAL
+            public void onMsg(RacerMessage msg) throws InterruptedException {
+                int a = active.incrementAndGet();
+                maxActive.updateAndGet(p -> Math.max(p, a));
+                Thread.sleep(20);
+                order.add(Integer.parseInt(msg.getPayload()));
+                active.decrementAndGet();
+            }
+        };
+
+        Sinks.Many<ReactiveSubscription.Message<String, String>> sink =
+                Sinks.many().unicast().onBackpressureBuffer();
+
+        when(listenerContainer.receive(ChannelTopic.of("racer:seq"))).thenReturn(sink.asFlux());
+
+        registrar.postProcessAfterInitialization(seqBean, "seqBean");
+
+        for (int i = 0; i < 4; i++) {
+            RacerMessage msg = buildMessage("racer:seq", String.valueOf(i));
+            sink.tryEmitNext(mockRedisMessage(objectMapper.writeValueAsString(msg)));
+        }
+
+        Thread.sleep(500);
+
+        assertThat(maxActive.get()).isEqualTo(1); // never more than 1 active at once
+    }
+
+    // ── Tests: error handling & DLQ ───────────────────────────────────────────
+
+    @Test
+    void listener_whenMethodThrows_enqueuesToDlq() throws Exception {
+        RacerMessage msg = buildMessage("racer:error", "bad-data");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:error".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        verify(deadLetterHandler, timeout(500).atLeastOnce()).enqueue(any(RacerMessage.class), any(Throwable.class));
+    }
+
+    @Test
+    void listener_whenMethodThrows_incrementsFailedCount() throws Exception {
+        RacerMessage msg = buildMessage("racer:error", "bad-data");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:error".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        assertThat(registrar.getFailedCount("sampleReceiver.onErrorMessage")).isGreaterThan(0);
+    }
+
+    // ── Tests: schema validation ──────────────────────────────────────────────
+
+    @Test
+    void listener_whenSchemaValidationFails_enqueuesToDlqAndSkipsMethod() throws Exception {
+        RacerMessage msg = buildMessage("racer:test", "invalid-payload");
+
+        doThrow(new SchemaValidationException("racer:test", List.of()))
+                .when(racerSchemaRegistry).validateForConsume(eq("racer:test"), anyString());
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        verify(deadLetterHandler, timeout(500).atLeastOnce()).enqueue(any(), any(SchemaValidationException.class));
+        assertThat(bean.received).isEmpty(); // method must NOT be invoked
+    }
+
+    // ── Tests: routing ────────────────────────────────────────────────────────
+
+    @Test
+    void listener_whenRouterClaimsMessage_skipsLocalDispatch() throws Exception {
+        RacerMessage msg = buildMessage("racer:test", "routed");
+
+        when(racerRouterService.route(any())).thenReturn(true); // router claims it
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        assertThat(bean.received).isEmpty();
+        assertThat(bean.invocations.get()).isZero();
+    }
+
+    // ── Tests: channelRef resolution ──────────────────────────────────────────
+
+    @Test
+    void listener_withChannelRef_resolvesChannelFromProperties() throws Exception {
+        RacerProperties.ChannelProperties cp = new RacerProperties.ChannelProperties();
+        cp.setName("racer:resolved:channel");
+        properties.getChannels().put("myalias", cp);
+
+        Object aliasBean = new Object() {
+            @RacerListener(channelRef = "myalias")
+            public void onAliased(RacerMessage msg) {}
+        };
+
+        when(listenerContainer.receive(ChannelTopic.of("racer:resolved:channel"))).thenReturn(Flux.never());
+
+        registrar.postProcessAfterInitialization(aliasBean, "aliasBean");
+
+        verify(listenerContainer).receive(ChannelTopic.of("racer:resolved:channel"));
+    }
+
+    // ── Tests: stats ──────────────────────────────────────────────────────────
+
+    @Test
+    void processedCount_incrementsAfterSuccessfulDispatch() throws Exception {
+        RacerMessage msg = buildMessage("racer:test", "hello");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        assertThat(registrar.getProcessedCount("sampleReceiver.onMessage")).isEqualTo(1);
+    }
+
+    // ── Tests: lifecycle ─────────────────────────────────────────────────────
+
+    @Test
+    void stop_disposesAllSubscriptions() throws Exception {
+        when(listenerContainer.receive(any(ChannelTopic.class))).thenReturn(Flux.never());
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        registrar.stop(); // should not throw, should log stats
+    }
+}

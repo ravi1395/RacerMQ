@@ -12,8 +12,8 @@ that:
 - Ships messages to the DLQ automatically when processing fails
 - Exposes Actuator metrics via Micrometer
 
-> This tutorial is self-contained. You do **not** need to run `racer-server` or
-> `racer-client`. Your new application acts as both publisher and subscriber.
+> This tutorial is self-contained. You do **not** need to run `racer-demo` or any other
+> Racer module alongside your application. Your new application acts as both publisher and subscriber.
 
 ---
 
@@ -447,23 +447,18 @@ public class InventoryEventRouter {
 
 ### Step 3.5 — In-process audit consumer
 
-Subscribe to the `audit` channel within the same application to maintain a live audit
-log without standing up a separate consumer service.
+Subscribe to the `audit` channel within the same application using `@RacerListener` to
+maintain a live audit log — no manual container setup required.
 
 ```java
 // src/main/java/com/example/inventory/service/InventoryAuditConsumer.java
 package com.example.inventory.service;
 
+import com.cheetah.racer.common.annotation.RacerListener;
 import com.cheetah.racer.common.model.RacerMessage;
-import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.data.redis.connection.ReactiveSubscription;
-import org.springframework.data.redis.listener.ChannelTopic;
-import org.springframework.data.redis.listener.ReactiveRedisMessageListenerContainer;
 import org.springframework.stereotype.Component;
-import reactor.core.publisher.Flux;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -473,39 +468,21 @@ import java.util.List;
 public class InventoryAuditConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(InventoryAuditConsumer.class);
-    private static final String AUDIT_CHANNEL = "racer:inventory:audit";
-
-    private final ReactiveRedisMessageListenerContainer listenerContainer;
-    private final ObjectMapper objectMapper;
 
     // In-memory audit log (replace with a persistent store in production)
     private final List<String> auditLog = Collections.synchronizedList(new ArrayList<>());
 
-    public InventoryAuditConsumer(ReactiveRedisMessageListenerContainer listenerContainer,
-                                  ObjectMapper objectMapper) {
-        this.listenerContainer = listenerContainer;
-        this.objectMapper = objectMapper;
-    }
-
-    @PostConstruct
-    public void startListening() {
-        Flux<ReactiveSubscription.Message<String, String>> messages =
-                listenerContainer.receive(ChannelTopic.of(AUDIT_CHANNEL));
-
-        messages
-            .map(ReactiveSubscription.Message::getMessage)
-            .doOnNext(raw -> {
-                try {
-                    RacerMessage msg = objectMapper.readValue(raw, RacerMessage.class);
-                    String entry = "[" + msg.getTimestamp() + "] "
-                            + msg.getSender() + " → " + msg.getPayload();
-                    auditLog.add(entry);
-                    log.info("AUDIT: {}", entry);
-                } catch (Exception e) {
-                    log.warn("Could not parse audit message: {}", raw, e);
-                }
-            })
-            .subscribe();
+    /**
+     * @RacerListener binds this method to racer:inventory:audit at startup.
+     * RacerListenerRegistrar (BeanPostProcessor) handles subscription,
+     * deserialization, DLQ forwarding, and metrics — no boilerplate needed.
+     */
+    @RacerListener(channel = "racer:inventory:audit", id = "audit-consumer")
+    public void onAuditEvent(RacerMessage message) {
+        String entry = "[" + message.getTimestamp() + "] "
+                + message.getSender() + " → " + message.getPayload();
+        auditLog.add(entry);
+        log.info("AUDIT: {}", entry);
     }
 
     /** Returns all recorded audit entries (newest last). */
@@ -514,6 +491,10 @@ public class InventoryAuditConsumer {
     }
 }
 ```
+
+> `@RacerListener` also integrates with metrics (`racer.listener.processed`,
+> `racer.listener.failed`) and the DLQ — exceptions thrown inside `onAuditEvent` are
+> automatically forwarded to the Dead Letter Queue.
 
 ---
 
@@ -777,9 +758,9 @@ InventoryService.createItem()  ──── @PublishResult ──►  racer:inve
     ▼ (if qty < 10)                                            │
 alertsPublisher.publishAsync()  ───────────────────►  racer:inventory:alerts
                                                                │
-                                              InventoryAuditConsumer
-                                              subscribes to racer:inventory:audit
-                                              and appends to in-memory log
+                                              @RacerListener("racer:inventory:audit")
+                                              (InventoryAuditConsumer.onAuditEvent)
+                                              appends to in-memory audit log
                                                                │
                                               GET /api/inventory/audit
 ```
@@ -792,6 +773,7 @@ alertsPublisher.publishAsync()  ────────────────
 | `@RacerPublisher("alerts")` | `InventoryService` | Injects a publisher bound to `racer:inventory:alerts` |
 | `@PublishResult(channelRef="stock")` | `createItem`, `updateStock` | Auto-publishes the return value to `racer:inventory:stock` without any `publishAsync()` call |
 | `@RacerRoute` + `@RacerRouteRule` | `InventoryEventRouter` | Declaratively fans out events from the default channel to dedicated sub-channels |
+| `@RacerListener(channel="racer:inventory:audit")` | `InventoryAuditConsumer` | Subscribes the method to the audit channel; handles deserialization, metrics, and DLQ automatically |
 
 ---
 

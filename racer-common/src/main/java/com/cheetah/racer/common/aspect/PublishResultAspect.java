@@ -1,5 +1,6 @@
 package com.cheetah.racer.common.aspect;
 
+import com.cheetah.racer.common.annotation.ConcurrencyMode;
 import com.cheetah.racer.common.annotation.PublishResult;
 import com.cheetah.racer.common.publisher.RacerChannelPublisher;
 import com.cheetah.racer.common.publisher.RacerPublisherRegistry;
@@ -62,7 +63,24 @@ public class PublishResultAspect {
 
         if (result instanceof Flux) {
             //noinspection unchecked
-            return ((Flux<?>) result)
+            Flux<?> source = (Flux<?>) result;
+
+            if (publishResult.mode() == ConcurrencyMode.CONCURRENT) {
+                // ── Concurrent mode: up to N publishes in-flight simultaneously ──
+                int effectiveConcurrency = Math.max(1, publishResult.concurrency());
+                String streamKey = resolveStreamKey(publishResult, channel);
+                return source
+                        .flatMap(value ->
+                                publishValueReactive(value, channel, sender, durable, streamKey)
+                                        .thenReturn(value),
+                                effectiveConcurrency)
+                        .doOnError(ex -> log.debug(
+                                "[racer] @PublishResult(CONCURRENT) skipped — upstream Flux error: {}",
+                                ex.getMessage()));
+            }
+
+            // ── Sequential mode (default): fire-and-forget side-effect per element ──
+            return source
                     .doOnNext(value -> publishValue(value, channel, sender, async, durable,
                             resolveStreamKey(publishResult, channel)))
                     .doOnError(ex -> log.debug("[racer] @PublishResult skipped — upstream Flux error: {}",
@@ -98,6 +116,26 @@ public class PublishResultAspect {
         }
         // default: <channel>:stream
         return channel + ":stream";
+    }
+
+    /**
+     * Reactive variant used in {@link ConcurrencyMode#CONCURRENT} mode.
+     * Always uses the async (non-blocking) path so that {@code flatMap} can
+     * control the actual in-flight concurrency.
+     */
+    private Mono<Void> publishValueReactive(Object value, String channel, String sender,
+                                             boolean durable, String streamKey) {
+        if (durable) {
+            return streamPublisher.publishToStream(streamKey, value, sender)
+                    .doOnSuccess(id -> log.debug("[racer] @PublishResult(durable,concurrent) → stream '{}' id={}", streamKey, id))
+                    .doOnError(err -> log.error("[racer] @PublishResult(durable,concurrent) failed on '{}': {}", streamKey, err.getMessage()))
+                    .then();
+        }
+        return publisherForChannel(channel)
+                .publishAsync(value, sender)
+                .doOnSuccess(count -> log.debug("[racer] @PublishResult(concurrent) → '{}' ({} subscriber(s))", channel, count))
+                .doOnError(err -> log.error("[racer] @PublishResult(concurrent) publish failed to '{}': {}", channel, err.getMessage()))
+                .then();
     }
 
     private void publishValue(Object value, String channel, String sender,
