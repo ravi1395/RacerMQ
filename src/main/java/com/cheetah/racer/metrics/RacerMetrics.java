@@ -126,4 +126,72 @@ public class RacerMetrics {
                 .tag("transport", transport)
                 .register(registry));
     }
+
+    // -----------------------------------------------------------------------
+    // Thread pool metrics
+    // -----------------------------------------------------------------------
+
+    /**
+     * Registers gauges that expose key metrics from the Racer listener thread pool.
+     * Should be called once at startup after the pool is created.
+     *
+     * <p>Exposed metrics:
+     * <ul>
+     *   <li>{@code racer.thread-pool.queue-depth} — current work-queue size</li>
+     *   <li>{@code racer.thread-pool.active-threads} — threads actively executing tasks</li>
+     *   <li>{@code racer.thread-pool.pool-size} — current total thread count in the pool</li>
+     * </ul>
+     *
+     * @param executor the {@link java.util.concurrent.ThreadPoolExecutor} backing the listener scheduler
+     */
+    public void registerThreadPoolGauges(java.util.concurrent.ThreadPoolExecutor executor) {
+        Gauge.builder("racer.thread-pool.queue-depth", executor, e -> e.getQueue().size())
+                .description("Work-queue depth of the Racer listener thread pool")
+                .register(registry);
+        Gauge.builder("racer.thread-pool.active-threads", executor,
+                        java.util.concurrent.ThreadPoolExecutor::getActiveCount)
+                .description("Number of threads actively executing tasks in the Racer listener pool")
+                .register(registry);
+        Gauge.builder("racer.thread-pool.pool-size", executor,
+                        java.util.concurrent.ThreadPoolExecutor::getPoolSize)
+                .description("Current number of threads in the Racer listener thread pool")
+                .register(registry);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive concurrency (AUTO-mode) metrics
+    // -----------------------------------------------------------------------
+
+    /**
+     * Registers a gauge reporting the current effective concurrency of an AUTO-mode listener.
+     *
+     * @param listenerId   the listener id (from {@code @RacerListener(id="…")}),
+     *                     used as the {@code listener} tag value
+     * @param concurrencySupplier supplies the current concurrency value on each scrape
+     */
+    public void registerAutoConcurrencyGauge(String listenerId,
+                                              Supplier<Number> concurrencySupplier) {
+        Gauge.builder("racer.auto.concurrency", concurrencySupplier, s -> s.get().doubleValue())
+                .description("Current adaptive concurrency level for an AUTO-mode listener")
+                .tag("listener", listenerId)
+                .register(registry);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream consumer-lag metric
+    // -----------------------------------------------------------------------
+
+    /**
+     * Registers a gauge that reports the consumer-group lag for a Redis stream
+     * (i.e. the number of pending/unacknowledged entries, as returned by XPENDING).
+     *
+     * @param streamKey the Redis stream key, used as the {@code stream} tag value
+     * @param lagSupplier supplies the current lag on each scrape (call XPENDING count)
+     */
+    public void registerStreamConsumerLagGauge(String streamKey, Supplier<Number> lagSupplier) {
+        Gauge.builder("racer.stream.consumer.lag", lagSupplier, s -> s.get().doubleValue())
+                .description("Number of pending (unacknowledged) entries in a Racer stream consumer group")
+                .tag("stream", streamKey)
+                .register(registry);
+    }
 }
