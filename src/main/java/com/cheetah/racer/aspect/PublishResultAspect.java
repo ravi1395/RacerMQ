@@ -2,6 +2,7 @@ package com.cheetah.racer.aspect;
 
 import com.cheetah.racer.annotation.ConcurrencyMode;
 import com.cheetah.racer.annotation.PublishResult;
+import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
 import com.cheetah.racer.publisher.RacerStreamPublisher;
@@ -9,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
+import org.springframework.lang.Nullable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -36,11 +38,21 @@ public class PublishResultAspect {
 
     private final RacerPublisherRegistry registry;
     private final RacerStreamPublisher streamPublisher;
+    @Nullable
+    private final RacerProperties properties;
 
+    /** Constructor used by tests and legacy wiring (no channel-config fallback). */
     public PublishResultAspect(RacerPublisherRegistry registry,
                                 RacerStreamPublisher streamPublisher) {
+        this(registry, streamPublisher, null);
+    }
+
+    public PublishResultAspect(RacerPublisherRegistry registry,
+                                RacerStreamPublisher streamPublisher,
+                                @Nullable RacerProperties properties) {
         this.registry        = registry;
         this.streamPublisher = streamPublisher;
+        this.properties      = properties;
     }
 
     @Around("@annotation(publishResult)")
@@ -48,8 +60,9 @@ public class PublishResultAspect {
         Object result = pjp.proceed();
 
         String channel = resolveChannel(publishResult);
-        String sender  = publishResult.sender();
-        boolean async  = publishResult.async();
+        String channelRef = publishResult.channelRef();
+        String sender  = resolveSender(publishResult, channelRef);
+        boolean async  = resolveAsync(publishResult, channelRef);
         boolean durable = publishResult.durable();
 
         if (result instanceof Mono) {
@@ -98,6 +111,39 @@ public class PublishResultAspect {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Resolves the sender: annotation value wins if non-empty; otherwise falls back
+     * to {@code racer.channels.<alias>.sender}; ultimate fallback is {@code "racer-publisher"}.
+     */
+    private String resolveSender(PublishResult annotation, String channelRef) {
+        if (!annotation.sender().isBlank()) {
+            return annotation.sender();
+        }
+        if (properties != null && !channelRef.isBlank()) {
+            RacerProperties.ChannelProperties channelProps = properties.getChannels().get(channelRef);
+            if (channelProps != null && channelProps.getSender() != null
+                    && !channelProps.getSender().isBlank()) {
+                return channelProps.getSender();
+            }
+        }
+        return "racer-publisher";
+    }
+
+    /**
+     * Resolves the async flag: when {@code channelRef} maps to a configured channel,
+     * that channel's {@code async} setting governs the publish; otherwise falls back
+     * to the annotation attribute.
+     */
+    private boolean resolveAsync(PublishResult annotation, String channelRef) {
+        if (properties != null && !channelRef.isBlank()) {
+            RacerProperties.ChannelProperties channelProps = properties.getChannels().get(channelRef);
+            if (channelProps != null) {
+                return channelProps.isAsync();
+            }
+        }
+        return annotation.async();
+    }
 
     private String resolveChannel(PublishResult annotation) {
         if (!annotation.channel().isBlank()) {

@@ -62,8 +62,13 @@ public @interface PublishResult {
 
     /**
      * Sender identifier attached to the published message.
+     *
+     * <p>When empty (the default), the sender is inherited from the channel configuration
+     * ({@code racer.channels.<alias>.sender}) when {@link #channelRef()} is set, or falls
+     * back to {@code "racer-publisher"} if no channel config is found.
+     * Set an explicit value here only to override the channel-level default.
      */
-    String sender() default "racer-publisher";
+    String sender() default "";
 
     /**
      * {@code true} = fire-and-forget (subscribe and return immediately).

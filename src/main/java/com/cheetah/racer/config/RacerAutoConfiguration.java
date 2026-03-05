@@ -82,9 +82,10 @@ public class RacerAutoConfiguration {
     @Bean
     public PublishResultAspect publishResultAspect(
             RacerPublisherRegistry racerPublisherRegistry,
-            RacerStreamPublisher racerStreamPublisher) {
+            RacerStreamPublisher racerStreamPublisher,
+            RacerProperties racerProperties) {
 
-        return new PublishResultAspect(racerPublisherRegistry, racerStreamPublisher);
+        return new PublishResultAspect(racerPublisherRegistry, racerStreamPublisher, racerProperties);
     }
 
     @Bean

@@ -334,7 +334,7 @@ public class InventoryService {
      * and published to racer:inventory:stock (the "stock" channel alias) by the
      * @PublishResult AOP interceptor — no explicit publish call needed.
      */
-    @PublishResult(channelRef = "stock", sender = "inventory-service", async = true)
+    @PublishResult(channelRef = "stock")   // sender and async inherited from racer.channels.stock.*
     public Mono<InventoryItem> createItem(String sku, String name, int qty, String location) {
         InventoryItem item = InventoryItem.builder()
                 .sku(sku)
@@ -359,7 +359,7 @@ public class InventoryService {
      * Updates stock level. If quantity drops below 10, also publishes a LOW_STOCK_ALERT
      * directly using the injected alertsPublisher (synchronous — waits for Redis).
      */
-    @PublishResult(channelRef = "stock", sender = "inventory-service", async = true)
+    @PublishResult(channelRef = "stock")   // sender and async inherited from racer.channels.stock.*
     public Mono<InventoryItem> updateStock(String sku, int delta) {
         return Mono.justOrEmpty(store.get(sku))
                 .switchIfEmpty(Mono.error(new IllegalArgumentException("SKU not found: " + sku)))
@@ -802,3 +802,514 @@ Once comfortably running, explore these Racer capabilities:
 | `@RacerPublisher` field is `null` at runtime | Bean is not a Spring-managed proxy (e.g. `new MyService()`) | Ensure the class is annotated `@Service` / `@Component` and obtained from the context |
 | `@PublishResult` not intercepting calls | AOP proxy not applied — bean called from within the same class | Move the `@PublishResult` method to a separate `@Service` bean |
 | Channel not found for alias | Alias missing in `application.properties` | Add `racer.channels.<alias>.name=...` |
+
+---
+
+## Part 8 — Consumer Application: Subscribing from a Separate Service
+
+The `inventory-service` you built in Parts 1–6 publishes events and also consumes its
+own audit channel in-process. In real architectures you often want a **completely
+separate downstream service** — possibly owned by a different team — to react to those
+same events independently.
+
+This part builds `inventory-consumer`, a standalone Spring Boot application that:
+
+- Subscribes to `racer:inventory:stock` for stock change events using `@RacerListener`
+- Subscribes to `racer:inventory:alerts` for low-stock alerts using `@RacerListener`
+- Subscribes durably to `racer:inventory:stock` as a Redis Stream consumer group (no
+  missed messages even after restarts) using `@RacerStreamListener`
+
+Both apps share the **same Redis instance** but are otherwise fully independent — no
+shared libraries, no direct HTTP calls, no service-discovery coupling.
+
+---
+
+### Step 8.1 — Directory layout
+
+Create this structure **alongside** (not inside) `inventory-service`:
+
+```
+inventory-consumer/
+├── pom.xml
+└── src/
+    └── main/
+        ├── java/
+        │   └── com/example/consumer/
+        │       ├── ConsumerApplication.java
+        │       ├── model/
+        │       │   └── InventoryItem.java
+        │       └── listener/
+        │           ├── StockEventListener.java
+        │           ├── AlertEventListener.java
+        │           └── StockStreamListener.java   ← durable (optional)
+        └── resources/
+            └── application.properties
+```
+
+```bash
+mkdir -p inventory-consumer/src/main/java/com/example/consumer/{model,listener}
+mkdir -p inventory-consumer/src/main/resources
+cd inventory-consumer
+```
+
+---
+
+### Step 8.2 — `pom.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.4.3</version>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>inventory-consumer</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <name>inventory-consumer</name>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <!-- racer — single dependency for all messaging capabilities -->
+        <dependency>
+            <groupId>com.cheetah</groupId>
+            <artifactId>racer</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
+        </dependency>
+
+        <!-- Reactive HTTP layer (for health / metrics endpoints) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
+        <!-- Actuator — health + metrics -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Lombok -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+---
+
+### Step 8.3 — `application.properties`
+
+```properties
+# ── Server ──────────────────────────────────────────────────────────────────
+server.port=8091   # different port — both apps run on the same machine
+
+# ── Redis ────────────────────────────────────────────────────────────────────
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+
+# ── Racer channel aliases ─────────────────────────────────────────────────
+# Mirror the producer's channel names so you can use channelRef in listeners.
+racer.channels.stock.name=racer:inventory:stock
+racer.channels.alerts.name=racer:inventory:alerts
+racer.channels.audit.name=racer:inventory:audit
+
+# ── Actuator ─────────────────────────────────────────────────────────────────
+management.endpoints.web.exposure.include=health,info,metrics
+management.endpoint.health.show-details=always
+```
+
+> **Tip:** Only `racer.channels.<alias>.name` is required in a consumer. The `async`,
+> `sender`, and `durable` properties are only meaningful on the publisher side.
+
+---
+
+### Step 8.4 — Main class
+
+```java
+// src/main/java/com/example/consumer/ConsumerApplication.java
+package com.example.consumer;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+// No @EnableRacer needed — RacerAutoConfiguration is registered automatically via
+// META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+public class ConsumerApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(ConsumerApplication.class, args);
+    }
+}
+```
+
+---
+
+### Step 8.5 — Domain model
+
+Replicate (or share via a shared library) the domain model from `inventory-service`.
+For this tutorial, define a local copy:
+
+```java
+// src/main/java/com/example/consumer/model/InventoryItem.java
+package com.example.consumer.model;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.Instant;
+
+@Data
+@NoArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)   // safe when producer adds new fields
+public class InventoryItem {
+    private String  sku;
+    private String  name;
+    private int     quantity;
+    private String  location;
+    private String  eventType;
+    private String  correlationId;
+    private Instant updatedAt;
+}
+```
+
+> `@JsonIgnoreProperties(ignoreUnknown = true)` prevents the consumer from breaking when
+> the producer adds new fields — a best practice for independent deployability.
+
+---
+
+### Step 8.6 — Stock event listener
+
+```java
+// src/main/java/com/example/consumer/listener/StockEventListener.java
+package com.example.consumer.listener;
+
+import com.cheetah.racer.annotation.RacerListener;
+import com.cheetah.racer.model.RacerMessage;
+import com.example.consumer.model.InventoryItem;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class StockEventListener {
+
+    private static final Logger log = LoggerFactory.getLogger(StockEventListener.class);
+
+    private final ObjectMapper objectMapper;
+
+    public StockEventListener(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Subscribes to racer:inventory:stock via Redis Pub/Sub.
+     * Every STOCK_UPDATED and ITEM_CREATED event published by inventory-service
+     * is delivered here in real time.
+     *
+     * RacerListenerRegistrar handles: subscription, deserialization,
+     * DLQ forwarding on exception, and Micrometer metrics.
+     */
+    @RacerListener(channel = "racer:inventory:stock", id = "stock-listener")
+    public void onStockEvent(RacerMessage message) {
+        InventoryItem item = objectMapper.convertValue(message.getPayload(), InventoryItem.class);
+        log.info("[STOCK] eventType={} sku={} qty={} correlationId={}",
+                item.getEventType(), item.getSku(), item.getQuantity(), item.getCorrelationId());
+
+        // Add your business logic here, for example:
+        //   - update a read-model or cache
+        //   - trigger a warehouse management system call
+        //   - feed an analytics pipeline
+    }
+}
+```
+
+---
+
+### Step 8.7 — Alert event listener
+
+```java
+// src/main/java/com/example/consumer/listener/AlertEventListener.java
+package com.example.consumer.listener;
+
+import com.cheetah.racer.annotation.RacerListener;
+import com.cheetah.racer.model.RacerMessage;
+import com.example.consumer.model.InventoryItem;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class AlertEventListener {
+
+    private static final Logger log = LoggerFactory.getLogger(AlertEventListener.class);
+
+    private final ObjectMapper objectMapper;
+
+    public AlertEventListener(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Subscribes to racer:inventory:alerts.
+     * LOW_STOCK_ALERT events trigger this handler whenever inventory-service
+     * detects a quantity below the alert threshold.
+     */
+    @RacerListener(channel = "racer:inventory:alerts", id = "alert-listener")
+    public void onAlertEvent(RacerMessage message) {
+        InventoryItem alert = objectMapper.convertValue(message.getPayload(), InventoryItem.class);
+        log.warn("[ALERT] LOW STOCK — sku={} qty={} location={}",
+                alert.getSku(), alert.getQuantity(), alert.getLocation());
+
+        // Example reactions:
+        //   - send an email or Slack notification
+        //   - create a purchase order via an ERP API
+        //   - update an ops dashboard
+    }
+}
+```
+
+---
+
+### Step 8.8 — Durable stream listener (optional)
+
+Pub/Sub (`@RacerListener`) is fire-and-forget: if `inventory-consumer` is **offline**
+when an event is published, that event is **lost**. Redis Streams solve this with
+durable, consumer-group-based delivery — messages are replayed on reconnect.
+
+**Enable durable publishing in `inventory-service`** by adding one property:
+
+```properties
+# inventory-service/src/main/resources/application.properties
+racer.channels.stock.durable=true    # ← add this line, then restart inventory-service
+```
+
+**Add the stream listener in `inventory-consumer`:**
+
+```java
+// src/main/java/com/example/consumer/listener/StockStreamListener.java
+package com.example.consumer.listener;
+
+import com.cheetah.racer.annotation.RacerStreamListener;
+import com.cheetah.racer.model.RacerMessage;
+import com.example.consumer.model.InventoryItem;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class StockStreamListener {
+
+    private static final Logger log = LoggerFactory.getLogger(StockStreamListener.class);
+
+    private final ObjectMapper objectMapper;
+
+    public StockStreamListener(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Durable stream consumer backed by a Redis Stream consumer group.
+     *
+     * stream   — Redis Stream key (must match racer.channels.stock.name in producer)
+     * group    — consumer group name (auto-created by Racer on first connect)
+     * consumer — unique consumer name within the group
+     *
+     * Messages are acknowledged (XACK) automatically on successful return.
+     * Exceptions route the message to the DLQ; the message is not re-queued
+     * unless you configure an explicit retry policy.
+     */
+    @RacerStreamListener(
+        stream   = "racer:inventory:stock",
+        group    = "inventory-consumer-group",
+        consumer = "consumer-1"
+    )
+    public void onStockStream(RacerMessage message) {
+        InventoryItem item = objectMapper.convertValue(message.getPayload(), InventoryItem.class);
+        log.info("[STREAM] durable delivery — eventType={} sku={} qty={}",
+                item.getEventType(), item.getSku(), item.getQuantity());
+    }
+}
+```
+
+> **When to use `@RacerStreamListener` vs `@RacerListener`?**
+>
+> |  | `@RacerListener` (Pub/Sub) | `@RacerStreamListener` (Streams) |
+> |---|---|---|
+> | Messages missed while offline | **Lost** | **Replayed on reconnect** |
+> | Multiple consumers share load | No — each subscriber receives all messages | Yes — consumer group distributes messages |
+> | Message ordering guaranteed | No | Yes, per shard |
+> | Producer-side setup required | None | Add `durable=true` to channel config |
+
+---
+
+### Step 8.9 — Build and run both apps
+
+**Terminal A** — Redis (already running from Part 1):
+
+```bash
+docker compose -f /path/to/racer/compose.yaml up -d
+```
+
+**Terminal B** — Producer (`inventory-service` on port 8090):
+
+```bash
+cd inventory-service
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+mvn spring-boot:run
+```
+
+**Terminal C** — Consumer (`inventory-consumer` on port 8091):
+
+```bash
+cd inventory-consumer
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+mvn spring-boot:run
+```
+
+`inventory-consumer` startup log should contain:
+
+```
+Started ConsumerApplication in X.XXX seconds
+[racer] Registered listener 'stock-listener'  → racer:inventory:stock
+[racer] Registered listener 'alert-listener'  → racer:inventory:alerts
+```
+
+---
+
+### Step 8.10 — End-to-end test
+
+**Terminal D** — create an item with a low starting quantity (triggers both stock and alert):
+
+```bash
+curl -s -X POST http://localhost:8090/api/inventory \
+  -H "Content-Type: application/json" \
+  -d '{"sku":"GADGET-42","name":"Smart Gadget","quantity":8,"location":"SHELF-A1"}' | jq
+```
+
+Watch `inventory-consumer` logs — you should see **two** entries:
+
+```
+[STOCK]  eventType=ITEM_CREATED   sku=GADGET-42 qty=8  correlationId=...
+[ALERT]  LOW STOCK — sku=GADGET-42 qty=8 location=SHELF-A1
+```
+
+Quantity 8 is already below the alert threshold (10), so both events fire immediately.
+
+**Restock above threshold** (stock event only — no alert):
+
+```bash
+curl -s -X PATCH http://localhost:8090/api/inventory/GADGET-42/stock \
+  -H "Content-Type: application/json" \
+  -d '{"delta":15}' | jq
+```
+
+Consumer logs:
+
+```
+[STOCK]  eventType=STOCK_UPDATED  sku=GADGET-42 qty=23
+```
+
+**Drain back below threshold** (both events fire again):
+
+```bash
+curl -s -X PATCH http://localhost:8090/api/inventory/GADGET-42/stock \
+  -H "Content-Type: application/json" \
+  -d '{"delta":-20}' | jq
+```
+
+Consumer logs:
+
+```
+[STOCK]  eventType=STOCK_UPDATED  sku=GADGET-42 qty=3
+[ALERT]  LOW STOCK — sku=GADGET-42 qty=3 location=SHELF-A1
+```
+
+---
+
+### How the two apps fit together
+
+```
+inventory-service (port 8090)                Redis (port 6379)
+─────────────────────────────                ─────────────────
+POST /api/inventory
+  └─▶ InventoryService.createItem()
+        ├─ @PublishResult ──────────────────▶ racer:inventory:stock  ──┐
+        └─ alertsPublisher ─────────────────▶ racer:inventory:alerts ──┤
+                                                                        │
+                                             inventory-consumer (8091)  │
+                                             ─────────────────────────  │
+                                             StockEventListener  ◀──────┤ (Pub/Sub)
+                                             AlertEventListener  ◀──────┘ (Pub/Sub)
+                                             StockStreamListener ◀────── (Streams, durable)
+```
+
+> **Key takeaway:** `inventory-consumer` requires only the `racer` dependency and
+> `@RacerListener` / `@RacerStreamListener` to subscribe to any channel.
+> There is no shared library, no code coupling, and no service-discovery — only a shared
+> Redis instance and agreed-upon channel names.
+
+---
+
+### Consumer Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| No messages received by consumer | Producer and consumer targeting different Redis or channel name | Verify `spring.data.redis.*` and `racer.channels.<alias>.name` match exactly in both apps |
+| `@RacerListener` method never called | Bean not picked up by Spring | Ensure class has `@Component` / `@Service` and is within the component-scan root |
+| Stream listener never triggers | `durable=true` not set on producer channel | Add `racer.channels.stock.durable=true` to `inventory-service` properties and restart |
+| Same message processed twice | Two consumer instances share the same `consumer` name in one group | Give each instance a unique `consumer` name (e.g. append `${random.uuid}`) |
+| Exception in listener — message lost | DLQ not configured | Add `racer.dlq.*` config or handle errors inside the listener and return normally |
