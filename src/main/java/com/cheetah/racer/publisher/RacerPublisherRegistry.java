@@ -3,6 +3,8 @@ package com.cheetah.racer.publisher;
 import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.metrics.RacerMetrics;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
+import com.cheetah.racer.security.RacerMessageSigner;
+import com.cheetah.racer.security.RacerPayloadEncryptor;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -35,6 +37,10 @@ public class RacerPublisherRegistry {
     private final RacerMetrics racerMetrics;
     @Nullable
     private final RacerSchemaRegistry schemaRegistry;
+    @Nullable
+    private final RacerPayloadEncryptor payloadEncryptor;
+    @Nullable
+    private final RacerMessageSigner messageSigner;
 
     /** alias → publisher */
     private final Map<String, RacerChannelPublisher> registry = new HashMap<>();
@@ -42,14 +48,16 @@ public class RacerPublisherRegistry {
     public RacerPublisherRegistry(RacerProperties properties,
                                   ReactiveRedisTemplate<String, String> redisTemplate,
                                   ObjectMapper objectMapper) {
-        this(properties, redisTemplate, objectMapper, Optional.empty(), Optional.empty());
+        this(properties, redisTemplate, objectMapper,
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     public RacerPublisherRegistry(RacerProperties properties,
                                   ReactiveRedisTemplate<String, String> redisTemplate,
                                   ObjectMapper objectMapper,
                                   Optional<RacerMetrics> metricsOpt) {
-        this(properties, redisTemplate, objectMapper, metricsOpt, Optional.empty());
+        this(properties, redisTemplate, objectMapper,
+                metricsOpt, Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     public RacerPublisherRegistry(RacerProperties properties,
@@ -57,19 +65,34 @@ public class RacerPublisherRegistry {
                                   ObjectMapper objectMapper,
                                   Optional<RacerMetrics> metricsOpt,
                                   Optional<RacerSchemaRegistry> schemaRegistryOpt) {
-        this.properties     = properties;
-        this.redisTemplate  = redisTemplate;
-        this.objectMapper   = objectMapper;
-        this.racerMetrics   = metricsOpt.orElse(null);
-        this.schemaRegistry = schemaRegistryOpt.orElse(null);
+        this(properties, redisTemplate, objectMapper,
+                metricsOpt, schemaRegistryOpt, Optional.empty(), Optional.empty());
+    }
+
+    public RacerPublisherRegistry(RacerProperties properties,
+                                  ReactiveRedisTemplate<String, String> redisTemplate,
+                                  ObjectMapper objectMapper,
+                                  Optional<RacerMetrics> metricsOpt,
+                                  Optional<RacerSchemaRegistry> schemaRegistryOpt,
+                                  Optional<RacerPayloadEncryptor> payloadEncryptorOpt,
+                                  Optional<RacerMessageSigner> messageSignerOpt) {
+        this.properties       = properties;
+        this.redisTemplate    = redisTemplate;
+        this.objectMapper     = objectMapper;
+        this.racerMetrics     = metricsOpt.orElse(null);
+        this.schemaRegistry   = schemaRegistryOpt.orElse(null);
+        this.payloadEncryptor = payloadEncryptorOpt.orElse(null);
+        this.messageSigner    = messageSignerOpt.orElse(null);
     }
 
     @PostConstruct
     public void init() {
         // Register the default channel
-        registry.put(DEFAULT_ALIAS, new RacerChannelPublisherImpl(
+        RacerChannelPublisherImpl defaultPub = new RacerChannelPublisherImpl(
                 redisTemplate, objectMapper,
-                properties.getDefaultChannel(), DEFAULT_ALIAS, "racer", racerMetrics, schemaRegistry));
+                properties.getDefaultChannel(), DEFAULT_ALIAS, "racer", racerMetrics, schemaRegistry);
+        applySecurityComponents(defaultPub);
+        registry.put(DEFAULT_ALIAS, defaultPub);
         log.info("[racer] Default channel registered: '{}'", properties.getDefaultChannel());
 
         // Register each named channel
@@ -78,11 +101,18 @@ public class RacerPublisherRegistry {
                 log.warn("[racer] Channel alias '{}' has no 'name' configured — skipping.", alias);
                 return;
             }
-            registry.put(alias, new RacerChannelPublisherImpl(
+            RacerChannelPublisherImpl pub = new RacerChannelPublisherImpl(
                     redisTemplate, objectMapper,
-                    channelProps.getName(), alias, channelProps.getSender(), racerMetrics, schemaRegistry));
+                    channelProps.getName(), alias, channelProps.getSender(), racerMetrics, schemaRegistry);
+            applySecurityComponents(pub);
+            registry.put(alias, pub);
             log.info("[racer] Channel '{}' registered → '{}'", alias, channelProps.getName());
         });
+    }
+
+    private void applySecurityComponents(RacerChannelPublisherImpl pub) {
+        if (payloadEncryptor != null) pub.setPayloadEncryptor(payloadEncryptor);
+        if (messageSigner    != null) pub.setMessageSigner(messageSigner);
     }
 
     /**

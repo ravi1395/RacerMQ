@@ -4,6 +4,7 @@ import com.cheetah.racer.aspect.PublishResultAspect;
 import com.cheetah.racer.backpressure.RacerBackPressureMonitor;
 import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
 import com.cheetah.racer.dedup.RacerDedupService;
+import com.cheetah.racer.health.RacerConnectionValidator;
 import com.cheetah.racer.listener.RacerDeadLetterHandler;
 import com.cheetah.racer.listener.RacerListenerRegistrar;
 import com.cheetah.racer.metrics.RacerMetrics;
@@ -17,6 +18,9 @@ import com.cheetah.racer.publisher.RacerStreamPublisher;
 import com.cheetah.racer.requestreply.RacerResponderRegistrar;
 import com.cheetah.racer.router.RacerRouterService;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
+import com.cheetah.racer.security.RacerMessageSigner;
+import com.cheetah.racer.security.RacerPayloadEncryptor;
+import com.cheetah.racer.security.RacerSenderFilter;
 import com.cheetah.racer.service.DeadLetterQueueService;
 import com.cheetah.racer.service.DlqReprocessorService;
 import com.cheetah.racer.service.RacerRetentionService;
@@ -79,14 +83,18 @@ public class RacerAutoConfiguration {
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
             ObjectMapper objectMapper,
             Optional<RacerMetrics> racerMetrics,
-            Optional<RacerSchemaRegistry> racerSchemaRegistry) {
+            Optional<RacerSchemaRegistry> racerSchemaRegistry,
+            Optional<RacerPayloadEncryptor> racerPayloadEncryptor,
+            Optional<RacerMessageSigner> racerMessageSigner) {
 
         return new RacerPublisherRegistry(
                 racerProperties,
                 reactiveStringRedisTemplate,
                 objectMapper,
                 racerMetrics,
-                racerSchemaRegistry);
+                racerSchemaRegistry,
+                racerPayloadEncryptor,
+                racerMessageSigner);
     }
 
     @Bean
@@ -111,13 +119,18 @@ public class RacerAutoConfiguration {
         return new RacerMetrics(meterRegistry);
     }
 
-    // ── Durable stream publisher ─────────────────────────────────────────────
+    // ── Durable stream publisher ───────────────────────────────────────────
 
     @Bean
     public RacerStreamPublisher racerStreamPublisher(
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
-            ObjectMapper objectMapper) {
-        return new RacerStreamPublisher(reactiveStringRedisTemplate, objectMapper);
+            ObjectMapper objectMapper,
+            Optional<RacerPayloadEncryptor> racerPayloadEncryptor,
+            Optional<RacerMessageSigner> racerMessageSigner) {
+        RacerStreamPublisher publisher = new RacerStreamPublisher(reactiveStringRedisTemplate, objectMapper);
+        racerPayloadEncryptor.ifPresent(publisher::setPayloadEncryptor);
+        racerMessageSigner.ifPresent(publisher::setMessageSigner);
+        return publisher;
     }
 
     // ── Content-based router ─────────────────────────────────────────────────
@@ -267,7 +280,10 @@ public class RacerAutoConfiguration {
             Optional<RacerRouterService> racerRouterService,
             Optional<RacerDeadLetterHandler> deadLetterHandler,
             Optional<RacerDedupService> racerDedupService,
-            Optional<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry) {
+            Optional<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry,
+            Optional<RacerPayloadEncryptor> racerPayloadEncryptor,
+            Optional<RacerMessageSigner> racerMessageSigner,
+            Optional<RacerSenderFilter> racerSenderFilter) {
         RacerListenerRegistrar registrar = new RacerListenerRegistrar(
                 listenerContainer,
                 objectMapper,
@@ -279,6 +295,9 @@ public class RacerAutoConfiguration {
                 deadLetterHandler.orElse(null));
         racerDedupService.ifPresent(registrar::setDedupService);
         racerCircuitBreakerRegistry.ifPresent(registrar::setCircuitBreakerRegistry);
+        racerPayloadEncryptor.ifPresent(registrar::setPayloadEncryptor);
+        racerMessageSigner.ifPresent(registrar::setMessageSigner);
+        racerSenderFilter.ifPresent(registrar::setSenderFilter);
         return registrar;
     }
 
@@ -333,7 +352,10 @@ public class RacerAutoConfiguration {
             Optional<RacerSchemaRegistry> racerSchemaRegistry,
             Optional<RacerDeadLetterHandler> deadLetterHandler,
             Optional<RacerDedupService> racerDedupService,
-            Optional<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry) {
+            Optional<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry,
+            Optional<RacerPayloadEncryptor> racerPayloadEncryptor,
+            Optional<RacerMessageSigner> racerMessageSigner,
+            Optional<RacerSenderFilter> racerSenderFilter) {
         RacerStreamListenerRegistrar registrar = new RacerStreamListenerRegistrar(
                 reactiveStringRedisTemplate,
                 objectMapper,
@@ -343,6 +365,9 @@ public class RacerAutoConfiguration {
                 deadLetterHandler.orElse(null));
         racerDedupService.ifPresent(registrar::setDedupService);
         racerCircuitBreakerRegistry.ifPresent(registrar::setCircuitBreakerRegistry);
+        racerPayloadEncryptor.ifPresent(registrar::setPayloadEncryptor);
+        racerMessageSigner.ifPresent(registrar::setMessageSigner);
+        racerSenderFilter.ifPresent(registrar::setSenderFilter);
         return registrar;
     }
 
@@ -449,5 +474,53 @@ public class RacerAutoConfiguration {
     @EnableScheduling
     static class RacerRetentionSchedulingConfiguration {
         // @EnableScheduling activates @Scheduled on RacerRetentionService
+    }
+
+    // ── Phase 4: Security ────────────────────────────────────────────────────
+
+    /**
+     * Activated via {@code racer.security.encryption.enabled=true}.
+     * Provides transparent AES-256-GCM payload encryption/decryption on all channels.
+     * Requires {@code racer.security.encryption.key} (base64, 32 bytes).
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.security.encryption.enabled", havingValue = "true")
+    public RacerPayloadEncryptor racerPayloadEncryptor(RacerProperties racerProperties) {
+        return new RacerPayloadEncryptor(racerProperties);
+    }
+
+    /**
+     * Activated via {@code racer.security.signing.enabled=true}.
+     * Provides transparent HMAC-SHA256 message signing on publish and
+     * signature verification on consume.
+     * Requires {@code racer.security.signing.secret}.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.security.signing.enabled", havingValue = "true")
+    public RacerMessageSigner racerMessageSigner(RacerProperties racerProperties) {
+        return new RacerMessageSigner(racerProperties);
+    }
+
+    /**
+     * Always registered. Acts as a no-op filter when both
+     * {@code racer.security.allowed-senders} and {@code racer.security.denied-senders} are empty.
+     * Becomes active as soon as either list is populated.
+     */
+    @Bean
+    public RacerSenderFilter racerSenderFilter(RacerProperties racerProperties) {
+        return new RacerSenderFilter(racerProperties);
+    }
+
+    /**
+     * Validates Redis connectivity, permissions, and TLS at {@code ApplicationReadyEvent}.
+     * Active when {@code racer.redis-health.validate-permissions-on-startup=true}
+     * and/or {@code racer.redis-health.require-tls=true} in the application config.
+     * The validator is always registered but only performs checks that are explicitly enabled.
+     */
+    @Bean
+    public RacerConnectionValidator racerConnectionValidator(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            RacerProperties racerProperties) {
+        return new RacerConnectionValidator(reactiveStringRedisTemplate, racerProperties);
     }
 }

@@ -601,4 +601,117 @@ public class RacerProperties {
 
     /** Graceful-shutdown configuration. */
     private ShutdownProperties shutdown = new ShutdownProperties();
+
+    // ── 4.1 Redis Connection Health ───────────────────────────────────────────
+
+    /**
+     * Redis connection health validation settings.
+     * Mapped under {@code racer.redis-health.*}.
+     */
+    @Data
+    public static class RedisHealthProperties {
+
+        /**
+         * When {@code true}, Racer verifies at startup that the configured Redis user
+         * has the minimum required permissions (PING, PUBLISH, SET, GET).
+         * A failed probe causes the application to refuse to start.
+         * Defaults to {@code false}.
+         */
+        private boolean validatePermissionsOnStartup = false;
+
+        /**
+         * When {@code true}, startup fails if the Redis connection is not using TLS/SSL.
+         * Requires {@code spring.data.redis.ssl.enabled=true} in the application config.
+         * Defaults to {@code false}.
+         */
+        private boolean requireTls = false;
+    }
+
+    /** Redis connection health configuration (4.1). */
+    private RedisHealthProperties redisHealth = new RedisHealthProperties();
+
+    // ── 4.2 Security (encryption, signing, sender filtering) ─────────────────
+
+    /**
+     * Transparent security settings applied on every Racer publish/consume cycle.
+     * Mapped under {@code racer.security.*}.
+     *
+     * <p>All features are off by default ({@code enabled=false}) and activated
+     * independently via their respective {@code enabled} flags.
+     */
+    @Data
+    public static class SecurityProperties {
+
+        /**
+         * Payload-level AES-256-GCM encryption.
+         * Mapped under {@code racer.security.encryption.*}.
+         */
+        private EncryptionProperties encryption = new EncryptionProperties();
+
+        /**
+         * HMAC-SHA256 message signing and verification.
+         * Mapped under {@code racer.security.signing.*}.
+         */
+        private SigningProperties signing = new SigningProperties();
+
+        /**
+         * Allow-list of sender identifiers.
+         * If non-empty, messages whose {@code sender} field is NOT in this list are silently dropped.
+         * An empty list means all senders are permitted (default).
+         */
+        private java.util.List<String> allowedSenders = new java.util.ArrayList<>();
+
+        /**
+         * Deny-list of sender identifiers.
+         * Messages whose {@code sender} field IS in this list are silently dropped.
+         * Evaluated before {@code allowed-senders}.
+         * An empty list means no senders are blocked (default).
+         */
+        private java.util.List<String> deniedSenders = new java.util.ArrayList<>();
+
+        /**
+         * AES-256-GCM payload encryption settings.
+         */
+        @Data
+        public static class EncryptionProperties {
+
+            /**
+             * When {@code true}, message payloads are encrypted (AES-256-GCM) before
+             * publishing and decrypted transparently after receiving.
+             * Defaults to {@code false}.
+             */
+            private boolean enabled = false;
+
+            /**
+             * Base64-encoded 256-bit (32-byte) AES key shared by all publishers
+             * and consumers in the same environment.
+             * Generate with: {@code openssl rand -base64 32}
+             */
+            private String key;
+        }
+
+        /**
+         * HMAC-SHA256 message signing settings.
+         */
+        @Data
+        public static class SigningProperties {
+
+            /**
+             * When {@code true}, each outbound message is HMAC-SHA256 signed and each
+             * inbound message's signature is verified.
+             * Messages with an invalid or missing signature are routed to the DLQ.
+             * Defaults to {@code false}.
+             */
+            private boolean enabled = false;
+
+            /**
+             * Shared HMAC-SHA256 signing secret.
+             * Must be identical on all publisher and consumer applications.
+             */
+            private String secret;
+        }
+    }
+
+    /** Security configuration (4.2). */
+    private SecurityProperties security = new SecurityProperties();
 }

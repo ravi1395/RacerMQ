@@ -11,6 +11,9 @@ import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.router.RacerRouterService;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.cheetah.racer.schema.SchemaValidationException;
+import com.cheetah.racer.security.RacerMessageSigner;
+import com.cheetah.racer.security.RacerPayloadEncryptor;
+import com.cheetah.racer.security.RacerSenderFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopProxyUtils;
@@ -120,6 +123,20 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
     /** Set by {@link com.cheetah.racer.backpressure.RacerBackPressureMonitor}. */
     private final AtomicBoolean backPressureActive = new AtomicBoolean(false);
 
+    // ── Phase 4 security extensions ─────────────────────────────────────────
+
+    /** Injected when {@code racer.security.encryption.enabled=true}. */
+    @Nullable
+    private RacerPayloadEncryptor payloadEncryptor;
+
+    /** Injected when {@code racer.security.signing.enabled=true}. */
+    @Nullable
+    private RacerMessageSigner messageSigner;
+
+    /** Always injected — acts as no-op when both filter lists are empty. */
+    @Nullable
+    private RacerSenderFilter senderFilter;
+
     // ── SmartLifecycle state ─────────────────────────────────────────────────
     private volatile boolean   running      = false;
     private final AtomicBoolean stopping    = new AtomicBoolean(false);
@@ -131,6 +148,18 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
 
     public void setCircuitBreakerRegistry(RacerCircuitBreakerRegistry circuitBreakerRegistry) {
         this.circuitBreakerRegistry = circuitBreakerRegistry;
+    }
+
+    public void setPayloadEncryptor(RacerPayloadEncryptor payloadEncryptor) {
+        this.payloadEncryptor = payloadEncryptor;
+    }
+
+    public void setMessageSigner(RacerMessageSigner messageSigner) {
+        this.messageSigner = messageSigner;
+    }
+
+    public void setSenderFilter(RacerSenderFilter senderFilter) {
+        this.senderFilter = senderFilter;
     }
 
     /**
@@ -420,6 +449,41 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                                        RacerMessage message,
                                        String listenerId, String channel,
                                        @Nullable RacerCircuitBreaker cb) {
+        // S1. Sender filter — reject messages from blocked/unlisted senders
+        if (senderFilter != null && senderFilter.isActive() && !senderFilter.isAllowed(message.getSender())) {
+            log.warn("[RACER-LISTENER] '{}' — sender '{}' blocked by filter, dropping message id={}",
+                    listenerId, message.getSender(), message.getId());
+            return Mono.empty();
+        }
+
+        // S2. Signature verification — must happen BEFORE decryption (signature covers encrypted form)
+        if (messageSigner != null) {
+            if (!messageSigner.verify(message)) {
+                log.warn("[RACER-LISTENER] '{}' — HMAC signature invalid for id={}, routing to DLQ",
+                        listenerId, message.getId());
+                if (cb != null) cb.onFailure();
+                return enqueueDeadLetter(message,
+                        new com.cheetah.racer.exception.RacerSecurityException(
+                                "HMAC-SHA256 signature mismatch for message id=" + message.getId()))
+                        .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
+                        .then();
+            }
+        }
+
+        // S3. Payload decryption
+        if (payloadEncryptor != null) {
+            try {
+                message.setPayload(payloadEncryptor.decrypt(message.getPayload()));
+            } catch (Exception e) {
+                log.warn("[RACER-LISTENER] '{}' — payload decryption failed for id={}, routing to DLQ: {}",
+                        listenerId, message.getId(), e.getMessage());
+                if (cb != null) cb.onFailure();
+                return enqueueDeadLetter(message, e)
+                        .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
+                        .then();
+            }
+        }
+
         // 2. Content-based routing — re-publish & skip local dispatch if a rule matches
         if (racerRouterService != null && racerRouterService.route(message)) {
             log.debug("[RACER-LISTENER] '{}' message id={} routed — skipping local dispatch",

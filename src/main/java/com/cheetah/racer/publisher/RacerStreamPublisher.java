@@ -1,10 +1,13 @@
 package com.cheetah.racer.publisher;
 
+import com.cheetah.racer.security.RacerMessageSigner;
+import com.cheetah.racer.security.RacerPayloadEncryptor;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.lang.Nullable;
 import reactor.core.publisher.Mono;
 
 import java.time.Instant;
@@ -37,6 +40,19 @@ public class RacerStreamPublisher {
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
 
+    @Nullable
+    private RacerPayloadEncryptor payloadEncryptor;
+    @Nullable
+    private RacerMessageSigner messageSigner;
+
+    public void setPayloadEncryptor(RacerPayloadEncryptor payloadEncryptor) {
+        this.payloadEncryptor = payloadEncryptor;
+    }
+
+    public void setMessageSigner(RacerMessageSigner messageSigner) {
+        this.messageSigner = messageSigner;
+    }
+
     public RacerStreamPublisher(ReactiveRedisTemplate<String, String> redisTemplate,
                                 ObjectMapper objectMapper) {
         this.redisTemplate = redisTemplate;
@@ -53,11 +69,33 @@ public class RacerStreamPublisher {
      */
     public Mono<RecordId> publishToStream(String streamKey, Object payload, String sender) {
         return Mono.fromCallable(() -> {
+                    String messageId = UUID.randomUUID().toString();
+
+                    // Normalise payload to string (required for encryption and signing)
+                    String payloadStr = (payload instanceof String s)
+                            ? s
+                            : objectMapper.writeValueAsString(payload);
+
+                    // 1. Encrypt payload if encryptor is present
+                    if (payloadEncryptor != null) {
+                        payloadStr = payloadEncryptor.encrypt(payloadStr);
+                    }
+
+                    // 2. Sign the message (over the possibly-encrypted payload)
+                    String signature = null;
+                    if (messageSigner != null) {
+                        signature = messageSigner.sign(messageId, sender, payloadStr, streamKey);
+                    }
+
                     Map<String, Object> envelope = new LinkedHashMap<>();
-                    envelope.put("id",        UUID.randomUUID().toString());
+                    envelope.put("id",        messageId);
+                    envelope.put("channel",   streamKey);
                     envelope.put("sender",    sender);
                     envelope.put("timestamp", Instant.now().toString());
-                    envelope.put("payload",   payload);
+                    envelope.put("payload",   payloadStr);
+                    if (signature != null) {
+                        envelope.put("signature", signature);
+                    }
                     return objectMapper.writeValueAsString(envelope);
                 })
                 .flatMap(json -> {

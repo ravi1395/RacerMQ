@@ -10,6 +10,9 @@ import com.cheetah.racer.listener.RacerDeadLetterHandler;
 import com.cheetah.racer.metrics.RacerMetrics;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
+import com.cheetah.racer.security.RacerMessageSigner;
+import com.cheetah.racer.security.RacerPayloadEncryptor;
+import com.cheetah.racer.security.RacerSenderFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopProxyUtils;
@@ -95,7 +98,19 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
 
     /** (streamKey, group) pairs that have been registered, used by {@link RacerConsumerLagMonitor}. */
     private final Map<String, String> trackedStreamGroups = new ConcurrentHashMap<>();
+    // ── Phase 4 security extensions ───────────────────────────────────────
 
+    /** Injected when {@code racer.security.encryption.enabled=true}. */
+    @Nullable
+    private RacerPayloadEncryptor payloadEncryptor;
+
+    /** Injected when {@code racer.security.signing.enabled=true}. */
+    @Nullable
+    private RacerMessageSigner messageSigner;
+
+    /** Always injected — acts as no-op when both filter lists are empty. */
+    @Nullable
+    private RacerSenderFilter senderFilter;
     // ── SmartLifecycle state ─────────────────────────────────────────────────
     private volatile boolean    running       = false;
     private final AtomicBoolean stopping      = new AtomicBoolean(false);
@@ -107,6 +122,18 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
 
     public void setCircuitBreakerRegistry(RacerCircuitBreakerRegistry circuitBreakerRegistry) {
         this.circuitBreakerRegistry = circuitBreakerRegistry;
+    }
+
+    public void setPayloadEncryptor(RacerPayloadEncryptor payloadEncryptor) {
+        this.payloadEncryptor = payloadEncryptor;
+    }
+
+    public void setMessageSigner(RacerMessageSigner messageSigner) {
+        this.messageSigner = messageSigner;
+    }
+
+    public void setSenderFilter(RacerSenderFilter senderFilter) {
+        this.senderFilter = senderFilter;
     }
 
     /**
@@ -380,6 +407,41 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                                       MapRecord<String, Object, Object> record, String listenerId,
                                       RacerMessage message, @Nullable RacerCircuitBreaker cb) {
         RecordId recordId = record.getId();
+
+        // S1. Sender filter — reject messages from blocked/unlisted senders
+        if (senderFilter != null && senderFilter.isActive() && !senderFilter.isAllowed(message.getSender())) {
+            log.warn("[RACER-STREAM-LISTENER] '{}' — sender '{}' blocked by filter, dropping entry {}",
+                    listenerId, message.getSender(), recordId);
+            return ackRecord(streamKey, group, recordId);
+        }
+
+        // S2. Signature verification — must happen BEFORE decryption (signature covers encrypted form)
+        if (messageSigner != null) {
+            if (!messageSigner.verify(message)) {
+                log.warn("[RACER-STREAM-LISTENER] '{}' — HMAC signature invalid for entry {}, routing to DLQ",
+                        listenerId, recordId);
+                if (cb != null) cb.onFailure();
+                return enqueueDeadLetter(message,
+                        new com.cheetah.racer.exception.RacerSecurityException(
+                                "HMAC-SHA256 signature mismatch for entry " + recordId))
+                        .then(ackRecord(streamKey, group, recordId))
+                        .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet());
+            }
+        }
+
+        // S3. Payload decryption
+        if (payloadEncryptor != null) {
+            try {
+                message.setPayload(payloadEncryptor.decrypt(message.getPayload()));
+            } catch (Exception e) {
+                log.warn("[RACER-STREAM-LISTENER] '{}' — payload decryption failed for entry {}: {}",
+                        listenerId, recordId, e.getMessage());
+                if (cb != null) cb.onFailure();
+                return enqueueDeadLetter(message, e)
+                        .then(ackRecord(streamKey, group, recordId))
+                        .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet());
+            }
+        }
 
         // Schema validation
         if (racerSchemaRegistry != null) {

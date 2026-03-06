@@ -34,6 +34,13 @@ public class RacerMessage implements Serializable {
     private String priority = "NORMAL";
 
     /**
+     * Optional HMAC-SHA256 signature computed by the publisher when
+     * {@code racer.security.signing.enabled=true} and verified by the consumer.
+     * {@code null} when message signing is disabled.
+     */
+    private String signature;
+
+    /**
      * Factory method to create a new message with auto-generated id and timestamp.
      */
     public static RacerMessage create(String channel, String payload, String sender) {
