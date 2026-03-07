@@ -52,12 +52,11 @@ public class RacerWebAutoConfiguration {
 
     @Bean
     @ConditionalOnProperty(name = "racer.web.dlq-enabled", havingValue = "true")
-    @ConditionalOnBean({DeadLetterQueueService.class, DlqReprocessorService.class, RacerRetentionService.class})
+    @ConditionalOnBean({DeadLetterQueueService.class, DlqReprocessorService.class})
     public DlqController dlqController(
             DeadLetterQueueService dlqService,
-            DlqReprocessorService reprocessorService,
-            RacerRetentionService retentionService) {
-        return new DlqController(dlqService, reprocessorService, retentionService);
+            DlqReprocessorService reprocessorService) {
+        return new DlqController(dlqService, reprocessorService);
     }
 
     // ── Schema controller ────────────────────────────────────────────────────

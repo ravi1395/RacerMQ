@@ -2,7 +2,9 @@ package com.cheetah.racer.backpressure;
 
 import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.listener.RacerListenerRegistrar;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.stream.RacerStreamListenerRegistrar;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -51,7 +53,7 @@ public class RacerBackPressureMonitor {
 
     @Nullable private final RacerListenerRegistrar       listenerRegistrar;
     @Nullable private final RacerStreamListenerRegistrar streamListenerRegistrar;
-    @Nullable private final RacerMetrics                 racerMetrics;
+    private final RacerMetricsPort                      racerMetrics;
 
     private final AtomicBoolean backPressureActive = new AtomicBoolean(false);
     private volatile Disposable monitorLoop;
@@ -66,7 +68,7 @@ public class RacerBackPressureMonitor {
         this.racerProperties         = racerProperties;
         this.listenerRegistrar       = listenerRegistrar;
         this.streamListenerRegistrar = streamListenerRegistrar;
-        this.racerMetrics            = racerMetrics;
+        this.racerMetrics            = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     @PostConstruct
@@ -76,9 +78,7 @@ public class RacerBackPressureMonitor {
                 bp.getQueueThreshold() * 100, bp.getCheckIntervalMs());
 
         // Register a single persistent gauge for the current active/inactive state
-        if (racerMetrics != null) {
-            racerMetrics.registerBackPressureActiveGauge(() -> backPressureActive.get() ? 1 : 0);
-        }
+        racerMetrics.registerBackPressureActiveGauge(() -> backPressureActive.get() ? 1 : 0);
 
         monitorLoop = Flux.interval(Duration.ofMillis(bp.getCheckIntervalMs()))
                 .subscribe(tick -> checkAndApply(), ex ->
@@ -116,7 +116,7 @@ public class RacerBackPressureMonitor {
             if (streamListenerRegistrar != null) {
                 streamListenerRegistrar.setBackPressurePollIntervalMs(bp.getStreamPollBackoffMs());
             }
-            if (racerMetrics != null) racerMetrics.recordBackPressureEvent("active");
+            racerMetrics.recordBackPressureEvent("active");
 
         } else if (!shouldActivate && wasActive) {
             backPressureActive.set(false);
@@ -129,7 +129,7 @@ public class RacerBackPressureMonitor {
             if (streamListenerRegistrar != null) {
                 streamListenerRegistrar.setBackPressurePollIntervalMs(0); // 0 = revert to annotation value
             }
-            if (racerMetrics != null) racerMetrics.recordBackPressureEvent("inactive");
+            racerMetrics.recordBackPressureEvent("inactive");
         }
     }
 

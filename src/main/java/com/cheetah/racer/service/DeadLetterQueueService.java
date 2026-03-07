@@ -53,14 +53,7 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
     public Mono<DeadLetterMessage> dequeue() {
         return reactiveStringRedisTemplate.opsForList()
                 .rightPop(RedisChannels.DEAD_LETTER_QUEUE)
-                .flatMap(json -> {
-                    try {
-                        return Mono.just(objectMapper.readValue(json, DeadLetterMessage.class));
-                    } catch (JsonProcessingException e) {
-                        log.error("[DLQ] Failed to deserialize dead letter message", e);
-                        return Mono.error(e);
-                    }
-                });
+                .flatMap(this::deserializeDlm);
     }
 
     /**
@@ -69,14 +62,16 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
     public Flux<DeadLetterMessage> peekAll() {
         return reactiveStringRedisTemplate.opsForList()
                 .range(RedisChannels.DEAD_LETTER_QUEUE, 0, -1)
-                .flatMap(json -> {
-                    try {
-                        return Mono.just(objectMapper.readValue(json, DeadLetterMessage.class));
-                    } catch (JsonProcessingException e) {
-                        log.error("[DLQ] Failed to deserialize dead letter message", e);
-                        return Mono.empty();
-                    }
-                });
+                .flatMap(json -> deserializeDlm(json).onErrorResume(e -> Mono.empty()));
+    }
+
+    private Mono<DeadLetterMessage> deserializeDlm(String json) {
+        try {
+            return Mono.just(objectMapper.readValue(json, DeadLetterMessage.class));
+        } catch (JsonProcessingException e) {
+            log.error("[DLQ] Failed to deserialize dead letter message", e);
+            return Mono.error(e);
+        }
     }
 
     /**

@@ -4,6 +4,7 @@ import com.cheetah.racer.annotation.RacerRequestReply;
 import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.model.RacerReply;
 import com.cheetah.racer.model.RacerRequest;
+import com.cheetah.racer.util.RacerChannelResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.DisposableBean;
@@ -129,11 +130,11 @@ public class RacerClientFactoryBean<T> implements FactoryBean<T>, EnvironmentAwa
 
         Mono<RacerReply> replyMono;
         if (isStream) {
-            String streamKey = resolveStreamKey(resolve(ann.stream()), resolve(ann.streamRef()));
+            String streamKey = RacerChannelResolver.resolveStreamKey(resolve(ann.stream()), resolve(ann.streamRef()), racerProperties);
             request.setReplyTo("racer:stream:response:" + request.getCorrelationId());
             replyMono = sendStreamRequest(request, streamKey, timeout);
         } else {
-            String channel = resolveChannel(resolve(ann.channel()), resolve(ann.channelRef()));
+            String channel = RacerChannelResolver.resolveChannel(resolve(ann.channel()), resolve(ann.channelRef()), racerProperties);
             request.setReplyTo("racer:reply:" + request.getCorrelationId());
             replyMono = sendPubSubRequest(request, channel, timeout);
         }
@@ -267,23 +268,6 @@ public class RacerClientFactoryBean<T> implements FactoryBean<T>, EnvironmentAwa
         return payload;
     }
 
-    private String resolveChannel(String channel, String channelRef) {
-        if (!channel.isEmpty()) return channel;
-        if (!channelRef.isEmpty()) {
-            RacerProperties.ChannelProperties cp = racerProperties.getChannels().get(channelRef);
-            if (cp != null && cp.getName() != null && !cp.getName().isEmpty()) return cp.getName();
-        }
-        return racerProperties.getDefaultChannel();
-    }
-
-    private String resolveStreamKey(String stream, String streamRef) {
-        if (!stream.isEmpty()) return stream;
-        if (!streamRef.isEmpty()) {
-            RacerProperties.ChannelProperties cp = racerProperties.getChannels().get(streamRef);
-            if (cp != null && cp.getName() != null && !cp.getName().isEmpty()) return cp.getName();
-        }
-        return racerProperties.getDefaultChannel();
-    }
 
     private String resolve(String value) {
         if (value == null || value.isEmpty()) return value == null ? "" : value;

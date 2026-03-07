@@ -1,7 +1,9 @@
 package com.cheetah.racer.publisher;
 
 import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -31,8 +33,7 @@ public class RacerPublisherRegistry {
     private final RacerProperties properties;
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
-    @Nullable
-    private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
     @Nullable
     private final RacerSchemaRegistry schemaRegistry;
 
@@ -60,7 +61,7 @@ public class RacerPublisherRegistry {
         this.properties     = properties;
         this.redisTemplate  = redisTemplate;
         this.objectMapper   = objectMapper;
-        this.racerMetrics   = metricsOpt.orElse(null);
+        this.racerMetrics   = metricsOpt.<RacerMetricsPort>map(m -> m).orElseGet(NoOpRacerMetrics::new);
         this.schemaRegistry = schemaRegistryOpt.orElse(null);
     }
 

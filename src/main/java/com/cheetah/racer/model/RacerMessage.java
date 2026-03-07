@@ -37,15 +37,7 @@ public class RacerMessage implements Serializable {
      * Factory method to create a new message with auto-generated id and timestamp.
      */
     public static RacerMessage create(String channel, String payload, String sender) {
-        return RacerMessage.builder()
-                .id(UUID.randomUUID().toString())
-                .channel(channel)
-                .payload(payload)
-                .sender(sender)
-                .timestamp(Instant.now())
-                .retryCount(0)
-                .priority("NORMAL")
-                .build();
+        return create(channel, payload, sender, null);
     }
 
     /**

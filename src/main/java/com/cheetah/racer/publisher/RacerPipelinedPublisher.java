@@ -1,6 +1,8 @@
 package com.cheetah.racer.publisher;
 
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -39,8 +41,7 @@ public class RacerPipelinedPublisher {
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
     private final int maxBatchSize;
-    @Nullable
-    private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
     @Nullable
     private final RacerSchemaRegistry schemaRegistry;
 
@@ -59,7 +60,7 @@ public class RacerPipelinedPublisher {
         this.redisTemplate  = redisTemplate;
         this.objectMapper   = objectMapper;
         this.maxBatchSize   = maxBatchSize;
-        this.racerMetrics   = racerMetrics;
+        this.racerMetrics   = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
         this.schemaRegistry = schemaRegistry;
     }
 
@@ -103,21 +104,14 @@ public class RacerPipelinedPublisher {
 
         List<Mono<Long>> ops = items.stream()
                 .map(item -> {
-                    // R-7: validate payload before publishing
-                    if (schemaRegistry != null) {
-                        try {
-                            schemaRegistry.validateForPublish(item.channelName(), item.payload());
-                        } catch (com.cheetah.racer.schema.SchemaValidationException e) {
-                            return Mono.<Long>error(e);
-                        }
-                    }
-                    return serializeEnvelope(item.channelName(), item.payload(), item.sender())
+                    Mono<Void> validate = schemaRegistry != null
+                            ? schemaRegistry.validateForPublishReactive(item.channelName(), item.payload())
+                            : Mono.empty();
+                    return validate
+                            .then(MessageEnvelopeBuilder.build(objectMapper, item.channelName(), item.sender(), item.payload()))
                             .flatMap(json -> redisTemplate.convertAndSend(item.channelName(), json))
-                            .doOnSuccess(count -> {
-                                if (racerMetrics != null) {
-                                    racerMetrics.recordPublished(item.channelName(), "pubsub-pipeline");
-                                }
-                            });
+                            .doOnSuccess(count ->
+                                    racerMetrics.recordPublished(item.channelName(), "pubsub-pipeline"));
                 })
                 .toList();
 
@@ -139,37 +133,20 @@ public class RacerPipelinedPublisher {
     private Mono<List<Long>> publishChunk(String channelName, List<String> payloads, String sender) {
         List<Mono<Long>> ops = payloads.stream()
                 .map(payload -> {
-                    // R-7: per-payload schema validation
-                    if (schemaRegistry != null) {
-                        try {
-                            schemaRegistry.validateForPublish(channelName, payload);
-                        } catch (com.cheetah.racer.schema.SchemaValidationException e) {
-                            return Mono.<Long>error(e);
-                        }
-                    }
-                    return serializeEnvelope(channelName, payload, sender)
+                    Mono<Void> validate = schemaRegistry != null
+                            ? schemaRegistry.validateForPublishReactive(channelName, payload)
+                            : Mono.empty();
+                    return validate
+                            .then(MessageEnvelopeBuilder.build(objectMapper, channelName, sender, payload))
                             .flatMap(json -> redisTemplate.convertAndSend(channelName, json))
-                            .doOnSuccess(count -> {
-                                if (racerMetrics != null) {
-                                    racerMetrics.recordPublished(channelName, "pubsub-pipeline");
-                                }
-                            });
+                            .doOnSuccess(count ->
+                                    racerMetrics.recordPublished(channelName, "pubsub-pipeline"));
                 })
                 .toList();
 
         return Flux.fromIterable(ops)
                 .flatMap(op -> op, ops.size()) // concurrency = all at once
                 .collectList();
-    }
-
-    private Mono<String> serializeEnvelope(String channelName, String payload, String sender) {
-        return Mono.fromCallable(() -> {
-            java.util.LinkedHashMap<String, Object> envelope = new java.util.LinkedHashMap<>();
-            envelope.put("channel", channelName);
-            envelope.put("sender", sender);
-            envelope.put("payload", payload);
-            return objectMapper.writeValueAsString(envelope);
-        });
     }
 
     private static <T> List<List<T>> partition(List<T> list, int size) {

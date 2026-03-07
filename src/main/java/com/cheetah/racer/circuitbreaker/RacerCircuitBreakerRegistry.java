@@ -1,7 +1,9 @@
 package com.cheetah.racer.circuitbreaker;
 
 import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
 
@@ -22,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class RacerCircuitBreakerRegistry {
 
     private final RacerProperties racerProperties;
-    @Nullable private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
     private final ConcurrentHashMap<String, RacerCircuitBreaker> breakers = new ConcurrentHashMap<>();
 
     /** Backward-compatible constructor (no metrics). */
@@ -32,7 +34,7 @@ public class RacerCircuitBreakerRegistry {
 
     public RacerCircuitBreakerRegistry(RacerProperties racerProperties, @Nullable RacerMetrics racerMetrics) {
         this.racerProperties = racerProperties;
-        this.racerMetrics    = racerMetrics;
+        this.racerMetrics    = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     /**
@@ -57,10 +59,8 @@ public class RacerCircuitBreakerRegistry {
                     cfg.getFailureRateThreshold(),
                     cfg.getWaitDurationInOpenStateSeconds() * 1000L,
                     cfg.getPermittedCallsInHalfOpenState());
-            if (racerMetrics != null) {
-                // State ordinals: CLOSED=0, OPEN=1, HALF_OPEN=2
-                racerMetrics.registerCircuitBreakerStateGauge(id, () -> cb.getState().ordinal());
-            }
+            // State ordinals: CLOSED=0, OPEN=1, HALF_OPEN=2
+            racerMetrics.registerCircuitBreakerStateGauge(id, () -> cb.getState().ordinal());
             return cb;
         });
     }

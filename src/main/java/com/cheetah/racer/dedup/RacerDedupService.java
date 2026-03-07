@@ -1,7 +1,9 @@
 package com.cheetah.racer.dedup;
 
 import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.lang.Nullable;
@@ -34,7 +36,7 @@ public class RacerDedupService {
 
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final RacerProperties racerProperties;
-    @Nullable private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
 
     /** Backward-compatible constructor (no metrics). */
     public RacerDedupService(
@@ -49,7 +51,7 @@ public class RacerDedupService {
             @Nullable RacerMetrics racerMetrics) {
         this.redisTemplate   = redisTemplate;
         this.racerProperties = racerProperties;
-        this.racerMetrics    = racerMetrics;
+        this.racerMetrics    = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     /**
@@ -88,7 +90,7 @@ public class RacerDedupService {
                 .setIfAbsent(key, "1", ttl)
                 .defaultIfEmpty(false)
                 .doOnNext(isNew -> {
-                    if (!isNew && racerMetrics != null && listenerId != null) {
+                    if (!isNew && listenerId != null) {
                         racerMetrics.recordDedupDuplicate(listenerId);
                     }
                 })

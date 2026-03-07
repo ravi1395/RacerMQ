@@ -6,18 +6,18 @@ import com.cheetah.racer.circuitbreaker.RacerCircuitBreaker;
 import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
 import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.dedup.RacerDedupService;
+import com.cheetah.racer.listener.AbstractRacerRegistrar;
 import com.cheetah.racer.listener.RacerDeadLetterHandler;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
+import com.cheetah.racer.util.RacerChannelResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopProxyUtils;
 import org.springframework.beans.BeansException;
-import org.springframework.beans.factory.config.BeanPostProcessor;
-import org.springframework.context.EnvironmentAware;
-import org.springframework.context.SmartLifecycle;
-import org.springframework.core.env.Environment;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.lang.Nullable;
@@ -29,13 +29,9 @@ import reactor.util.retry.Retry;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -57,24 +53,16 @@ import java.util.concurrent.atomic.AtomicLong;
  * @see RacerStreamListener
  */
 @Slf4j
-public class RacerStreamListenerRegistrar implements BeanPostProcessor, EnvironmentAware, SmartLifecycle {
+public class RacerStreamListenerRegistrar extends AbstractRacerRegistrar {
 
     private static final String DEFAULT_DATA_FIELD = "data";
     private static final int    GROUP_CREATION_RETRIES = 5;
 
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
-    private final RacerProperties racerProperties;
 
-    @Nullable private final RacerMetrics          racerMetrics;
+    private final RacerMetricsPort            racerMetrics;
     @Nullable private final RacerSchemaRegistry   racerSchemaRegistry;
-    @Nullable private final RacerDeadLetterHandler deadLetterHandler;
-
-    private Environment environment;
-
-    private final List<Disposable>              subscriptions    = new ArrayList<>();
-    private final Map<String, AtomicLong>       processedCounts  = new ConcurrentHashMap<>();
-    private final Map<String, AtomicLong>       failedCounts     = new ConcurrentHashMap<>();
 
     // ── Phase 3 optional extensions ─────────────────────────────────────────
 
@@ -95,11 +83,6 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
 
     /** (streamKey, group) pairs that have been registered, used by {@link RacerConsumerLagMonitor}. */
     private final Map<String, String> trackedStreamGroups = new ConcurrentHashMap<>();
-
-    // ── SmartLifecycle state ─────────────────────────────────────────────────
-    private volatile boolean    running       = false;
-    private final AtomicBoolean stopping      = new AtomicBoolean(false);
-    private final AtomicInteger inFlightCount = new AtomicInteger(0);
 
     public void setDedupService(RacerDedupService dedupService) {
         this.dedupService = dedupService;
@@ -129,18 +112,15 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             @Nullable RacerMetrics racerMetrics,
             @Nullable RacerSchemaRegistry racerSchemaRegistry,
             @Nullable RacerDeadLetterHandler deadLetterHandler) {
+        super(racerProperties, deadLetterHandler);
         this.redisTemplate      = redisTemplate;
         this.objectMapper       = objectMapper;
-        this.racerProperties    = racerProperties;
-        this.racerMetrics       = racerMetrics;
+        this.racerMetrics       = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
         this.racerSchemaRegistry = racerSchemaRegistry;
-        this.deadLetterHandler  = deadLetterHandler;
     }
 
     @Override
-    public void setEnvironment(Environment environment) {
-        this.environment = environment;
-    }
+    protected String logPrefix() { return "RACER-STREAM-LISTENER"; }
 
     // ── BeanPostProcessor ────────────────────────────────────────────────────
 
@@ -156,83 +136,15 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
         return bean;
     }
 
-    @Override
-    public void start() {
-        running = true;
-    }
-
-    /**
-     * Graceful stop: signals shutdown, waits for in-flight stream records to drain
-     * (bounded by {@code racer.shutdown.timeout-seconds}), then disposes all polling loops.
-     * XACK has already been issued by the time a record completes, so no entries are orphaned.
-     */
-    @Override
-    public void stop(Runnable callback) {
-        log.info("[RACER-STREAM-LISTENER] Graceful shutdown — waiting up to {}s for in-flight entries to drain...",
-                racerProperties.getShutdown().getTimeoutSeconds());
-        stopping.set(true);
-        long timeoutMs = racerProperties.getShutdown().getTimeoutSeconds() * 1000L;
-        Mono.fromRunnable(() -> awaitDrain(timeoutMs))
-                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
-                .doFinally(signal -> {
-                    disposeAll();
-                    running = false;
-                    logStats();
-                    callback.run();
-                })
-                .subscribe();
-    }
-
-    @Override
-    public void stop() {
-        stopping.set(true);
-        awaitDrain(racerProperties.getShutdown().getTimeoutSeconds() * 1000L);
-        disposeAll();
-        running = false;
-        logStats();
-    }
-
-    @Override
-    public boolean isRunning() { return running; }
-
-    @Override
-    public boolean isAutoStartup() { return true; }
-
-    private void awaitDrain(long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (inFlightCount.get() > 0 && System.currentTimeMillis() < deadline) {
-            try { Thread.sleep(50); } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        int remaining = inFlightCount.get();
-        if (remaining > 0) {
-            log.warn("[RACER-STREAM-LISTENER] Shutdown timeout — {} entry(ies) still in-flight after {}ms",
-                    remaining, timeoutMs);
-        }
-    }
-
-    private void disposeAll() {
-        int disposed = 0;
-        for (Disposable sub : subscriptions) {
-            if (!sub.isDisposed()) { sub.dispose(); disposed++; }
-        }
-        log.info("[RACER-STREAM-LISTENER] Stopped {} polling loop(s).", disposed);
-    }
-
-    private void logStats() {
-        processedCounts.forEach((id, cnt) ->
-                log.info("[RACER-STREAM-LISTENER] Listener '{}': processed={} failed={}",
-                        id, cnt.get(), failedCounts.getOrDefault(id, new AtomicLong()).get()));
-    }
+    // ── SmartLifecycle (delegated to AbstractRacerRegistrar) ────────────────
 
     // ── Registration ─────────────────────────────────────────────────────────
 
     private void registerStreamListener(Object bean, Method method, RacerStreamListener ann, String beanName) {
         String rawStreamKey = resolve(ann.streamKey());
         String streamKeyRef = resolve(ann.streamKeyRef());
-        String streamKey    = resolveStreamKey(rawStreamKey, streamKeyRef);
+        String streamKey    = RacerChannelResolver.resolveStreamKey(
+                rawStreamKey, streamKeyRef, racerProperties, logPrefix());
 
         if (streamKey.isEmpty()) {
             log.warn("[RACER-STREAM-LISTENER] {}.{}() has @RacerStreamListener but no streamKey/streamKeyRef — skipped.",
@@ -240,16 +152,15 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             return;
         }
 
-        String rawId      = ann.id().isEmpty() ? "" : resolve(ann.id());
-        String listenerId = rawId.isEmpty() ? beanName + "." + method.getName() : rawId;
+        String listenerId = resolveListenerId(
+                ann.id().isEmpty() ? "" : resolve(ann.id()), beanName, method);
         String group      = ann.group();
         int    concurrencyN = ann.mode() == ConcurrencyMode.SEQUENTIAL ? 1 : Math.max(1, ann.concurrency());
         int    batchSize    = ann.batchSize();
         Duration pollInterval = Duration.ofMillis(ann.pollIntervalMs());
 
         method.setAccessible(true);
-        processedCounts.put(listenerId, new AtomicLong(0));
-        failedCounts.put(listenerId,    new AtomicLong(0));
+        registerListenerStats(listenerId);
 
         // Register for consumer-lag tracking (3.4)
         trackedStreamGroups.put(streamKey, group);
@@ -315,12 +226,12 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                     return Flux.empty();
                 })
                 .flatMap(record -> {
-                    if (stopping.get()) {
-                        return ackRecord(streamKey, group, record.getId());
+                    if (isStopping()) {
+                        return RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, record.getId());
                     }
-                    inFlightCount.incrementAndGet();
+                    incrementInFlight();
                     return processRecord(bean, method, streamKey, group, record, listenerId)
-                            .doFinally(s -> inFlightCount.decrementAndGet());
+                            .doFinally(s -> decrementInFlight());
                 });
     }
 
@@ -338,14 +249,14 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             log.debug("[RACER-STREAM-LISTENER] '{}' circuit {} — skipping record {}",
                     listenerId, cb.getState(), recordId);
             // ACK to avoid building up pending entries while the circuit is open
-            return ackRecord(streamKey, group, recordId);
+            return RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId);
         }
 
         // The data field carries the serialized RacerMessage envelope
         Object raw = fields.get(DEFAULT_DATA_FIELD);
         if (raw == null) {
             log.warn("[RACER-STREAM-LISTENER] Record {} on '{}' missing '{}' field — skipped", recordId, streamKey, DEFAULT_DATA_FIELD);
-            return ackRecord(streamKey, group, recordId);
+            return RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId);
         }
 
         String envelopeJson = raw.toString();
@@ -354,8 +265,8 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             message = objectMapper.readValue(envelopeJson, RacerMessage.class);
         } catch (Exception e) {
             log.error("[RACER-STREAM-LISTENER] '{}' — failed to deserialize entry {}: {}", listenerId, recordId, e.getMessage());
-            failedCounts.get(listenerId).incrementAndGet();
-            return ackRecord(streamKey, group, recordId);
+            incrementFailed(listenerId);
+            return RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId);
         }
 
         // 0b. Deduplication check
@@ -365,7 +276,7 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                         if (!shouldProcess) {
                             log.debug("[RACER-STREAM-LISTENER] '{}' duplicate id={} — skipping record {}",
                                     listenerId, message.getId(), recordId);
-                            return ackRecord(streamKey, group, recordId);
+                            return RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId);
                         }
                         return processChecked(bean, method, streamKey, group, record, listenerId, message, cb);
                     });
@@ -389,8 +300,8 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                 log.warn("[RACER-STREAM-LISTENER] '{}' schema validation failed for {}: {}", listenerId, recordId, e.getMessage());
                 if (cb != null) cb.onFailure();
                 return enqueueDeadLetter(message, e)
-                        .then(ackRecord(streamKey, group, recordId))
-                        .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet());
+                        .then(RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId))
+                        .doOnTerminate(() -> incrementFailed(listenerId));
             }
         }
 
@@ -402,8 +313,8 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
             log.error("[RACER-STREAM-LISTENER] '{}' — cannot resolve argument for {}: {}", listenerId, recordId, e.getMessage());
             if (cb != null) cb.onFailure();
             return enqueueDeadLetter(message, e)
-                    .then(ackRecord(streamKey, group, recordId))
-                    .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet());
+                    .then(RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId))
+                    .doOnTerminate(() -> incrementFailed(listenerId));
         }
 
         final Object resolvedArg  = arg;
@@ -421,54 +332,27 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
                 });
 
         return invocation
-                .then(ackRecord(streamKey, group, recordId))
+                .then(RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId))
                 .doOnSuccess(v -> {
-                    processedCounts.get(listenerId).incrementAndGet();
+                    incrementProcessed(listenerId);
                     if (cb != null) cb.onSuccess();
-                    if (racerMetrics != null) {
-                        racerMetrics.recordConsumed(streamKey, listenerId);
-                    }
+                    racerMetrics.recordConsumed(streamKey, listenerId);
                     log.debug("[RACER-STREAM-LISTENER] '{}' processed entry {}", listenerId, recordId);
                 })
                 .onErrorResume(ex -> {
-                    failedCounts.get(listenerId).incrementAndGet();
+                    incrementFailed(listenerId);
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
                     if (cb != null) cb.onFailure();
                     log.error("[RACER-STREAM-LISTENER] '{}' failed entry {}: {}", listenerId, recordId, cause.getMessage(), cause);
                     return enqueueDeadLetter(captured, cause)
-                            .then(ackRecord(streamKey, group, recordId));
+                            .then(RacerStreamUtils.ackRecord(redisTemplate, streamKey, group, recordId));
                 });
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private Mono<Void> ensureGroup(String streamKey, String group) {
-        return redisTemplate.opsForStream()
-                .createGroup(streamKey, ReadOffset.from("0"), group)
-                .onErrorResume(ex -> {
-                    if (ex.getMessage() != null && ex.getMessage().contains("BUSYGROUP")) {
-                        log.debug("[RACER-STREAM-LISTENER] Group '{}' already exists on '{}'", group, streamKey);
-                        return Mono.empty();
-                    }
-                    return Mono.error(ex);
-                })
-                .then();
-    }
-
-    private Mono<Void> ackRecord(String streamKey, String group, RecordId recordId) {
-        return redisTemplate.opsForStream()
-                .acknowledge(streamKey, group, recordId)
-                .then();
-    }
-
-    private String resolveStreamKey(String streamKey, String streamKeyRef) {
-        if (!streamKey.isEmpty()) return streamKey;
-        if (!streamKeyRef.isEmpty()) {
-            RacerProperties.ChannelProperties cp = racerProperties.getChannels().get(streamKeyRef);
-            if (cp != null && cp.getName() != null && !cp.getName().isEmpty()) return cp.getName();
-            log.warn("[RACER-STREAM-LISTENER] streamKeyRef '{}' not found in racer.channels — falling back to default channel.", streamKeyRef);
-        }
-        return racerProperties.getDefaultChannel();
+        return RacerStreamUtils.ensureGroup(redisTemplate, streamKey, group);
     }
 
     private Object resolveArgument(Method method, RacerMessage message) throws Exception {
@@ -479,18 +363,6 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
         return objectMapper.readValue(message.getPayload(), paramType);
     }
 
-    private Mono<?> enqueueDeadLetter(RacerMessage message, Throwable error) {
-        if (deadLetterHandler != null) {
-            return deadLetterHandler.enqueue(message, error)
-                    .onErrorResume(dlqEx -> {
-                        log.error("[RACER-STREAM-LISTENER] DLQ enqueue failed for id={}: {}", message.getId(), dlqEx.getMessage());
-                        return Mono.empty();
-                    });
-        }
-        log.warn("[RACER-STREAM-LISTENER] No DLQ handler — dropping failed message id={}", message.getId());
-        return Mono.empty();
-    }
-
     private String resolve(String value) {
         if (value == null || value.isEmpty()) return value == null ? "" : value;
         try { return environment.resolvePlaceholders(value); } catch (Exception e) { return value; }
@@ -499,12 +371,10 @@ public class RacerStreamListenerRegistrar implements BeanPostProcessor, Environm
     // ── Stats ─────────────────────────────────────────────────────────────────
 
     public long getProcessedCount(String listenerId) {
-        AtomicLong c = processedCounts.get(listenerId);
-        return c == null ? 0L : c.get();
+        return super.getProcessedCount(listenerId);
     }
 
     public long getFailedCount(String listenerId) {
-        AtomicLong c = failedCounts.get(listenerId);
-        return c == null ? 0L : c.get();
+        return super.getFailedCount(listenerId);
     }
 }

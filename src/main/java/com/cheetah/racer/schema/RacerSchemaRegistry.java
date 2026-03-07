@@ -147,6 +147,20 @@ public class RacerSchemaRegistry {
     }
 
     /**
+     * Reactive variant of {@link #validateForPublish(String, Object)} — wraps the
+     * synchronous validation in a {@code Mono} that emits an error on violation.
+     * Suitable for composition inside reactive publish pipelines.
+     *
+     * @param channelName the Redis channel or alias
+     * @param payload     the payload to validate
+     * @return a {@code Mono<Void>} that completes empty on success or errors with
+     *         {@link SchemaValidationException}
+     */
+    public reactor.core.publisher.Mono<Void> validateForPublishReactive(String channelName, Object payload) {
+        return reactor.core.publisher.Mono.fromRunnable(() -> validateForPublish(channelName, payload));
+    }
+
+    /**
      * Validates {@code payload} against the schema registered for {@code channelName} on
      * the <b>consume</b> path.
      *

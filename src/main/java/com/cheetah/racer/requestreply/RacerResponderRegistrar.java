@@ -3,9 +3,13 @@ package com.cheetah.racer.requestreply;
 import com.cheetah.racer.annotation.ConcurrencyMode;
 import com.cheetah.racer.annotation.RacerResponder;
 import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.model.RacerReply;
 import com.cheetah.racer.model.RacerRequest;
+import com.cheetah.racer.stream.RacerStreamUtils;
+import com.cheetah.racer.util.RacerChannelResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -67,7 +71,7 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
     private final RacerProperties racerProperties;
-    @Nullable private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
 
     private Environment environment;
 
@@ -85,7 +89,7 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
         this.redisTemplate     = redisTemplate;
         this.objectMapper      = objectMapper;
         this.racerProperties   = racerProperties;
-        this.racerMetrics      = racerMetrics;
+        this.racerMetrics      = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     @Override
@@ -148,7 +152,7 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
             return;
         }
 
-        String channel = resolveChannel(resolve(ann.channel()), resolve(ann.channelRef()));
+        String channel = RacerChannelResolver.resolveChannel(resolve(ann.channel()), resolve(ann.channelRef()), racerProperties);
         int effectiveConcurrency = ann.mode() == ConcurrencyMode.SEQUENTIAL ? 1 : Math.max(1, ann.concurrency());
 
         log.info("[RACER-RESPONDER] Registering Pub/Sub responder '{}' <- channel '{}'", responderId, channel);
@@ -198,13 +202,13 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
     // ── Stream responder ──────────────────────────────────────────────────────
 
     private void registerStreamResponder(Object bean, Method method, RacerResponder ann, String responderId) {
-        String streamKey = resolveStreamKey(resolve(ann.stream()), resolve(ann.streamRef()));
+        String streamKey = RacerChannelResolver.resolveStreamKey(resolve(ann.stream()), resolve(ann.streamRef()), racerProperties);
         String group     = ann.group();
         int concurrencyN = ann.mode() == ConcurrencyMode.SEQUENTIAL ? 1 : Math.max(1, ann.concurrency());
 
         log.info("[RACER-RESPONDER] Registering Stream responder '{}' <- stream '{}' group='{}'", responderId, streamKey, group);
 
-        ensureGroup(streamKey, group)
+        RacerStreamUtils.ensureGroup(redisTemplate, streamKey, group)
                 .retryWhen(Retry.backoff(GROUP_CREATION_RETRIES, Duration.ofSeconds(2))
                         .doBeforeRetry(rs -> log.warn("[RACER-RESPONDER] Retrying group creation on '{}' (attempt {})", streamKey, rs.totalRetries() + 1)))
                 .doOnSuccess(v -> {
@@ -257,7 +261,7 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
 
         if (correlationIdObj == null || replyToObj == null) {
             log.warn("[RACER-RESPONDER] Stream record {} missing correlationId/replyTo — skipping", recordId);
-            return ackRecord(record.getStream(), CONSUMER_GROUP, recordId);
+            return RacerStreamUtils.ackRecord(redisTemplate, record.getStream(), CONSUMER_GROUP, recordId);
         }
 
         RacerRequest request = new RacerRequest();
@@ -267,7 +271,7 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
 
         return invokeAndReply(bean, method, request, responderId)
                 .flatMap(reply -> writeStreamReply(request.getReplyTo(), reply))
-                .then(ackRecord(record.getStream(), CONSUMER_GROUP, recordId))
+                .then(RacerStreamUtils.ackRecord(redisTemplate, record.getStream(), CONSUMER_GROUP, recordId))
                 .doOnError(ex -> log.error("[RACER-RESPONDER] Stream record {} processing failed: {}", recordId, ex.getMessage()));
     }
 
@@ -335,38 +339,6 @@ public class RacerResponderRegistrar implements BeanPostProcessor, EnvironmentAw
         if (String.class.equals(paramType)) return request.getPayload();
         if (request.getPayload() == null || request.getPayload().isBlank()) return null;
         return objectMapper.readValue(request.getPayload(), paramType);
-    }
-
-    private Mono<Void> ensureGroup(String streamKey, String group) {
-        return redisTemplate.opsForStream()
-                .createGroup(streamKey, ReadOffset.from("0"), group)
-                .onErrorResume(ex -> {
-                    if (ex.getMessage() != null && ex.getMessage().contains("BUSYGROUP")) return Mono.empty();
-                    return Mono.error(ex);
-                })
-                .then();
-    }
-
-    private Mono<Void> ackRecord(String streamKey, String group, RecordId recordId) {
-        return redisTemplate.opsForStream().acknowledge(streamKey, group, recordId).then();
-    }
-
-    private String resolveChannel(String channel, String channelRef) {
-        if (!channel.isEmpty()) return channel;
-        if (!channelRef.isEmpty()) {
-            RacerProperties.ChannelProperties cp = racerProperties.getChannels().get(channelRef);
-            if (cp != null && cp.getName() != null && !cp.getName().isEmpty()) return cp.getName();
-        }
-        return racerProperties.getDefaultChannel();
-    }
-
-    private String resolveStreamKey(String stream, String streamRef) {
-        if (!stream.isEmpty()) return stream;
-        if (!streamRef.isEmpty()) {
-            RacerProperties.ChannelProperties cp = racerProperties.getChannels().get(streamRef);
-            if (cp != null && cp.getName() != null && !cp.getName().isEmpty()) return cp.getName();
-        }
-        return racerProperties.getDefaultChannel();
     }
 
     private String resolve(String value) {

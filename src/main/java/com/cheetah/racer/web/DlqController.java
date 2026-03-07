@@ -3,7 +3,6 @@ package com.cheetah.racer.web;
 import com.cheetah.racer.model.DeadLetterMessage;
 import com.cheetah.racer.service.DeadLetterQueueService;
 import com.cheetah.racer.service.DlqReprocessorService;
-import com.cheetah.racer.service.RacerRetentionService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -25,7 +24,6 @@ public class DlqController {
 
     private final DeadLetterQueueService dlqService;
     private final DlqReprocessorService reprocessorService;
-    private final RacerRetentionService retentionService;
 
     /**
      * GET /api/dlq/messages
@@ -95,18 +93,4 @@ public class DlqController {
                 )));
     }
 
-    /**
-     * POST /api/dlq/trim
-     * Immediately runs a retention trim: truncates all configured durable streams
-     * and removes DLQ entries older than the configured max-age.
-     */
-    @PostMapping("/trim")
-    public Mono<ResponseEntity<Map<String, Object>>> trim() {
-        retentionService.trimStreams();
-        return retentionService.pruneDlq()
-                .map(pruned -> ResponseEntity.ok(Map.of(
-                        "status",    "trimmed",
-                        "dlqPruned", (Object) pruned
-                )));
-    }
 }

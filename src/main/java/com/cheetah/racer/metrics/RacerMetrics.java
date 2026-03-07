@@ -25,7 +25,7 @@ import java.util.function.Supplier;
  * </table>
  */
 @Slf4j
-public class RacerMetrics {
+public class RacerMetrics implements RacerMetricsPort {
 
     private final MeterRegistry registry;
 

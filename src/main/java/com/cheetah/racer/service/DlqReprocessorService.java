@@ -1,7 +1,9 @@
 package com.cheetah.racer.service;
 
 import com.cheetah.racer.RedisChannels;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.model.DeadLetterMessage;
 import com.cheetah.racer.model.RacerMessage;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -31,9 +33,7 @@ public class DlqReprocessorService {
     private final DeadLetterQueueService dlqService;
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
-
-    @Nullable
-    private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
 
     private final AtomicLong republishedCount       = new AtomicLong(0);
     private final AtomicLong permanentlyFailedCount = new AtomicLong(0);
@@ -46,7 +46,7 @@ public class DlqReprocessorService {
         this.dlqService     = dlqService;
         this.redisTemplate  = redisTemplate;
         this.objectMapper   = objectMapper;
-        this.racerMetrics   = racerMetrics;
+        this.racerMetrics   = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     /**
@@ -107,7 +107,7 @@ public class DlqReprocessorService {
                         republishedCount.incrementAndGet();
                         log.info("[DLQ-REPROCESSOR] Republished id={} -> channel='{}' (subscribers={})",
                                 message.getId(), message.getChannel(), count);
-                        if (racerMetrics != null) racerMetrics.recordDlqReprocessed();
+                        racerMetrics.recordDlqReprocessed();
                     });
         } catch (JsonProcessingException e) {
             log.error("[DLQ-REPROCESSOR] Failed to serialize message id={}: {}", message.getId(), e.getMessage());

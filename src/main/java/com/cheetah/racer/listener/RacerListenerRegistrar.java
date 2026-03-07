@@ -6,19 +6,18 @@ import com.cheetah.racer.circuitbreaker.RacerCircuitBreaker;
 import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
 import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.dedup.RacerDedupService;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.router.RacerRouterService;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.cheetah.racer.schema.SchemaValidationException;
+import com.cheetah.racer.util.RacerChannelResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopProxyUtils;
 import org.springframework.beans.BeansException;
-import org.springframework.beans.factory.config.BeanPostProcessor;
-import org.springframework.context.EnvironmentAware;
-import org.springframework.context.SmartLifecycle;
-import org.springframework.core.env.Environment;
 import org.springframework.data.redis.connection.ReactiveSubscription;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.data.redis.listener.ReactiveRedisMessageListenerContainer;
@@ -29,13 +28,8 @@ import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * {@link BeanPostProcessor} that discovers methods annotated with {@link RacerListener}
@@ -76,33 +70,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * @see RacerDeadLetterHandler
  */
 @Slf4j
-public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAware, SmartLifecycle {
+public class RacerListenerRegistrar extends AbstractRacerRegistrar {
 
     private final ReactiveRedisMessageListenerContainer listenerContainer;
     private final ObjectMapper objectMapper;
-    private final RacerProperties racerProperties;
     private final Scheduler listenerScheduler;
 
-    @Nullable
-    private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
 
     @Nullable
     private final RacerSchemaRegistry racerSchemaRegistry;
 
     @Nullable
     private final RacerRouterService racerRouterService;
-
-    @Nullable
-    private final RacerDeadLetterHandler deadLetterHandler;
-
-    private Environment environment;
-
-    /** All active subscriptions keyed by listenerId for lifecycle management. */
-    private final List<Disposable> subscriptions = new ArrayList<>();
-
-    /** Per-listener message counters. Key = listenerId. */
-    private final Map<String, AtomicLong> processedCounts = new ConcurrentHashMap<>();
-    private final Map<String, AtomicLong> failedCounts    = new ConcurrentHashMap<>();
 
     /** Adaptive tuners for AUTO-mode listeners — shut down on application stop. */
     private final Map<String, AdaptiveConcurrencyTuner> tuners = new ConcurrentHashMap<>();
@@ -118,12 +98,7 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
     private RacerCircuitBreakerRegistry circuitBreakerRegistry;
 
     /** Set by {@link com.cheetah.racer.backpressure.RacerBackPressureMonitor}. */
-    private final AtomicBoolean backPressureActive = new AtomicBoolean(false);
-
-    // ── SmartLifecycle state ─────────────────────────────────────────────────
-    private volatile boolean   running      = false;
-    private final AtomicBoolean stopping    = new AtomicBoolean(false);
-    private final AtomicInteger inFlightCount = new AtomicInteger(0);
+    private final java.util.concurrent.atomic.AtomicBoolean backPressureActive = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     public void setDedupService(RacerDedupService dedupService) {
         this.dedupService = dedupService;
@@ -168,19 +143,21 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
             @Nullable RacerSchemaRegistry racerSchemaRegistry,
             @Nullable RacerRouterService racerRouterService,
             @Nullable RacerDeadLetterHandler deadLetterHandler) {
+        super(racerProperties, deadLetterHandler);
         this.listenerContainer   = listenerContainer;
         this.objectMapper        = objectMapper;
-        this.racerProperties     = racerProperties;
         this.listenerScheduler   = listenerScheduler;
-        this.racerMetrics        = racerMetrics;
+        this.racerMetrics        = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
         this.racerSchemaRegistry = racerSchemaRegistry;
         this.racerRouterService  = racerRouterService;
-        this.deadLetterHandler   = deadLetterHandler;
     }
 
     @Override
-    public void setEnvironment(Environment environment) {
-        this.environment = environment;
+    protected String logPrefix() { return "RACER-LISTENER"; }
+
+    @Override
+    protected void additionalDisposeCleanup() {
+        tuners.values().forEach(AdaptiveConcurrencyTuner::shutdown);
     }
 
     // ── BeanPostProcessor ────────────────────────────────────────────────────
@@ -197,79 +174,7 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
         return bean;
     }
 
-    // ── SmartLifecycle ────────────────────────────────────────────────────────
-
-    @Override
-    public void start() {
-        running = true;
-    }
-
-    /**
-     * Graceful stop: signals shutdown, waits for in-flight messages to drain, then
-     * disposes all subscriptions and invokes the Spring-provided {@code callback}.
-     * The wait is bounded by {@code racer.shutdown.timeout-seconds} (default 30 s).
-     */
-    @Override
-    public void stop(Runnable callback) {
-        log.info("[RACER-LISTENER] Graceful shutdown — waiting up to {}s for in-flight messages to drain...",
-                racerProperties.getShutdown().getTimeoutSeconds());
-        stopping.set(true);
-        long timeoutMs = racerProperties.getShutdown().getTimeoutSeconds() * 1000L;
-        Mono.fromRunnable(() -> awaitDrain(timeoutMs))
-                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
-                .doFinally(signal -> {
-                    disposeAll();
-                    running = false;
-                    logStats();
-                    callback.run();
-                })
-                .subscribe();
-    }
-
-    @Override
-    public void stop() {
-        stopping.set(true);
-        awaitDrain(racerProperties.getShutdown().getTimeoutSeconds() * 1000L);
-        disposeAll();
-        running = false;
-        logStats();
-    }
-
-    @Override
-    public boolean isRunning() { return running; }
-
-    @Override
-    public boolean isAutoStartup() { return true; }
-
-    private void awaitDrain(long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (inFlightCount.get() > 0 && System.currentTimeMillis() < deadline) {
-            try { Thread.sleep(50); } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        int remaining = inFlightCount.get();
-        if (remaining > 0) {
-            log.warn("[RACER-LISTENER] Shutdown timeout — {} message(s) still in-flight after {}ms",
-                    remaining, timeoutMs);
-        }
-    }
-
-    private void disposeAll() {
-        int disposed = 0;
-        for (Disposable sub : subscriptions) {
-            if (!sub.isDisposed()) { sub.dispose(); disposed++; }
-        }
-        tuners.values().forEach(AdaptiveConcurrencyTuner::shutdown);
-        log.info("[RACER-LISTENER] Stopped {} subscription(s).", disposed);
-    }
-
-    private void logStats() {
-        processedCounts.forEach((id, cnt) ->
-                log.info("[RACER-LISTENER] Listener '{}': processed={} failed={}",
-                        id, cnt.get(), failedCounts.getOrDefault(id, new AtomicLong()).get()));
-    }
+    // ── SmartLifecycle (delegated to AbstractRacerRegistrar) ─────────────────
 
     // ── Registration ─────────────────────────────────────────────────────────
 
@@ -277,7 +182,8 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
         // --- resolve channel name ---
         String channel    = resolve(ann.channel());
         String channelRef = resolve(ann.channelRef());
-        String resolvedChannel = resolveChannel(channel, channelRef);
+        String resolvedChannel = RacerChannelResolver.resolveChannel(
+                channel, channelRef, racerProperties, logPrefix());
 
         if (resolvedChannel.isEmpty()) {
             log.warn("[RACER-LISTENER] {}.{}() has @RacerListener but no channel/channelRef — skipped.",
@@ -286,16 +192,13 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
         }
 
         // --- resolve listener id for logging/metrics ---
-        String rawId    = ann.id().isEmpty() ? "" : resolve(ann.id());
-        String listenerId = rawId.isEmpty()
-                ? beanName + "." + method.getName()
-                : rawId;
+        String listenerId = resolveListenerId(
+                ann.id().isEmpty() ? "" : resolve(ann.id()), beanName, method);
 
         // --- concurrency + subscription ---
         method.setAccessible(true);
 
-        processedCounts.put(listenerId, new AtomicLong(0));
-        failedCounts.put(listenerId,    new AtomicLong(0));
+        registerListenerStats(listenerId);
 
         final boolean dedupEnabled = ann.dedup();
 
@@ -365,7 +268,7 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                                 ReactiveSubscription.Message<String, String> redisMsg,
                                 String listenerId, String channel, boolean dedupEnabled) {
         // Shutdown gate — reject new messages once graceful stop has been initiated
-        if (stopping.get()) {
+        if (isStopping()) {
             return Mono.empty();
         }
         return Mono.<Void>defer(() -> {
@@ -411,8 +314,8 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
 
             return dispatchChecked(bean, method, message, listenerId, channel, cb);
         })
-        .doOnSubscribe(s -> inFlightCount.incrementAndGet())
-        .doFinally(s -> inFlightCount.decrementAndGet());
+        .doOnSubscribe(s -> incrementInFlight())
+        .doFinally(s -> decrementInFlight());
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -436,7 +339,7 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                         listenerId, message.getId(), e.getMessage());
                 if (cb != null) cb.onFailure();
                 return enqueueDeadLetter(message, e)
-                        .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
+                        .doOnTerminate(() -> incrementFailed(listenerId))
                         .then();
             }
         }
@@ -450,7 +353,7 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
                     listenerId, message.getId(), e.getMessage());
             if (cb != null) cb.onFailure();
             return enqueueDeadLetter(message, e)
-                    .doOnTerminate(() -> failedCounts.get(listenerId).incrementAndGet())
+                    .doOnTerminate(() -> incrementFailed(listenerId))
                     .then();
         }
 
@@ -473,49 +376,25 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
 
         return invocation
                 .doOnSuccess(v -> {
-                    processedCounts.get(listenerId).incrementAndGet();
+                    incrementProcessed(listenerId);
                     if (cb != null) cb.onSuccess();
-                    if (racerMetrics != null) {
-                        racerMetrics.recordConsumed(channel,
-                                listenerId.contains(".") ? listenerId.split("\\.")[1] : listenerId);
-                    }
+                    racerMetrics.recordConsumed(channel,
+                            listenerId.contains(".") ? listenerId.split("\\.")[1] : listenerId);
                     log.debug("[RACER-LISTENER] '{}' processed id={}",
                             listenerId, captured.getId());
                 })
                 .onErrorResume((Throwable ex) -> {
-                    failedCounts.get(listenerId).incrementAndGet();
+                    incrementFailed(listenerId);
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
                     if (cb != null) cb.onFailure();
                     log.error("[RACER-LISTENER] '{}' failed processing id={}: {}",
                             listenerId, captured.getId(), cause.getMessage(), cause);
-                    if (racerMetrics != null) {
-                        racerMetrics.recordFailed(channel, cause.getClass().getSimpleName());
-                    }
+                    racerMetrics.recordFailed(channel, cause.getClass().getSimpleName());
                     return enqueueDeadLetter(captured, cause).then();
                 });
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-
-    /**
-     * Resolves the target channel name.
-     * Priority: explicit channel name > channelRef lookup in {@link RacerProperties} > default channel.
-     */
-    private String resolveChannel(String channel, String channelRef) {
-        if (!channel.isEmpty()) {
-            return channel;
-        }
-        if (!channelRef.isEmpty()) {
-            RacerProperties.ChannelProperties cp =
-                    racerProperties.getChannels().get(channelRef);
-            if (cp != null && cp.getName() != null && !cp.getName().isEmpty()) {
-                return cp.getName();
-            }
-            log.warn("[RACER-LISTENER] channelRef '{}' not found in racer.channels — " +
-                     "falling back to default channel.", channelRef);
-        }
-        return racerProperties.getDefaultChannel();
-    }
 
     /**
      * Resolves the value of a method argument from the incoming {@link RacerMessage}
@@ -538,23 +417,6 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
     }
 
     /**
-     * Conditionally enqueues a failed message to the DLQ.
-     * If no {@link RacerDeadLetterHandler} is configured, returns an empty {@code Mono}.
-     */
-    private Mono<?> enqueueDeadLetter(RacerMessage message, Throwable error) {
-        if (deadLetterHandler != null) {
-            return deadLetterHandler.enqueue(message, error)
-                    .onErrorResume(dlqEx -> {
-                        log.error("[RACER-LISTENER] DLQ enqueue failed for id={}: {}",
-                                message.getId(), dlqEx.getMessage());
-                        return Mono.empty();
-                    });
-        }
-        log.warn("[RACER-LISTENER] No DLQ handler — dropping failed message id={}", message.getId());
-        return Mono.empty();
-    }
-
-    /**
      * Resolves Spring {@code ${...}} placeholders in annotation attribute values.
      */
     private String resolve(String value) {
@@ -564,19 +426,5 @@ public class RacerListenerRegistrar implements BeanPostProcessor, EnvironmentAwa
         } catch (Exception e) {
             return value;
         }
-    }
-
-    // ── Stats (visible for testing / actuator) ───────────────────────────────
-
-    /** Returns the total processed-message count for the given listener id. */
-    public long getProcessedCount(String listenerId) {
-        AtomicLong c = processedCounts.get(listenerId);
-        return c == null ? 0L : c.get();
-    }
-
-    /** Returns the total failed-message count for the given listener id. */
-    public long getFailedCount(String listenerId) {
-        AtomicLong c = failedCounts.get(listenerId);
-        return c == null ? 0L : c.get();
     }
 }

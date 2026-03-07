@@ -1,6 +1,7 @@
 package com.cheetah.racer.publisher;
 
-import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -9,8 +10,6 @@ import org.springframework.lang.Nullable;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 /**
  * Default implementation of {@link RacerChannelPublisher}.
@@ -35,8 +34,7 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
     private final String channelName;
     private final String channelAlias;
     private final String defaultSender;
-    @Nullable
-    private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
     @Nullable
     private final RacerSchemaRegistry schemaRegistry;
 
@@ -53,23 +51,14 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
                                      String channelName,
                                      String channelAlias,
                                      String defaultSender,
-                                     @Nullable RacerMetrics racerMetrics) {
-        this(redisTemplate, objectMapper, channelName, channelAlias, defaultSender, racerMetrics, null);
-    }
-
-    public RacerChannelPublisherImpl(ReactiveRedisTemplate<String, String> redisTemplate,
-                                     ObjectMapper objectMapper,
-                                     String channelName,
-                                     String channelAlias,
-                                     String defaultSender,
-                                     @Nullable RacerMetrics racerMetrics,
+                                     @Nullable RacerMetricsPort racerMetrics,
                                      @Nullable RacerSchemaRegistry schemaRegistry) {
         this.redisTemplate  = redisTemplate;
         this.objectMapper   = objectMapper;
         this.channelName    = channelName;
         this.channelAlias   = channelAlias;
         this.defaultSender  = defaultSender;
-        this.racerMetrics   = racerMetrics;
+        this.racerMetrics   = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
         this.schemaRegistry = schemaRegistry;
     }
 
@@ -80,21 +69,15 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
 
     @Override
     public Mono<Long> publishAsync(Object payload, String sender) {
-        // R-7: validate payload against registered schema before publishing
-        if (schemaRegistry != null) {
-            try {
-                schemaRegistry.validateForPublish(channelName, payload);
-            } catch (com.cheetah.racer.schema.SchemaValidationException e) {
-                return Mono.error(e);
-            }
-        }
-        return serialize(payload, sender)
+        Mono<Void> validate = schemaRegistry != null
+                ? schemaRegistry.validateForPublishReactive(channelName, payload)
+                : Mono.empty();
+        return validate
+                .then(MessageEnvelopeBuilder.build(objectMapper, channelName, sender, payload))
                 .flatMap(json -> redisTemplate.convertAndSend(channelName, json))
                 .doOnSuccess(count -> {
                     log.debug("[racer] Published to '{}' → {} subscriber(s)", channelName, count);
-                    if (racerMetrics != null) {
-                        racerMetrics.recordPublished(channelName, "pubsub");
-                    }
+                    racerMetrics.recordPublished(channelName, "pubsub");
                 })
                 .doOnError(ex ->
                         log.error("[racer] Failed to publish to '{}': {}", channelName, ex.getMessage()));
@@ -119,14 +102,4 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
-
-    private Mono<String> serialize(Object payload, String sender) {
-        return Mono.fromCallable(() -> {
-            Map<String, Object> envelope = new LinkedHashMap<>();
-            envelope.put("channel", channelName);
-            envelope.put("sender", sender);
-            envelope.put("payload", payload);
-            return objectMapper.writeValueAsString(envelope);
-        });
-    }
 }

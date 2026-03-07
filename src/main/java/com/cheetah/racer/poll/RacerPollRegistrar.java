@@ -1,7 +1,9 @@
 package com.cheetah.racer.poll;
 
 import com.cheetah.racer.annotation.RacerPoll;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -46,8 +48,7 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
 
     private final RacerPublisherRegistry publisherRegistry;
     private final ObjectMapper objectMapper;
-    @Nullable
-    private final RacerMetrics racerMetrics;
+    private final RacerMetricsPort racerMetrics;
 
     private Environment environment;
 
@@ -60,7 +61,7 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
                               @Nullable RacerMetrics racerMetrics) {
         this.publisherRegistry = publisherRegistry;
         this.objectMapper      = objectMapper;
-        this.racerMetrics      = racerMetrics;
+        this.racerMetrics      = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     @Override
@@ -161,9 +162,7 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
     private Mono<Void> publish(Object payload, RacerChannelPublisher publisher,
                                 String channelName, String sender, boolean async) {
         totalPolls.incrementAndGet();
-        if (racerMetrics != null) {
-            racerMetrics.recordPublished(channelName, async ? "async" : "sync");
-        }
+        racerMetrics.recordPublished(channelName, async ? "async" : "sync");
         String payloadStr;
         try {
             payloadStr = payload instanceof String s ? s

@@ -7,9 +7,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import reactor.core.publisher.Mono;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
-
 /**
  * Routes messages to priority sub-channels (R-10 — Message Priority).
  *
@@ -77,19 +74,15 @@ public class RacerPriorityPublisher {
      */
     public Mono<Long> publish(String baseChannelName, Object payload,
                                String sender, String priorityLevel) {
-        // R-7: validate against the base channel's schema before routing
-        if (schemaRegistry != null) {
-            try {
-                schemaRegistry.validateForPublish(baseChannelName, payload);
-            } catch (com.cheetah.racer.schema.SchemaValidationException e) {
-                return Mono.error(e);
-            }
-        }
+        Mono<Void> validate = schemaRegistry != null
+                ? schemaRegistry.validateForPublishReactive(baseChannelName, payload)
+                : Mono.empty();
         String level   = (priorityLevel != null && !priorityLevel.isBlank())
                 ? priorityLevel.trim().toUpperCase()
                 : PriorityLevel.NORMAL.name();
         String channel = priorityChannelName(baseChannelName, level);
-        return serializeEnvelope(baseChannelName, payload, sender, level)
+        return validate
+                .then(MessageEnvelopeBuilder.buildWithPriority(objectMapper, baseChannelName, sender, level, payload))
                 .flatMap(json -> redisTemplate.convertAndSend(channel, json))
                 .doOnSuccess(count ->
                         log.debug("[racer-priority] Published to '{}' → {} subscriber(s)", channel, count))
@@ -111,16 +104,4 @@ public class RacerPriorityPublisher {
     // -------------------------------------------------------------------------
     // Internal
     // -------------------------------------------------------------------------
-
-    private Mono<String> serializeEnvelope(String baseChannel, Object payload,
-                                            String sender, String level) {
-        return Mono.fromCallable(() -> {
-            Map<String, Object> envelope = new LinkedHashMap<>();
-            envelope.put("channel",  baseChannel);
-            envelope.put("sender",   sender);
-            envelope.put("priority", level);
-            envelope.put("payload",  payload);
-            return objectMapper.writeValueAsString(envelope);
-        });
-    }
 }
