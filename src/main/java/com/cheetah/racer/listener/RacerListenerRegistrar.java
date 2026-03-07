@@ -17,22 +17,30 @@ import com.cheetah.racer.router.RacerRouterService;
 import com.cheetah.racer.router.RouteDecision;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.cheetah.racer.schema.SchemaValidationException;
+import com.cheetah.racer.stream.RacerStreamUtils;
 import com.cheetah.racer.util.RacerChannelResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopProxyUtils;
 import org.springframework.beans.BeansException;
 import org.springframework.data.redis.connection.ReactiveSubscription;
+import org.springframework.data.redis.connection.stream.Consumer;
+import org.springframework.data.redis.connection.stream.ReadOffset;
+import org.springframework.data.redis.connection.stream.StreamOffset;
+import org.springframework.data.redis.connection.stream.StreamReadOptions;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.data.redis.listener.ReactiveRedisMessageListenerContainer;
 import org.springframework.lang.Nullable;
 import reactor.core.Disposable;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -82,6 +90,13 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
     private final ReactiveRedisMessageListenerContainer listenerContainer;
     private final ObjectMapper objectMapper;
     private final Scheduler listenerScheduler;
+
+    /**
+     * Used when {@code racer.channels.<alias>.durable=true} to set up XREADGROUP consumers.
+     * {@code null} when constructed via the legacy test constructor.
+     */
+    @Nullable
+    private final ReactiveRedisTemplate<String, String> redisTemplate;
 
     private final RacerMetricsPort racerMetrics;
 
@@ -152,7 +167,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
             @Nullable RacerRouterService racerRouterService,
             @Nullable RacerDeadLetterHandler deadLetterHandler) {
         this(listenerContainer, objectMapper, racerProperties, Schedulers.boundedElastic(),
-                racerMetrics, racerSchemaRegistry, racerRouterService, deadLetterHandler);
+                null, racerMetrics, racerSchemaRegistry, racerRouterService, deadLetterHandler);
     }
 
     /** Production constructor — uses the dedicated Racer listener thread pool. */
@@ -161,6 +176,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
             ObjectMapper objectMapper,
             RacerProperties racerProperties,
             Scheduler listenerScheduler,
+            @Nullable ReactiveRedisTemplate<String, String> redisTemplate,
             @Nullable RacerMetrics racerMetrics,
             @Nullable RacerSchemaRegistry racerSchemaRegistry,
             @Nullable RacerRouterService racerRouterService,
@@ -169,6 +185,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
         this.listenerContainer   = listenerContainer;
         this.objectMapper        = objectMapper;
         this.listenerScheduler   = listenerScheduler;
+        this.redisTemplate       = redisTemplate;
         this.racerMetrics        = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
         this.racerSchemaRegistry = racerSchemaRegistry;
         this.racerRouterService  = racerRouterService;
@@ -233,6 +250,21 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
 
         final boolean dedupEnabled = ann.dedup();
 
+        // --- durable: use XREADGROUP if the channel alias is configured as durable ---
+        RacerProperties.ChannelProperties chProps = channelRef.isBlank()
+                ? null : racerProperties.getChannels().get(channelRef);
+        if (chProps != null && chProps.isDurable()) {
+            if (redisTemplate == null) {
+                log.warn("[RACER-LISTENER] Channel '{}' is durable but no ReactiveRedisTemplate " +
+                        "is available — falling back to Pub/Sub for {}.{}()",
+                        channelRef, beanName, method.getName());
+            } else {
+                registerDurableListener(bean, method, ann, beanName, listenerId,
+                        resolvedChannel, channelRef, chProps);
+                return;
+            }
+        }
+
         if (ann.mode() == ConcurrencyMode.AUTO) {
             AdaptiveConcurrencyTuner tuner = new AdaptiveConcurrencyTuner(
                     listenerId,
@@ -292,11 +324,98 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
         }
     }
 
+    // ── Durable (stream-backed) listener ────────────────────────────────────
+
+    /**
+     * Registers a Redis Stream (XREADGROUP) poll loop for the given listener method.
+     * Called when {@code racer.channels.<alias>.durable=true}.
+     */
+    private void registerDurableListener(Object bean, Method method, RacerListener ann,
+                                          String beanName, String listenerId,
+                                          String resolvedChannel, String channelRef,
+                                          RacerProperties.ChannelProperties chProps) {
+        String streamKey = chProps.getStreamKey().isBlank()
+                ? resolvedChannel + ":stream" : chProps.getStreamKey();
+        String group = chProps.getDurableGroup().isBlank()
+                ? channelRef + "-group" : chProps.getDurableGroup();
+
+        int effectiveConcurrency = ann.mode() == ConcurrencyMode.AUTO ? 4
+                : ann.mode() == ConcurrencyMode.SEQUENTIAL ? 1
+                : Math.max(1, ann.concurrency());
+
+        final boolean dedupEnabled = ann.dedup();
+        final Duration pollInterval = Duration.ofMillis(200);
+        final String consumerName = listenerId.replace('.', '-') + "-0";
+
+        final ReactiveRedisTemplate<String, String> template = redisTemplate;
+
+        // Ensure the consumer group exists (ignores BUSYGROUP error if already present)
+        RacerStreamUtils.ensureGroup(template, streamKey, group)
+                .onErrorResume(e -> Mono.empty())
+                .subscribe();
+
+        Disposable sub = Flux.defer(() ->
+                        pollOnceDurable(template, bean, method, streamKey, group, consumerName,
+                                listenerId, resolvedChannel, dedupEnabled, effectiveConcurrency))
+                .repeatWhen(flux -> flux.flatMap(v -> Mono.delay(pollInterval)))
+                .onErrorContinue((ex, o) ->
+                        log.error("[RACER-LISTENER] Durable '{}' poll error: {}", listenerId, ex.getMessage()))
+                .subscribe(
+                        v -> {},
+                        ex -> log.error("[RACER-LISTENER] Durable '{}' fatal error: {}",
+                                listenerId, ex.getMessage(), ex));
+
+        subscriptions.add(sub);
+        log.info("[RACER-LISTENER] Registered (DURABLE) {}.{}() ← stream='{}' group='{}' concurrency={}",
+                beanName, method.getName(), streamKey, group, effectiveConcurrency);
+    }
+
+    private Flux<Void> pollOnceDurable(ReactiveRedisTemplate<String, String> template,
+                                        Object bean, Method method,
+                                        String streamKey, String group, String consumerName,
+                                        String listenerId, String channel,
+                                        boolean dedupEnabled, int concurrency) {
+        StreamReadOptions readOptions = StreamReadOptions.empty().count(10);
+        Consumer consumer = Consumer.from(group, consumerName);
+        StreamOffset<String> offset = StreamOffset.create(streamKey, ReadOffset.lastConsumed());
+
+        return template.opsForStream()
+                .read(consumer, readOptions, offset)
+                .onErrorResume(ex -> {
+                    log.debug("[RACER-LISTENER] XREADGROUP on '{}' error: {}", streamKey, ex.getMessage());
+                    return Flux.empty();
+                })
+                .flatMap(record -> {
+                    if (isStopping()) {
+                        return RacerStreamUtils.ackRecord(template, streamKey, group, record.getId()).then();
+                    }
+                    Object raw = record.getValue().get("data");
+                    if (raw == null) {
+                        log.warn("[RACER-LISTENER] Record {} on '{}' missing 'data' field — acking and skipping",
+                                record.getId(), streamKey);
+                        return RacerStreamUtils.ackRecord(template, streamKey, group, record.getId()).then();
+                    }
+                    String rawJson = raw.toString();
+                    return dispatch(bean, method, rawJson, listenerId, channel, dedupEnabled)
+                            .then(RacerStreamUtils.ackRecord(template, streamKey, group, record.getId()))
+                            .then();
+                }, concurrency);
+    }
+
     // ── Dispatch ─────────────────────────────────────────────────────────────
 
+    /** Pub/Sub convenience overload — delegates to the raw-JSON overload. */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private Mono<Void> dispatch(Object bean, Method method,
                                 ReactiveSubscription.Message<String, String> redisMsg,
+                                String listenerId, String channel, boolean dedupEnabled) {
+        return dispatch(bean, method, redisMsg.getMessage(), listenerId, channel, dedupEnabled);
+    }
+
+    /** Core dispatch — deserialization, dedup, circuit-breaker, routing, and invocation. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private Mono<Void> dispatch(Object bean, Method method,
+                                String rawJson,
                                 String listenerId, String channel, boolean dedupEnabled) {
         // Shutdown gate — reject new messages once graceful stop has been initiated
         if (isStopping()) {
@@ -321,7 +440,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
 
             RacerMessage message;
             try {
-                message = objectMapper.readValue(redisMsg.getMessage(), RacerMessage.class);
+                message = objectMapper.readValue(rawJson, RacerMessage.class);
             } catch (Exception e) {
                 log.error("[RACER-LISTENER] '{}' — failed to deserialize message from channel '{}': {}",
                         listenerId, channel, e.getMessage());

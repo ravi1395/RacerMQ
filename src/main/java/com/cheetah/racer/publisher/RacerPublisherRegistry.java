@@ -120,10 +120,21 @@ public class RacerPublisherRegistry {
                 log.warn("[racer] Channel alias '{}' has no 'name' configured — skipping.", alias);
                 return;
             }
-            registry.put(alias, new RacerChannelPublisherImpl(
-                    redisTemplate, objectMapper,
-                    channelProps.getName(), alias, channelProps.getSender(), racerMetrics, schemaRegistry));
-            log.info("[racer] Channel '{}' registered → '{}'", alias, channelProps.getName());
+            if (channelProps.isDurable()) {
+                String actualStreamKey = channelProps.getStreamKey().isBlank()
+                        ? channelProps.getName() + ":stream"
+                        : channelProps.getStreamKey();
+                registry.put(alias, new RacerChannelPublisherImpl(
+                        redisTemplate, objectMapper,
+                        channelProps.getName(), alias, channelProps.getSender(),
+                        true, actualStreamKey, racerMetrics, schemaRegistry));
+                log.info("[racer] Channel '{}' registered → stream '{}' (durable)", alias, actualStreamKey);
+            } else {
+                registry.put(alias, new RacerChannelPublisherImpl(
+                        redisTemplate, objectMapper,
+                        channelProps.getName(), alias, channelProps.getSender(), racerMetrics, schemaRegistry));
+                log.info("[racer] Channel '{}' registered → '{}'", alias, channelProps.getName());
+            }
         });
     }
 

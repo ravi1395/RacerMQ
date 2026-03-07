@@ -49,6 +49,26 @@ public class RacerProperties {
 
         /** Default sender identifier for messages on this channel. */
         private String sender = "racer";
+
+        /**
+         * When {@code true}, the publisher writes to a Redis Stream (XADD) instead of
+         * Pub/Sub (PUBLISH), and {@link com.cheetah.racer.listener.RacerListenerRegistrar}
+         * consumes via XREADGROUP — guaranteeing at-least-once delivery even when the
+         * consumer was temporarily offline. Default {@code false}.
+         */
+        private boolean durable = false;
+
+        /**
+         * Consumer group name used when {@link #durable} is {@code true}.
+         * Defaults to {@code "<alias>-group"} when blank.
+         */
+        private String durableGroup = "";
+
+        /**
+         * Redis Stream key used when {@link #durable} is {@code true}.
+         * Defaults to {@code "<channelName>:stream"} when blank.
+         */
+        private String streamKey = "";
     }
 
     /**
