@@ -11,7 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.lang.Nullable;
 
-import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -53,7 +53,7 @@ public class RacerPublisherRegistry {
     private final RacerSchemaRegistry schemaRegistry;
 
     /** alias → publisher; populated by {@link #init()}. */
-    private final Map<String, RacerChannelPublisher> registry = new HashMap<>();
+    private final Map<String, RacerChannelPublisher> registry = new ConcurrentHashMap<>();
 
     /**
      * Minimal constructor — no metrics or schema validation.

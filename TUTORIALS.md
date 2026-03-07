@@ -33,6 +33,7 @@ Each tutorial is self-contained and builds on a running Racer instance.
 22. [Tutorial 22 — Circuit Breaker per Listener](#tutorial-22--circuit-breaker-per-listener)
 23. [Tutorial 23 — Back-Pressure Monitoring](#tutorial-23--back-pressure-monitoring)
 24. [Tutorial 24 — Consumer Group Lag Dashboard](#tutorial-24--consumer-group-lag-dashboard)
+25. [Tutorial 25 — Message Interceptors (RacerMessageInterceptor)](#tutorial-25--message-interceptors-racermessageinterceptor)
 
 ---
 
@@ -1872,8 +1873,127 @@ In `racer-demo` logs you should see the router dispatch the message to `racer:or
 
 ---
 
-### What you built
+### What you built (basic routing)
 A content-based message router that evaluates inbound messages against regex rules and forwards them to the correct Redis channel — equivalent to RabbitMQ topic exchange semantics, without leaving the Redis ecosystem.
+
+---
+
+### Step 5 — RouteMatchSource: match on sender or message ID
+
+By default rules match a JSON field in the payload (`RouteMatchSource.PAYLOAD`). Use `source` to match the **envelope sender** or **message ID** instead:
+
+```java
+@Component
+@RacerRoute({
+    // Forward every message from "payment-service" to a dedicated channel
+    @RacerRouteRule(source = RouteMatchSource.SENDER,
+                    matches = "payment-service",
+                    to      = "racer:payments"),
+    // Quarantine messages whose ID starts with "LEGACY-"
+    @RacerRouteRule(source = RouteMatchSource.ID,
+                    matches = "^LEGACY-.*",
+                    to      = "racer:legacy",
+                    action  = RouteAction.DROP_TO_DLQ)
+})
+public class SenderRouter { }
+```
+
+| `source` value | Matched against |
+|----------------|----------------|
+| `PAYLOAD` (default) | A top-level JSON field in the message payload (`field` attribute selects which key). |
+| `SENDER` | `RacerMessage.getSender()` — the envelope sender label. |
+| `ID` | `RacerMessage.getId()` — the unique message ID. |
+
+---
+
+### Step 6 — RouteAction: DROP, DLQ, and fan-out
+
+Add the `action` attribute to control what happens when a rule fires:
+
+```java
+@Component
+@RacerRoute({
+    // Silently discard test messages
+    @RacerRouteRule(field   = "env",     matches = "test",      to = "",
+                    action  = RouteAction.DROP),
+    // Route fraud alerts to DLQ for manual review
+    @RacerRouteRule(field   = "type",    matches = "FRAUD.*",   to = "racer:fraud",
+                    action  = RouteAction.DROP_TO_DLQ),
+    // Fan-out: forward AND keep processing locally
+    @RacerRouteRule(field   = "type",    matches = "^ORDER.*",  to = "racer:audit",
+                    action  = RouteAction.FORWARD_AND_PROCESS),
+    // Default: forward only
+    @RacerRouteRule(field   = "type",    matches = ".*",        to = "racer:default")
+})
+public class ActionRouter { }
+```
+
+| `action` value | Behaviour |
+|----------------|----------|
+| `FORWARD` (default) | Re-publish to `to` channel; **skip** local handler. |
+| `FORWARD_AND_PROCESS` | Re-publish to `to` channel **and** invoke the local handler (fan-out). |
+| `DROP` | Silently discard — no re-publish, no handler, no DLQ. |
+| `DROP_TO_DLQ` | Route to the Dead Letter Queue; skip local handler. |
+
+---
+
+### Step 7 — Method-level @RacerRoute on a @RacerListener handler
+
+Instead of a dedicated router bean, attach routing rules directly to a **listener method**. The rules apply only to that handler:
+
+```java
+@Component
+public class OrderConsumer {
+
+    @RacerListener(channel = "racer:orders")
+    @RacerRoute({
+        @RacerRouteRule(field  = "priority", matches = "HIGH",
+                        to     = "racer:orders:high",
+                        action = RouteAction.FORWARD),
+        @RacerRouteRule(field  = "priority", matches = ".*",
+                        to     = "",
+                        action = RouteAction.DROP)   // drop non-HIGH silently
+    })
+    public void onOrder(RacerMessage msg) {
+        // Only reached for messages where priority = HIGH AND action = FORWARD_AND_PROCESS
+        orderService.process(msg);
+    }
+}
+```
+
+The annotation is evaluated before the handler is invoked. Rules are checked in declaration order; the first match decides the outcome.
+
+---
+
+### Step 8 — @Routed boolean parameter injection
+
+When a rule fires with `FORWARD_AND_PROCESS`, the message is both forwarded **and** dispatched to the local handler. Add a `@Routed boolean` parameter to your handler to find out which case you are in:
+
+```java
+@Component
+public class AuditListener {
+
+    @RacerListener(channel = "racer:events")
+    @RacerRoute({
+        @RacerRouteRule(field  = "type", matches = "^SENSITIVE.*",
+                        to     = "racer:audit",
+                        action = RouteAction.FORWARD_AND_PROCESS)
+    })
+    public void onEvent(RacerMessage msg, @Routed boolean wasForwarded) {
+        if (wasForwarded) {
+            log.info("Event was also forwarded to audit channel");
+        }
+        eventService.handle(msg);
+    }
+}
+```
+
+Racer injects `true` when the decision was `FORWARDED_AND_PROCESS`, and `false` for a `PASS` decision (no rule matched / rule allowed through).
+
+---
+
+### What you built
+A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded.
 
 ---
 
@@ -3962,3 +4082,170 @@ Prometheus scrape  →  Grafana panel  →  alert on threshold
 ```
 
 Real-time visibility into stream back-log with zero code changes — just one property and standard Micrometer / Prometheus tooling.
+
+---
+
+## Tutorial 25 — Message Interceptors (RacerMessageInterceptor)
+
+### What you'll learn
+- Implement `RacerMessageInterceptor` to intercept every inbound message before handler dispatch
+- Register interceptors as Spring beans and control chain order with `@Order`
+- Mutate, enrich, or validate messages in the interceptor chain
+- Short-circuit processing by returning `Mono.error(...)`
+- Access listener metadata via `InterceptorContext`
+
+### Prerequisites
+- `racer-demo` running on port 8080 — see Tutorial 1
+- At least one `@RacerListener` handler configured (e.g. from Tutorial 3 or Tutorial 19)
+
+---
+
+### Step 1 — Implement a logging interceptor
+
+`RacerMessageInterceptor` is a `@FunctionalInterface` with a single method:
+
+```java
+Mono<RacerMessage> intercept(RacerMessage message, InterceptorContext context);
+```
+
+- Return `Mono.just(message)` (or a mutated copy) to continue the chain.
+- Return `Mono.error(...)` to abort processing entirely (message is NOT dispatched to the handler).
+
+```java
+// src/main/java/com/example/demo/interceptor/LoggingInterceptor.java
+package com.example.demo.interceptor;
+
+import com.cheetah.racer.listener.InterceptorContext;
+import com.cheetah.racer.listener.RacerMessageInterceptor;
+import com.cheetah.racer.model.RacerMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+@Component
+@Order(1)
+public class LoggingInterceptor implements RacerMessageInterceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(LoggingInterceptor.class);
+
+    @Override
+    public Mono<RacerMessage> intercept(RacerMessage message, InterceptorContext ctx) {
+        log.info("[{}] message id={} on channel={}",
+                 ctx.listenerId(), message.getId(), ctx.channel());
+        return Mono.just(message); // pass through unchanged
+    }
+}
+```
+
+`InterceptorContext` exposes three fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `listenerId()` | `String` | The listener ID (`@RacerListener(id=...)` or auto-generated). |
+| `channel()` | `String` | The Redis channel the message arrived on. |
+| `method()` | `java.lang.reflect.Method` | The handler method that will be invoked. |
+
+---
+
+### Step 2 — Message validation / short-circuit
+
+Return `Mono.error(...)` to reject a message before it reaches the handler. The error is treated as a handler failure (increments `failedCount`, forwards to DLQ if configured):
+
+```java
+@Component
+@Order(2)
+public class ValidationInterceptor implements RacerMessageInterceptor {
+
+    @Override
+    public Mono<RacerMessage> intercept(RacerMessage message, InterceptorContext ctx) {
+        if (message.getPayload() == null || message.getPayload().isBlank()) {
+            return Mono.error(new IllegalArgumentException(
+                    "Rejected empty payload on " + ctx.channel()));
+        }
+        return Mono.just(message);
+    }
+}
+```
+
+---
+
+### Step 3 — Message mutation / enrichment
+
+Return a new `RacerMessage` to enrich or transform the message before the handler sees it:
+
+```java
+@Component
+@Order(3)
+public class CorrelationInterceptor implements RacerMessageInterceptor {
+
+    @Override
+    public Mono<RacerMessage> intercept(RacerMessage message, InterceptorContext ctx) {
+        // Stamp a correlation-id header if absent
+        if (message.getId() == null || message.getId().isBlank()) {
+            RacerMessage enriched = RacerMessage.builder()
+                    .id(java.util.UUID.randomUUID().toString())
+                    .sender(message.getSender())
+                    .payload(message.getPayload())
+                    .channel(message.getChannel())
+                    .build();
+            return Mono.just(enriched);
+        }
+        return Mono.just(message);
+    }
+}
+```
+
+---
+
+### Step 4 — Ordering multiple interceptors
+
+Racer collects all `RacerMessageInterceptor` beans, sorts them by `@Order` (lowest value = first), and chains them before every handler invocation. The chain is:
+
+```
+message arrives
+       │
+       ▼
+@Order(1)  LoggingInterceptor    → logs, passes through
+       │
+       ▼
+@Order(2)  ValidationInterceptor → rejects if invalid
+       │
+       ▼
+@Order(3)  CorrelationInterceptor → enriches id if absent
+       │
+       ▼
+   @RacerListener handler invoked with final message
+```
+
+If any interceptor returns `Mono.error(...)`, the chain is terminated immediately and the error is propagated.
+
+---
+
+### Step 5 — Scoping interceptors with lambdas
+
+For lightweight use cases, register interceptors inline in a `@Configuration`:
+
+```java
+@Configuration
+public class RacerInterceptorConfig {
+
+    @Bean
+    @Order(10)
+    public RacerMessageInterceptor timingInterceptor() {
+        return (msg, ctx) -> {
+            long start = System.currentTimeMillis();
+            return Mono.just(msg)
+                    .doOnTerminate(() ->
+                        log.debug("[{}] dispatch took {} ms",
+                                  ctx.listenerId(), System.currentTimeMillis() - start));
+        };
+    }
+}
+```
+
+---
+
+### What you built
+A pluggable pre-dispatch interception pipeline that runs before every `@RacerListener` handler. Use it for cross-cutting concerns — logging, validation, enrichment, metrics, or security checks — without modifying handler code.

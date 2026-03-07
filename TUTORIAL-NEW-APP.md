@@ -420,28 +420,41 @@ package com.example.inventory.router;
 
 import com.cheetah.racer.annotation.RacerRoute;
 import com.cheetah.racer.annotation.RacerRouteRule;
+import com.cheetah.racer.annotation.RouteAction;
 import org.springframework.stereotype.Service;
 
 /**
  * Routes incoming messages on racer:inventory:events by their "eventType" field:
  *
- *   eventType = "STOCK_UPDATED"  →  racer:inventory:stock  (alias: stock)
- *   eventType = "LOW_STOCK_ALERT" → racer:inventory:alerts (alias: alerts)
- *   eventType = "ITEM_CREATED"   →  racer:inventory:audit  (alias: audit)
+ *   eventType = "STOCK_UPDATED"   →  racer:inventory:stock  (FORWARD — stock processors only)
+ *   eventType = "LOW_STOCK.*"     →  racer:inventory:alerts (FORWARD_AND_PROCESS — fan-out:
+ *                                    alerts channel + local audit handler)
+ *   eventType = "ITEM_.*"         →  racer:inventory:audit  (FORWARD — audit only)
+ *   eventType = anything else     →  dropped silently       (DROP — unknown events discarded)
  *
  * Rules are evaluated in declaration order. First match wins.
  * The annotated class acts as a config container — no methods needed.
  */
 @Service
 @RacerRoute({
-    @RacerRouteRule(field = "eventType", matches = "STOCK_UPDATED",   to = "stock"),
-    @RacerRouteRule(field = "eventType", matches = "LOW_STOCK.*",     to = "alerts"),
-    @RacerRouteRule(field = "eventType", matches = "ITEM_.*",         to = "audit")
+    @RacerRouteRule(field = "eventType", matches = "STOCK_UPDATED",
+                    to = "stock",   action = RouteAction.FORWARD),
+    @RacerRouteRule(field = "eventType", matches = "LOW_STOCK.*",
+                    to = "alerts",  action = RouteAction.FORWARD_AND_PROCESS),
+    @RacerRouteRule(field = "eventType", matches = "ITEM_.*",
+                    to = "audit",   action = RouteAction.FORWARD),
+    @RacerRouteRule(field = "eventType", matches = ".*",
+                    to = "",        action = RouteAction.DROP)
 })
 public class InventoryEventRouter {
     // No methods required — Racer's RacerRouterService reads the annotations at startup
 }
 ```
+
+> **`action` defaults to `FORWARD`** — the original three-rule example works identically
+> without specifying `action`. The `DROP` catch-all above is an optional safety net that
+> silently discards messages with unrecognised event types rather than letting them fall
+> through to all listeners.
 
 ---
 
@@ -772,7 +785,7 @@ alertsPublisher.publishAsync()  ────────────────
 | `@EnableRacer` | `InventoryApplication` | Activates auto-configuration, AOP, registry, field processor |
 | `@RacerPublisher("alerts")` | `InventoryService` | Injects a publisher bound to `racer:inventory:alerts` |
 | `@PublishResult(channelRef="stock")` | `createItem`, `updateStock` | Auto-publishes the return value to `racer:inventory:stock` without any `publishAsync()` call |
-| `@RacerRoute` + `@RacerRouteRule` | `InventoryEventRouter` | Declaratively fans out events from the default channel to dedicated sub-channels |
+| `@RacerRoute` + `@RacerRouteRule` | `InventoryEventRouter` | Declaratively fans out events using `RouteAction` (FORWARD/FORWARD_AND_PROCESS/DROP/DROP_TO_DLQ) and `RouteMatchSource` (PAYLOAD/SENDER/ID) |
 | `@RacerListener(channel="racer:inventory:audit")` | `InventoryAuditConsumer` | Subscribes the method to the audit channel; handles deserialization, metrics, and DLQ automatically |
 
 ---
@@ -786,6 +799,8 @@ Once comfortably running, explore these Racer capabilities:
 | Durable delivery with Redis Streams (`@PublishResult(durable=true)`) | [Tutorial 11](TUTORIALS.md#tutorial-11--durable-publishing-publishresult-durabletrue) |
 | Dead Letter Queue — automatic retry on failure | [Tutorial 4](TUTORIALS.md#tutorial-4--dead-letter-queue--reprocessing) |
 | Request-Reply (send a message, wait for a typed response) | [Tutorial 5](TUTORIALS.md#tutorial-5--two-way-request-reply-over-pubsub) |
+| Advanced routing — `RouteMatchSource`, `RouteAction`, method-level `@RacerRoute`, `@Routed` injection | [Tutorial 10](TUTORIALS.md#tutorial-10--content-based-routing-racerroute) |
+| Pre-dispatch message interception (`RacerMessageInterceptor`) | [Tutorial 25](TUTORIALS.md#tutorial-25--message-interceptors-racermessageinterceptor) |
 | Atomic multi-channel batch publish (`RacerTransaction`) | [Tutorial 14](TUTORIALS.md#tutorial-14--atomic-batch-publishing-racertransaction) |
 | Promethues / Actuator metrics deep-dive | [Tutorial 12](TUTORIALS.md#tutorial-12--metrics--observability-actuator--prometheus) |
 | High availability with Redis Sentinel | [Tutorial 15](TUTORIALS.md#tutorial-15--high-availability-sentinel--cluster) |

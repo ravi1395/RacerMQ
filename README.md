@@ -9,7 +9,7 @@ A Spring Boot library for annotation-driven reactive Redis messaging. Define pub
 - **Dead Letter Queue (DLQ)** — automatic enqueue on failure; opt-in REST API (`racer.web.dlq-enabled=true`) for inspection and republishing
 - **Multiple Channels** — declare unlimited named channels in `application.properties`
 - **Durable Publishing** — `@PublishResult(durable = true)` writes to Redis Streams for at-least-once delivery
-- **Content-Based Router** — `@RacerRoute` / `@RacerRouteRule` for regex-pattern message routing; opt-in REST API (`racer.web.router-enabled=true`)
+- **Content-Based Router** — `@RacerRoute` / `@RacerRouteRule` for regex-pattern message routing on payload fields, sender, or message ID; `RouteAction` controls FORWARD / FORWARD\_AND\_PROCESS / DROP / DROP\_TO\_DLQ; method-level `@RacerRoute` on `@RacerListener` handlers; `@Routed` boolean parameter injection; `RacerMessageInterceptor` SPI for pre-dispatch interception; opt-in REST API (`racer.web.router-enabled=true`)
 - **Atomic Batch Publish** — `RacerTransaction.execute()` for ordered multi-channel publish
 - **Pipelined Batch Publish** — `RacerPipelinedPublisher` issues all commands in parallel for maximum throughput
 - **Consumer Scaling** — configurable concurrency per stream via `@RacerStreamListener(concurrency=N)` and key-based sharding via `RacerShardedStreamPublisher`
@@ -133,8 +133,11 @@ racer/                                   # Library (single-module Maven project)
     │   │   │   ├── EnableRacerClients.java      # Enables @RacerClient scanning
     │   │   │   ├── RacerPublisher.java          # Field injection annotation
     │   │   │   ├── PublishResult.java           # Method auto-publish (+ durable mode)
-    │   │   │   ├── RacerRoute.java              # Content-based routing (container)
-    │   │   │   ├── RacerRouteRule.java          # Per-rule: field, matches, to, sender
+    │   │   │   ├── RacerRoute.java              # Content-based routing: @Target(TYPE, METHOD)
+    │   │   │   ├── RacerRouteRule.java          # Per-rule: field, matches, to, sender, source, action
+    │   │   │   ├── RouteAction.java             # FORWARD / FORWARD_AND_PROCESS / DROP / DROP_TO_DLQ
+    │   │   │   ├── RouteMatchSource.java        # PAYLOAD (default) / SENDER / ID
+    │   │   │   ├── Routed.java                  # @Parameter: injects wasForwarded boolean into handler
     │   │   │   ├── ConcurrencyMode.java         # SEQUENTIAL / CONCURRENT / AUTO dispatch enum
     │   │   │   ├── RacerListener.java           # Declarative Pub/Sub subscriber
     │   │   │   ├── RacerStreamListener.java     # Durable Redis Streams consumer
@@ -151,7 +154,9 @@ racer/                                   # Library (single-module Maven project)
     │   │   ├── listener/
     │   │   │   ├── AbstractRacerRegistrar.java        # Base BeanPostProcessor + SmartLifecycle for listener registrars
     │   │   │   ├── RacerDeadLetterHandler.java        # SPI: forward failed msgs to DLQ
-    │   │   │   └── RacerListenerRegistrar.java        # BeanPostProcessor for @RacerListener
+    │   │   │   ├── RacerListenerRegistrar.java        # BeanPostProcessor for @RacerListener
+    │   │   │   ├── RacerMessageInterceptor.java       # @FunctionalInterface SPI: intercept messages before handler dispatch
+    │   │   │   └── InterceptorContext.java            # record(listenerId, channel, method) — passed to each interceptor
     │   │   ├── metrics/
     │   │   │   ├── RacerMetrics.java                  # Micrometer counters/timers/gauges (implements RacerMetricsPort)
     │   │   │   ├── RacerMetricsPort.java              # SPI: metrics abstraction — implement to provide custom instrumentation
@@ -174,7 +179,9 @@ racer/                                   # Library (single-module Maven project)
     │   │   │   ├── RacerClientRegistrar.java          # ImportBeanDefinitionRegistrar for @RacerClient
     │   │   │   └── RacerClientFactoryBean.java        # JDK dynamic proxy FactoryBean
     │   │   ├── router/
-    │   │   │   └── RacerRouterService.java            # @PostConstruct scans @RacerRoute beans
+    │   │   │   ├── CompiledRouteRule.java             # Compiled, regex-ready rule (record)
+    │   │   │   ├── RouteDecision.java                 # PASS / FORWARDED / FORWARDED_AND_PROCESS / DROPPED / DROPPED_TO_DLQ
+    │   │   │   └── RacerRouterService.java            # compile() / evaluate() / route(); scans @RacerRoute beans
     │   │   ├── service/
     │   │   │   ├── DeadLetterQueueService.java        # DLQ enqueue + republish
     │   │   │   ├── DlqReprocessorService.java         # Republish-only DLQ reprocessor
@@ -496,18 +503,41 @@ public Flux<Event> generateEvents() {
 
 ### `@RacerRoute` — content-based routing
 
-Apply `@RacerRoute` to a **`@Component`** (or any Spring bean). At startup `RacerRouterService` scans all beans, compiles the rules, and checks every inbound message against them before dispatching to a processor.
+Apply `@RacerRoute` to a **`@Component`** (or any Spring bean) **or directly to a `@RacerListener` handler method**. At startup `RacerRouterService` scans all beans, compiles the rules, and checks every inbound message against them before dispatching to a processor.
+
+**Type-level router (dedicated router bean):**
 
 ```java
 @Component
 @RacerRoute({
-    @RacerRouteRule(field = "type",   matches = "^ORDER.*",          to = "racer:orders"),
-    @RacerRouteRule(field = "type",   matches = "^NOTIFICATION.*",   to = "racer:notifications"),
-    @RacerRouteRule(field = "sender", matches = "payment-service",   to = "racer:payments",
-                    sender = "router")
+    @RacerRouteRule(field = "type",   matches = "^ORDER.*",        to = "racer:orders"),
+    @RacerRouteRule(field = "type",   matches = "^NOTIFICATION.*", to = "racer:notifications"),
+    @RacerRouteRule(source = RouteMatchSource.SENDER, field = "",
+                    matches = "payment-service",                   to = "racer:payments",
+                    action = RouteAction.FORWARD_AND_PROCESS,       sender = "router")
 })
 public class OrderRouter {
     // no methods required — the annotation does all the work
+}
+```
+
+**Method-level router (per-listener routing rule):**
+
+```java
+@Component
+public class OrderListener {
+
+    @RacerListener(channel = "racer:orders")
+    @RacerRoute({
+        @RacerRouteRule(field = "priority", matches = "HIGH", to = "racer:orders:high",
+                        action = RouteAction.FORWARD),
+        @RacerRouteRule(field = "priority", matches = ".*",   to = "",
+                        action = RouteAction.DROP)
+    })
+    public void onOrder(RacerMessage msg, @Routed boolean wasForwarded) {
+        // only invoked for FORWARD_AND_PROCESS or PASS decisions
+        log.info("Processing order. wasForwarded={}", wasForwarded);
+    }
 }
 ```
 
@@ -515,13 +545,50 @@ public class OrderRouter {
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `field` | `String` | `""` | JSON field in the payload to evaluate (e.g. `"type"`, `"sender"`). |
-| `matches` | `String` | `""` | Java regex applied to the field value. |
-| `to` | `String` | `""` | Target Redis channel to forward the message to when the rule matches. |
-| `sender` | `String` | `"racer-router"` | Sender label used when re-publishing to the target channel. |
+| `field` | `String` | `""` | JSON field in the payload to evaluate (ignored when `source` is `SENDER` or `ID`). |
+| `matches` | `String` | `""` | Java regex applied to the field value (or envelope field when `source ≠ PAYLOAD`). |
+| `to` | `String` | `""` | Target Redis channel/alias to re-publish the message to when the rule fires. |
+| `sender` | `String` | `"racer-router"` | Sender label stamped on the re-published message. |
+| `source` | `RouteMatchSource` | `PAYLOAD` | Which part of the message is matched (see table below). |
+| `action` | `RouteAction` | `FORWARD` | What to do when the rule matches (see table below). |
+
+**`RouteMatchSource` values**
+
+| Value | Matches against |
+|-------|----------------|
+| `PAYLOAD` | A top-level JSON field in `RacerMessage.payload` (identified by `field`). |
+| `SENDER` | `RacerMessage.getSender()` — the envelope sender label. |
+| `ID` | `RacerMessage.getId()` — the unique message ID. |
+
+**`RouteAction` values**
+
+| Value | Behaviour |
+|-------|----------|
+| `FORWARD` | Re-publish to `to` channel and **skip** the local handler (default). |
+| `FORWARD_AND_PROCESS` | Re-publish to `to` channel **and** invoke the local handler (fan-out). |
+| `DROP` | Silently discard — no re-publish, no local handler invocation. |
+| `DROP_TO_DLQ` | Route the message to the Dead Letter Queue and skip the local handler. |
+
+**`@Routed` parameter injection:**  
+Add a `boolean` parameter annotated `@Routed` to any `@RacerListener` handler. Racer injects `true` if the message was forwarded (`FORWARD_AND_PROCESS`), and `false` otherwise.
+
+**`RacerMessageInterceptor` SPI:**  
+Declare one or more `RacerMessageInterceptor` beans to intercept every message before handler dispatch. Use `@Order` to control the chain order. Return a different `Mono<RacerMessage>` to mutate the message, or return `Mono.error(...)` to abort processing.
+
+```java
+@Component
+@Order(1)
+public class LoggingInterceptor implements RacerMessageInterceptor {
+    @Override
+    public Mono<RacerMessage> intercept(RacerMessage msg, InterceptorContext ctx) {
+        log.info("[{}] received on {}", ctx.listenerId(), ctx.channel());
+        return Mono.just(msg); // pass through unchanged
+    }
+}
+```
 
 **Runtime API:**
-- `GET /api/router/rules` — list all compiled rules with their index, field, pattern and target.
+- `GET /api/router/rules` — list all compiled rules with their index, source, field, pattern, target and action.
 - `POST /api/router/test` — dry-run: pass a message body and see which rule (if any) matches.
 
 ---
@@ -717,7 +784,7 @@ public void handleOrder(String rawPayload) {
 
 **Integration with schema validation, routing, and DLQ:**
 - If a `RacerSchemaValidator` bean is present, the payload is validated before dispatch; schema failures are forwarded to the DLQ without invoking the method.
-- If a `RacerRouterService` bean is present, the router decides whether the message is meant for this listener's channel; non-matching messages are silently skipped.
+- If a `RacerRouterService` bean is present, it evaluates routing rules for the message. The `RouteDecision` outcome controls dispatch: `PASS` → handler invoked normally; `FORWARDED` → message re-published to target channel, local handler **skipped**; `FORWARDED_AND_PROCESS` → message re-published **and** local handler invoked; `DROPPED` → message silently discarded; `DROPPED_TO_DLQ` → message sent to the Dead Letter Queue. A `@Routed boolean` parameter in the handler receives `true` when the decision was `FORWARDED_AND_PROCESS`.
 - Any exception thrown by the method (or emitted by a returned `Mono`) increments the listener's `failedCount` and forwards the message to `RacerDeadLetterHandler` (implemented by `DeadLetterQueueService` in `racer`).
 
 **Metrics:** each listener exposes `getProcessedCount(id)` and `getFailedCount(id)` via `RacerListenerRegistrar`, and records to Micrometer under `racer.listener.processed` / `racer.listener.failed` tags.

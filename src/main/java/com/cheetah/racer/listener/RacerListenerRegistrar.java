@@ -111,7 +111,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
     private final Map<String, List<CompiledRouteRule>> perListenerRules = new ConcurrentHashMap<>();
 
     /** Ordered list of message interceptors applied before every handler invocation. */
-    private List<RacerMessageInterceptor> interceptors = Collections.emptyList();
+    private volatile List<RacerMessageInterceptor> interceptors = Collections.emptyList();
 
     public void setDedupService(RacerDedupService dedupService) {
         this.dedupService = dedupService;
