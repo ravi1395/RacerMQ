@@ -1,35 +1,68 @@
-# Build a New Application with Racer — From Scratch
+# Build a Notification Hub — Complete Racer Feature Tour
 
-This tutorial builds a complete **Inventory Management** Spring Boot application from
-scratch using the Racer messaging framework. By the end you will have a running service
-that:
+This tutorial builds **NotifyHub**, a self-contained Spring Boot service that demonstrates
+_every_ Racer capability using a simple notification dispatch domain. Because the domain
+logic is trivial (route and log notifications), all attention stays on the framework.
 
-- Receives REST requests and publishes domain events to Redis channels
-- Uses `@RacerPublisher` for injected, property-driven publishers
-- Uses `@PublishResult` to auto-publish method return values without boilerplate
-- Applies content-based routing with `@RacerRoute` to fan events to dedicated channels
-- Consumes its own events to maintain an in-memory audit log
-- Ships messages to the DLQ automatically when processing fails
-- Exposes Actuator metrics via Micrometer
+By the end you will have a running service that:
 
-> This tutorial is self-contained. You do **not** need to run `racer-demo` or any other
-> Racer module alongside your application. Your new application acts as both publisher and subscriber.
+- Publishes messages three different ways: `@RacerPublisher`, `@PublishResult`, `RacerTransaction`
+- Routes messages content-based to `email`, `sms`, `push`, and `audit` channels via `@RacerRoute`
+- Intercepts every message with logging and sender validation via `RacerMessageInterceptor`
+- Consumes messages with plain, dedup, and concurrent listeners via `@RacerListener`
+- Sends requests and waits for typed replies via `@RacerClient` / `@RacerResponder`
+- Ships failing messages to the Dead Letter Queue automatically and lets you inspect / reprocess them
+- Publishes to three channels atomically in one call via `RacerTransaction`
+- Routes high-priority notifications to priority sub-channels via `@RacerPriority`
+- Protects the SMS consumer with a circuit breaker
+- Switches the email channel from transient Pub/Sub to durable Streams by editing one property
+- Exposes Micrometer metrics via Spring Actuator
+
+> This tutorial is **self-contained**. You do not need any other Racer module running
+> alongside it. `notify-hub` acts as both publisher and subscriber of its own channels.
+
+---
+
+## Capability Map
+
+| # | Racer Feature | Where demonstrated |
+|---|---|---|
+| 1 | `@EnableRacer` | `NotifyApplication` |
+| 2 | `@EnableRacerClients` | `NotifyApplication` |
+| 3 | `@RacerPublisher` field injection | `NotificationService` |
+| 4 | `@PublishResult` AOP | `NotificationService.dispatchEmail/Sms/Push()` |
+| 5 | `RacerTransaction` batch publish | `NotificationService.sendBroadcast()` |
+| 6 | `@RacerRoute` + `@RacerRouteRule` | `NotificationRouter` |
+| 7 | `RacerMessageInterceptor` | `CorrelationInterceptor`, `AuditInterceptor` |
+| 8 | `@RacerListener` (plain) | `AuditCollector` |
+| 9 | `@RacerListener(dedup = true)` | `EmailWorker` |
+| 10 | `@RacerListener(mode = CONCURRENT)` | `PushWorker` |
+| 11 | `@RacerListener` + exception → DLQ | `SmsWorker` |
+| 12 | `@RacerClient` + `@RacerRequestReply` | `NotificationStatusClient` |
+| 13 | `@RacerResponder` | `StatusResponder` |
+| 14 | `DeadLetterQueueService` + `DlqReprocessorService` | `DlqApiController` |
+| 15 | `@RacerPriority` | `NotificationService.sendUrgentPush()` |
+| 16 | Circuit breaker | `racer.circuit-breaker.*` + `SmsWorker` |
+| 17 | Message deduplication | `racer.dedup.*` + `EmailWorker` |
+| 18 | Durable delivery (Streams) | `racer.channels.email.durable=true` |
+| 19 | Actuator metrics | `/actuator/metrics` |
+| 20 | Built-in web API | `racer.web.dlq-enabled=true` |
 
 ---
 
 ## Prerequisites
 
-| Requirement   | Version / Notes                                                 |
-|---------------|------------------------------------------------------------------|
-| Java          | **21** – pin via `JAVA_HOME`                                     |
-| Maven         | 3.9+                                                             |
-| Docker        | Any recent Desktop version                                       |
-| Racer JARs    | Already installed to local Maven (`mvn clean install` in Racer)  |
+| Requirement | Version / Notes |
+|---|---|
+| Java | **21** — pin via `JAVA_HOME` |
+| Maven | 3.9+ |
+| Docker | Any recent Desktop version |
+| Racer JARs | Installed locally: run `mvn clean install` inside the Racer repo first |
 
 > **Verify your JDK:**
 > ```bash
 > export JAVA_HOME=$(/usr/libexec/java_home -v 21)   # macOS
-> java -version   # must print openjdk version "21…"
+> java -version   # must print: openjdk version "21..."
 > ```
 
 ---
@@ -38,22 +71,21 @@ that:
 
 ### Step 1.1 — Start Redis
 
-Open **Terminal A** inside the Racer repository and start the single-node Redis:
+Open a terminal inside the Racer repository and start the single-node Redis:
 
 ```bash
 cd /path/to/racer
 docker compose -f compose.yaml up -d
 ```
 
-Verify it is ready:
+Verify:
 
 ```bash
 docker ps --filter name=redis
-redis-cli ping     # → PONG
+redis-cli ping     # PONG
 ```
 
-The `compose.yaml` runs Redis 7 on the default port `6379` with a persistent named
-volume so data survives restarts.
+The `compose.yaml` runs Redis 7 on port `6379` with a persistent named volume.
 
 ---
 
@@ -61,33 +93,45 @@ volume so data survives restarts.
 
 ### Step 2.1 — Directory layout
 
-Create the following structure anywhere on your machine (not inside the Racer repo):
+Create the following structure **anywhere outside** the Racer repository:
 
 ```
-inventory-service/
+notify-hub/
 ├── pom.xml
 └── src/
     └── main/
         ├── java/
-        │   └── com/example/inventory/
-        │       ├── InventoryApplication.java
+        │   └── com/example/notify/
+        │       ├── NotifyApplication.java
         │       ├── model/
-        │       │   └── InventoryItem.java
+        │       │   ├── NotificationCommand.java
+        │       │   └── NotificationResult.java
         │       ├── service/
-        │       │   ├── InventoryService.java
-        │       │   └── InventoryAuditConsumer.java
+        │       │   └── NotificationService.java
         │       ├── router/
-        │       │   └── InventoryEventRouter.java
+        │       │   └── NotificationRouter.java
+        │       ├── interceptor/
+        │       │   ├── CorrelationInterceptor.java
+        │       │   └── AuditInterceptor.java
+        │       ├── worker/
+        │       │   ├── AuditCollector.java
+        │       │   ├── EmailWorker.java
+        │       │   ├── PushWorker.java
+        │       │   └── SmsWorker.java
+        │       ├── requestreply/
+        │       │   ├── NotificationStatusClient.java
+        │       │   └── StatusResponder.java
         │       └── controller/
-        │           └── InventoryController.java
+        │           ├── NotifyController.java
+        │           └── DlqApiController.java
         └── resources/
             └── application.properties
 ```
 
 ```bash
-mkdir -p inventory-service/src/main/java/com/example/inventory/{model,service,router,controller}
-mkdir -p inventory-service/src/main/resources
-cd inventory-service
+mkdir -p notify-hub/src/main/java/com/example/notify/{model,service,router,interceptor,worker,requestreply,controller}
+mkdir -p notify-hub/src/main/resources
+cd notify-hub
 ```
 
 ---
@@ -109,9 +153,9 @@ cd inventory-service
     </parent>
 
     <groupId>com.example</groupId>
-    <artifactId>inventory-service</artifactId>
+    <artifactId>notify-hub</artifactId>
     <version>1.0.0-SNAPSHOT</version>
-    <name>inventory-service</name>
+    <name>notify-hub</name>
 
     <properties>
         <java.version>21</java.version>
@@ -119,14 +163,8 @@ cd inventory-service
 
     <dependencies>
         <!--
-          ┌──────────────────────────────────────────────────┐
-          │  racer — one dependency for everything           │
-          │  Brings in:                                      │
-          │    • annotations, models, auto-configuration     │
-          │    • spring-boot-starter-data-redis-reactive     │
-          │    • spring-boot-starter-aop                     │
-          │    • jackson-datatype-jsr310                     │
-          └──────────────────────────────────────────────────┘
+          One dependency pulls in: annotations, auto-configuration, AOP,
+          reactive Redis (Lettuce), Jackson, and Micrometer integration.
         -->
         <dependency>
             <groupId>com.cheetah</groupId>
@@ -134,19 +172,16 @@ cd inventory-service
             <version>0.0.1-SNAPSHOT</version>
         </dependency>
 
-        <!-- Reactive HTTP layer -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
-        <!-- Actuator — metrics + health endpoints -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Lombok for concise domain models -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -174,7 +209,6 @@ cd inventory-service
                     </excludes>
                 </configuration>
             </plugin>
-            <!-- Ensure Lombok annotation processing works with JDK 21 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -192,15 +226,12 @@ cd inventory-service
 </project>
 ```
 
-> **Why `racer` and not `racer` directly?**
-> `racer` is a zero-code aggregator (same pattern as Spring Boot starters) that
-> pulls all required transitive dependencies in a single `<dependency>` block. It mirrors
-> what `spring-boot-starter-web` does: you don't add Tomcat, Jackson, and the web MVC
-> framework individually — the starter handles that for you.
-
 ---
 
 ### Step 2.3 — `application.properties`
+
+This single file configures every Racer feature. Each section corresponds to a
+capability demonstrated later in the tutorial.
 
 ```properties
 # ── Server ──────────────────────────────────────────────────────────────────
@@ -210,71 +241,147 @@ server.port=8090
 spring.data.redis.host=localhost
 spring.data.redis.port=6379
 
-# ── Racer ────────────────────────────────────────────────────────────────────
-# Default channel (used when @RacerPublisher has no alias)
-racer.default-channel=racer:inventory:events
+# ── Racer: default channel ────────────────────────────────────────────────────
+# Fallback channel when no channelRef or channel is specified.
+racer.default-channel=racer:notify:default
 
-# Named channel: stock — async, high-throughput stock level updates
-racer.channels.stock.name=racer:inventory:stock
-racer.channels.stock.async=true
-racer.channels.stock.sender=inventory-service
-# Optional: switch this channel to durable delivery without changing listener code
-# racer.channels.stock.durable=true
-# racer.channels.stock.durable-group=inventory-consumer-group
-# racer.channels.stock.stream-key=racer:inventory:stock:stream
+# ── Racer: named channel aliases ─────────────────────────────────────────────
 
-# Named channel: alerts — sync, low-latency critical alerts
-racer.channels.alerts.name=racer:inventory:alerts
-racer.channels.alerts.async=false
-racer.channels.alerts.sender=inventory-service
+# email — async, idempotent delivery (EmailWorker uses dedup=true)
+racer.channels.email.name=racer:notify:email
+racer.channels.email.async=true
+racer.channels.email.sender=notify-hub
+# Uncomment to make email delivery durable (Part 13 — Durable Delivery):
+# racer.channels.email.durable=true
+# racer.channels.email.durable-group=email-consumer-group
+# racer.channels.email.stream-key=racer:notify:email:stream
 
-# Named channel: audit — async append-only audit trail
-racer.channels.audit.name=racer:inventory:audit
+# sms — synchronous dispatch; protected by a circuit breaker
+racer.channels.sms.name=racer:notify:sms
+racer.channels.sms.async=false
+racer.channels.sms.sender=notify-hub
+
+# push — async; consumed concurrently by up to 4 workers
+racer.channels.push.name=racer:notify:push
+racer.channels.push.async=true
+racer.channels.push.sender=notify-hub
+
+# audit — append-only record of every dispatched notification
+racer.channels.audit.name=racer:notify:audit
 racer.channels.audit.async=true
-racer.channels.audit.sender=inventory-service
+racer.channels.audit.sender=notify-hub
+
+# requests — request-reply channel used by the status client (Part 8)
+racer.channels.requests.name=racer:notify:requests
+racer.channels.requests.async=false
+racer.channels.requests.sender=notify-hub
+
+# ── Racer: message deduplication (Part 7.2) ──────────────────────────────────
+# Activated per-listener with @RacerListener(dedup = true).
+# Uses Redis SET NX EX — same message ID within the TTL is silently dropped.
+racer.dedup.enabled=true
+racer.dedup.ttl-seconds=60
+racer.dedup.key-prefix=racer:dedup:
+
+# ── Racer: circuit breaker (Part 12) ─────────────────────────────────────────
+# Opens after 50% failures in a 5-call sliding window.
+# Stays open for 10 s; then allows 2 probe calls before closing.
+racer.circuit-breaker.enabled=true
+racer.circuit-breaker.failure-rate-threshold=50
+racer.circuit-breaker.sliding-window-size=5
+racer.circuit-breaker.wait-duration-in-open-state-seconds=10
+racer.circuit-breaker.permitted-calls-in-half-open-state=2
+
+# ── Racer: priority channels (Part 11) ───────────────────────────────────────
+# Creates sub-channels: racer:notify:push:priority:HIGH / NORMAL / LOW
+# and racer:notify:sms:priority:HIGH / NORMAL / LOW
+racer.priority.enabled=true
+racer.priority.levels=HIGH,NORMAL,LOW
+racer.priority.strategy=strict
+racer.priority.channels=push,sms
+
+# ── Racer: back-pressure monitoring ──────────────────────────────────────────
+racer.backpressure.enabled=true
+racer.backpressure.queue-threshold=0.80
+racer.backpressure.check-interval-ms=2000
+
+# ── Racer: built-in web endpoints ────────────────────────────────────────────
+racer.web.dlq-enabled=true          # exposes GET/POST /api/dlq/**
+racer.web.channels-enabled=true     # exposes GET /api/channels
 
 # ── Actuator ─────────────────────────────────────────────────────────────────
 management.endpoints.web.exposure.include=health,info,metrics,prometheus
 management.endpoint.health.show-details=always
 ```
 
+> **One file, all features.** Each section maps to a Racer `@ConfigurationProperties`
+> class: `RacerProperties.DedupProperties`, `CircuitBreakerProperties`,
+> `PriorityProperties`, `BackPressureProperties`, `WebProperties`, and so on.
+
 ---
 
-## Part 3 — Application Code
-
-### Step 3.1 — Main class
+### Step 2.4 — Main class
 
 ```java
-// src/main/java/com/example/inventory/InventoryApplication.java
-package com.example.inventory;
+// src/main/java/com/example/notify/NotifyApplication.java
+package com.example.notify;
 
 import com.cheetah.racer.annotation.EnableRacer;
+import com.cheetah.racer.annotation.EnableRacerClients;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-@EnableRacer   // enables @RacerPublisher injection, @PublishResult AOP, channel registry
-public class InventoryApplication {
+@EnableRacer           // activates: channel registry, @RacerPublisher injection,
+                       // @PublishResult AOP, RacerListenerRegistrar, RacerRouterService, DLQ
+@EnableRacerClients    // scans this package for @RacerClient interfaces and generates JDK proxies
+public class NotifyApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(InventoryApplication.class, args);
+        SpringApplication.run(NotifyApplication.class, args);
     }
 }
 ```
 
-> **`@EnableRacer` is optional** when using `racer` because
-> `RacerAutoConfiguration` is registered automatically via
-> `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`.
-> Add it explicitly as self-documenting intent that your application uses the Racer
-> framework, or when you depend on `racer` directly instead of the starter.
+> `@EnableRacer` is technically optional when using the `racer` starter
+> (AutoConfiguration registers automatically), but it serves as explicit self-documentation.
+> `@EnableRacerClients` **is required** for the `NotificationStatusClient` proxy in Part 8.
 
 ---
 
-### Step 3.2 — Domain model
+## Part 3 — Domain Model
 
 ```java
-// src/main/java/com/example/inventory/model/InventoryItem.java
-package com.example.inventory.model;
+// src/main/java/com/example/notify/model/NotificationCommand.java
+package com.example.notify.model;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class NotificationCommand {
+
+    /** Idempotency key — same value within the dedup TTL = same notification. */
+    private String id;
+
+    /** EMAIL, SMS, PUSH, or BROADCAST (fan-out to all three channels). */
+    private String type;
+
+    /** E-mail address, phone number, or device push token. */
+    private String recipient;
+
+    private String subject;
+    private String body;
+
+    /** HIGH, NORMAL, or LOW — maps to @RacerPriority sub-channels. */
+    private String priority;
+}
+```
+
+```java
+// src/main/java/com/example/notify/model/NotificationResult.java
+package com.example.notify.model;
 
 import lombok.Builder;
 import lombok.Data;
@@ -283,144 +390,177 @@ import java.time.Instant;
 
 @Data
 @Builder
-public class InventoryItem {
-    private String sku;
-    private String name;
-    private int    quantity;
-    private String location;
-    private String eventType;    // e.g. STOCK_UPDATED, LOW_STOCK_ALERT, ITEM_CREATED
-    private String correlationId;
-    private Instant updatedAt;
+public class NotificationResult {
+    private String  id;
+    private String  type;           // EMAIL, SMS, PUSH, BROADCAST
+    private String  recipient;
+    private String  status;         // DISPATCHED, DELIVERED, FAILED
+    private String  priority;       // HIGH, NORMAL, LOW — read by @RacerPriority
+    private Instant dispatchedAt;
 }
 ```
 
 ---
 
-### Step 3.3 — Inventory service
+## Part 4 — Three Publishing Patterns
 
-This is where the main features of Racer come together.
+Racer provides three distinct ways to publish messages. All three are used inside
+`NotificationService`. Understanding the differences is key to choosing the right
+approach in each situation.
+
+| Pattern | How it works | Best for |
+|---|---|---|
+| `@RacerPublisher` | Field injection — Racer wires a `RacerChannelPublisher` into the field at startup | Full control over **when** and **what** to publish |
+| `@PublishResult` | AOP interceptor — taps the reactive pipeline returned by a method and publishes each emitted value automatically | Service methods whose **return value is the event** |
+| `RacerTransaction` | Spring bean — chain multiple `tx.publish(alias, payload)` calls into one reactive sequence | Publishing to **multiple channels** in one business action |
+
+### Step 4.1 — `NotificationService`
 
 ```java
-// src/main/java/com/example/inventory/service/InventoryService.java
-package com.example.inventory.service;
+// src/main/java/com/example/notify/service/NotificationService.java
+package com.example.notify.service;
 
 import com.cheetah.racer.annotation.PublishResult;
+import com.cheetah.racer.annotation.RacerPriority;
 import com.cheetah.racer.annotation.RacerPublisher;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
-import com.example.inventory.model.InventoryItem;
+import com.cheetah.racer.tx.RacerTransaction;
+import com.example.notify.model.NotificationCommand;
+import com.example.notify.model.NotificationResult;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
 import java.time.Instant;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Service
-public class InventoryService {
+public class NotificationService {
 
-    // ── In-memory store (replace with a database in production) ──────────────
-    private final Map<String, InventoryItem> store = new ConcurrentHashMap<>();
+    // ── Pattern 1: @RacerPublisher field injection ────────────────────────────
+    //
+    // RacerPublisherFieldProcessor (a BeanPostProcessor) replaces this null at
+    // startup with a RacerChannelPublisher pre-configured for the "audit" alias.
+    // No @Autowired, no constructor argument — Racer handles it.
+    @RacerPublisher("audit")
+    private RacerChannelPublisher auditPublisher;
 
-    /**
-     * @RacerPublisher injects a publisher pre-configured for the "alerts" channel.
-     * No constructor or @Autowired needed — the RacerPublisherFieldProcessor handles it.
-     */
-    @RacerPublisher("alerts")
-    private RacerChannelPublisher alertsPublisher;
+    // RacerTransaction is registered as a Spring bean — wire it normally.
+    private final RacerTransaction racerTransaction;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // CREATE — @PublishResult auto-publishes the return value to racer:inventory:stock
-    // ─────────────────────────────────────────────────────────────────────────
+    public NotificationService(RacerTransaction racerTransaction) {
+        this.racerTransaction = racerTransaction;
+    }
 
-    /**
-     * Creates a new item. The returned InventoryItem is automatically serialized to JSON
-     * and published to racer:inventory:stock (the "stock" channel alias) by the
-     * @PublishResult AOP interceptor — no explicit publish call needed.
-     */
-    @PublishResult(channelRef = "stock")   // sender and async inherited from racer.channels.stock.*
-    public Mono<InventoryItem> createItem(String sku, String name, int qty, String location) {
-        InventoryItem item = InventoryItem.builder()
-                .sku(sku)
-                .name(name)
-                .quantity(qty)
-                .location(location)
-                .eventType("ITEM_CREATED")
-                .correlationId(UUID.randomUUID().toString())
-                .updatedAt(Instant.now())
+    // ── Pattern 2: @PublishResult ─────────────────────────────────────────────
+    //
+    // The @PublishResult AOP aspect intercepts these methods, taps the returned
+    // Mono pipeline, and publishes each emitted NotificationResult to the
+    // configured channel alias BEFORE forwarding the value to the caller.
+    // No explicit publishAsync() call is required.
+
+    @PublishResult(channelRef = "email")
+    public Mono<NotificationResult> dispatchEmail(NotificationCommand cmd) {
+        return buildResult(cmd, "EMAIL");
+    }
+
+    @PublishResult(channelRef = "sms")
+    public Mono<NotificationResult> dispatchSms(NotificationCommand cmd) {
+        return buildResult(cmd, "SMS");
+    }
+
+    @PublishResult(channelRef = "push")
+    public Mono<NotificationResult> dispatchPush(NotificationCommand cmd) {
+        return buildResult(cmd, "PUSH");
+    }
+
+    // ── Pattern 2 + @RacerPriority ────────────────────────────────────────────
+    //
+    // @RacerPriority reads the "priority" field from the returned result and routes
+    // to: racer:notify:push:priority:HIGH   (or NORMAL / LOW)
+    // Falls back to defaultLevel="HIGH" when the priority field is blank.
+    @PublishResult(channelRef = "push")
+    @RacerPriority(defaultLevel = "HIGH")
+    public Mono<NotificationResult> sendUrgentPush(NotificationCommand cmd) {
+        return Mono.just(NotificationResult.builder()
+                .id(cmd.getId())
+                .type("PUSH")
+                .recipient(cmd.getRecipient())
+                .status("DISPATCHED")
+                .priority("HIGH")
+                .dispatchedAt(Instant.now())
+                .build());
+    }
+
+    // ── Pattern 3: RacerTransaction ───────────────────────────────────────────
+    //
+    // Used for type=BROADCAST: publishes the same payload to all four channels
+    // in a single reactive chain (sequential Flux.concat).
+    // First publish failure aborts the remaining channels (fail-fast).
+    public Mono<Void> sendBroadcast(NotificationCommand cmd) {
+        NotificationResult result = NotificationResult.builder()
+                .id(cmd.getId())
+                .type("BROADCAST")
+                .recipient(cmd.getRecipient())
+                .status("DISPATCHED")
+                .dispatchedAt(Instant.now())
                 .build();
-        store.put(sku, item);
-        return Mono.just(item);
-        // ↑ @PublishResult intercepts this Mono, taps the emitted value, and
-        //   publishes it to racer:inventory:stock BEFORE forwarding to the caller.
+
+        return racerTransaction.execute(tx -> {
+            tx.publish("email", result);
+            tx.publish("sms",   result);
+            tx.publish("push",  result);
+            tx.publish("audit", result);   // record in audit trail too
+        }).then();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // UPDATE STOCK — @PublishResult + conditional low-stock alert
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── Entry point ───────────────────────────────────────────────────────────
 
-    /**
-     * Updates stock level. If quantity drops below 10, also publishes a LOW_STOCK_ALERT
-     * directly using the injected alertsPublisher (synchronous — waits for Redis).
-     */
-    @PublishResult(channelRef = "stock")   // sender and async inherited from racer.channels.stock.*
-    public Mono<InventoryItem> updateStock(String sku, int delta) {
-        return Mono.justOrEmpty(store.get(sku))
-                .switchIfEmpty(Mono.error(new IllegalArgumentException("SKU not found: " + sku)))
-                .flatMap(item -> {
-                    InventoryItem updated = InventoryItem.builder()
-                            .sku(item.getSku())
-                            .name(item.getName())
-                            .quantity(item.getQuantity() + delta)
-                            .location(item.getLocation())
-                            .eventType("STOCK_UPDATED")
-                            .correlationId(UUID.randomUUID().toString())
-                            .updatedAt(Instant.now())
-                            .build();
-                    store.put(sku, updated);
+    public Mono<NotificationResult> send(NotificationCommand cmd) {
+        Mono<NotificationResult> dispatch = switch (cmd.getType().toUpperCase()) {
+            case "EMAIL"     -> dispatchEmail(cmd);
+            case "SMS"       -> dispatchSms(cmd);
+            case "PUSH"      -> dispatchPush(cmd);
+            case "BROADCAST" -> sendBroadcast(cmd).thenReturn(
+                    NotificationResult.builder()
+                            .id(cmd.getId()).type("BROADCAST").status("DISPATCHED")
+                            .recipient(cmd.getRecipient()).dispatchedAt(Instant.now()).build());
+            default -> Mono.error(
+                    new IllegalArgumentException("Unknown type: " + cmd.getType()));
+        };
 
-                    Mono<InventoryItem> result = Mono.just(updated);
-
-                    // Sidecar alert when stock is critically low
-                    if (updated.getQuantity() < 10) {
-                        InventoryItem alert = InventoryItem.builder()
-                                .sku(sku)
-                                .name(updated.getName())
-                                .quantity(updated.getQuantity())
-                                .location(updated.getLocation())
-                                .eventType("LOW_STOCK_ALERT")
-                                .correlationId(updated.getCorrelationId())
-                                .updatedAt(Instant.now())
-                                .build();
-                        // publishAsync returns Mono<Long> (subscriber count); flatMap chains it
-                        return alertsPublisher.publishAsync(alert).then(result);
-                    }
-
-                    return result;
-                });
-        // ↑ @PublishResult publishes the final InventoryItem (STOCK_UPDATED) to racer:inventory:stock
+        // After dispatching, also publish to audit using the injected auditPublisher
+        return dispatch.flatMap(result ->
+                auditPublisher.publishAsync(result).thenReturn(result));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // GET (no publishing)
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── Helper ────────────────────────────────────────────────────────────────
 
-    public Mono<InventoryItem> getItem(String sku) {
-        return Mono.justOrEmpty(store.get(sku));
+    private Mono<NotificationResult> buildResult(NotificationCommand cmd, String type) {
+        return Mono.just(NotificationResult.builder()
+                .id(cmd.getId())
+                .type(type)
+                .recipient(cmd.getRecipient())
+                .status("DISPATCHED")
+                .priority(cmd.getPriority() != null ? cmd.getPriority() : "NORMAL")
+                .dispatchedAt(Instant.now())
+                .build());
     }
 }
 ```
 
 ---
 
-### Step 3.4 — Content-based event router
+## Part 5 — Content-Based Routing
 
-`@RacerRoute` lets you declaratively fan-out events to channel aliases based on a JSON
-field pattern. No routing code is required inside your message processors.
+`@RacerRoute` evaluates each incoming message against a list of field-matching rules
+and re-publishes it to the first matching channel alias — with no handler code inside
+the router class itself.
+
+`NotificationRouter` listens on `racer:notify:default` (the `racer.default-channel`)
+and fans out messages based on the `type` payload field.
 
 ```java
-// src/main/java/com/example/inventory/router/InventoryEventRouter.java
-package com.example.inventory.router;
+// src/main/java/com/example/notify/router/NotificationRouter.java
+package com.example.notify.router;
 
 import com.cheetah.racer.annotation.RacerRoute;
 import com.cheetah.racer.annotation.RacerRouteRule;
@@ -428,48 +568,144 @@ import com.cheetah.racer.annotation.RouteAction;
 import org.springframework.stereotype.Service;
 
 /**
- * Routes incoming messages on racer:inventory:events by their "eventType" field:
+ * Routes messages on racer:notify:default by their "type" payload field.
+ * Rules are evaluated top-to-bottom; the first match wins.
  *
- *   eventType = "STOCK_UPDATED"   →  racer:inventory:stock  (FORWARD — stock processors only)
- *   eventType = "LOW_STOCK.*"     →  racer:inventory:alerts (FORWARD_AND_PROCESS — fan-out:
- *                                    alerts channel + local audit handler)
- *   eventType = "ITEM_.*"         →  racer:inventory:audit  (FORWARD — audit only)
- *   eventType = anything else     →  dropped silently       (DROP — unknown events discarded)
+ * RouteAction options:
+ *   FORWARD              - re-publish to target alias; skip local @RacerListener handlers
+ *   FORWARD_AND_PROCESS  - re-publish AND also invoke local @RacerListener handlers
+ *   DROP                 - silently discard; nothing is forwarded
+ *   DROP_TO_DLQ          - send directly to the Dead Letter Queue (for poison messages)
  *
- * Rules are evaluated in declaration order. First match wins.
- * The annotated class acts as a config container — no methods needed.
+ * RouteMatchSource (default = PAYLOAD):
+ *   PAYLOAD  - match against a JSON field in the message payload
+ *   SENDER   - match against the message sender name
+ *   ID       - match against the message ID
  */
 @Service
 @RacerRoute({
-    @RacerRouteRule(field = "eventType", matches = "STOCK_UPDATED",
-                    to = "stock",   action = RouteAction.FORWARD),
-    @RacerRouteRule(field = "eventType", matches = "LOW_STOCK.*",
-                    to = "alerts",  action = RouteAction.FORWARD_AND_PROCESS),
-    @RacerRouteRule(field = "eventType", matches = "ITEM_.*",
-                    to = "audit",   action = RouteAction.FORWARD),
-    @RacerRouteRule(field = "eventType", matches = ".*",
-                    to = "",        action = RouteAction.DROP)
+    @RacerRouteRule(field = "type", matches = "EMAIL",
+                    to = "email",  action = RouteAction.FORWARD),
+    @RacerRouteRule(field = "type", matches = "SMS",
+                    to = "sms",    action = RouteAction.FORWARD),
+    @RacerRouteRule(field = "type", matches = "PUSH",
+                    to = "push",   action = RouteAction.FORWARD),
+    // BROADCAST: fan-out to email AND trigger local listeners
+    @RacerRouteRule(field = "type", matches = "BROADCAST",
+                    to = "email",  action = RouteAction.FORWARD_AND_PROCESS),
+    // Catch-all: discard anything unrecognised
+    @RacerRouteRule(field = "type", matches = ".*",
+                    to = "",       action = RouteAction.DROP)
 })
-public class InventoryEventRouter {
-    // No methods required — Racer's RacerRouterService reads the annotations at startup
+public class NotificationRouter {
+    // No methods required — RacerRouterService reads the annotations at startup
 }
 ```
 
-> **`action` defaults to `FORWARD`** — the original three-rule example works identically
-> without specifying `action`. The `DROP` catch-all above is an optional safety net that
-> silently discards messages with unrecognised event types rather than letting them fall
-> through to all listeners.
+> **First match wins.** Put more-specific patterns before general regex catch-alls.
+> Exact string literals like `"EMAIL"` are implicitly anchored; `".*"` is the wildcard.
 
 ---
 
-### Step 3.5 — In-process audit consumer
+## Part 6 — Message Interceptors
 
-Subscribe to the `audit` channel within the same application using `@RacerListener` to
-maintain a live audit log — no manual container setup required.
+`RacerMessageInterceptor` is the Racer equivalent of a servlet filter for incoming
+messages. Interceptors run **after** routing decisions and **before** the listener
+method is invoked. They are Spring beans auto-discovered by `RacerListenerRegistrar`.
+
+Use `@Order` to control execution order. An interceptor may:
+- Pass the message through unchanged (`Mono.just(message)`)
+- Mutate the message and pass the modified version through
+- Abort processing by returning `Mono.error()`, causing the message to be sent to the DLQ
+
+### Step 6.1 — `CorrelationInterceptor` (log + pass-through)
 
 ```java
-// src/main/java/com/example/inventory/service/InventoryAuditConsumer.java
-package com.example.inventory.service;
+// src/main/java/com/example/notify/interceptor/CorrelationInterceptor.java
+package com.example.notify.interceptor;
+
+import com.cheetah.racer.listener.InterceptorContext;
+import com.cheetah.racer.listener.RacerMessageInterceptor;
+import com.cheetah.racer.model.RacerMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+/**
+ * Runs first (@Order 10): logs correlation ID, channel, and target listener.
+ *
+ * ctx.listenerId() lets you filter by listener — for example, to only log for
+ * the email-worker: if (!"email-worker".equals(ctx.listenerId())) return Mono.just(message);
+ */
+@Component
+@Order(10)
+public class CorrelationInterceptor implements RacerMessageInterceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(CorrelationInterceptor.class);
+
+    @Override
+    public Mono<RacerMessage> intercept(RacerMessage message, InterceptorContext ctx) {
+        log.info("[INTERCEPT] id={} channel={} listener={}",
+                message.getId(), ctx.channel(), ctx.listenerId());
+        return Mono.just(message);   // pass through unchanged
+    }
+}
+```
+
+### Step 6.2 — `AuditInterceptor` (validate + abort)
+
+```java
+// src/main/java/com/example/notify/interceptor/AuditInterceptor.java
+package com.example.notify.interceptor;
+
+import com.cheetah.racer.listener.InterceptorContext;
+import com.cheetah.racer.listener.RacerMessageInterceptor;
+import com.cheetah.racer.model.RacerMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+/**
+ * Runs second (@Order 20): rejects messages with no sender.
+ *
+ * Returning Mono.error() aborts the dispatch chain. The listener method is NOT
+ * invoked. RacerListenerRegistrar catches the error and forwards to the DLQ.
+ */
+@Component
+@Order(20)
+public class AuditInterceptor implements RacerMessageInterceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(AuditInterceptor.class);
+
+    @Override
+    public Mono<RacerMessage> intercept(RacerMessage message, InterceptorContext ctx) {
+        if (message.getSender() != null && !message.getSender().isBlank()) {
+            log.debug("[AUDIT-FILTER] Accepted from sender='{}'", message.getSender());
+            return Mono.just(message);
+        }
+        return Mono.error(new IllegalStateException(
+                "Rejected: message id=" + message.getId() + " has no sender"));
+    }
+}
+```
+
+---
+
+## Part 7 — Consuming Messages
+
+### Step 7.1 — Plain listener: `AuditCollector`
+
+The simplest form. `@RacerListener` subscribes the method to the `audit` channel at
+startup. Racer handles subscription, JSON deserialization, exception-to-DLQ forwarding,
+and `racer.listener.processed` / `racer.listener.failed` Micrometer counters.
+
+```java
+// src/main/java/com/example/notify/worker/AuditCollector.java
+package com.example.notify.worker;
 
 import com.cheetah.racer.annotation.RacerListener;
 import com.cheetah.racer.model.RacerMessage;
@@ -482,836 +718,987 @@ import java.util.Collections;
 import java.util.List;
 
 @Component
-public class InventoryAuditConsumer {
+public class AuditCollector {
 
-    private static final Logger log = LoggerFactory.getLogger(InventoryAuditConsumer.class);
-
-    // In-memory audit log (replace with a persistent store in production)
-    private final List<String> auditLog = Collections.synchronizedList(new ArrayList<>());
+    private static final Logger log = LoggerFactory.getLogger(AuditCollector.class);
+    private final List<String> entries = Collections.synchronizedList(new ArrayList<>());
 
     /**
-     * @RacerListener binds this method to the 'audit' alias at startup.
-     * RacerListenerRegistrar (BeanPostProcessor) handles subscription,
-     * deserialization, DLQ forwarding, and metrics — no boilerplate needed.
+     * Supported parameter types:
+     *   RacerMessage   - full envelope (id, channel, payload, sender, timestamp, priority)
+     *   String         - raw JSON payload string
+     *   Any POJO type  - payload auto-deserialized via Jackson into that type
+     *
+     * Supported return types:
+     *   void / Void    - fire-and-forget
+     *   Mono<Void>     - subscribed by Racer; errors forwarded to DLQ
      */
-    @RacerListener(channelRef = "audit", id = "audit-consumer")
+    @RacerListener(channelRef = "audit", id = "audit-collector")
     public void onAuditEvent(RacerMessage message) {
         String entry = "[" + message.getTimestamp() + "] "
-                + message.getSender() + " → " + message.getPayload();
-        auditLog.add(entry);
+                + message.getSender() + " | id=" + message.getId()
+                + " | " + message.getPayload();
+        entries.add(entry);
         log.info("AUDIT: {}", entry);
     }
 
-    /** Returns all recorded audit entries (newest last). */
-    public List<String> getAuditLog() {
-        return Collections.unmodifiableList(auditLog);
+    public List<String> getEntries() {
+        return Collections.unmodifiableList(entries);
     }
 }
 ```
 
-> `@RacerListener` also integrates with metrics (`racer.listener.processed`,
-> `racer.listener.failed`) and the DLQ — exceptions thrown inside `onAuditEvent` are
-> automatically forwarded to the Dead Letter Queue.
-
 ---
 
-### Step 3.6 — REST controller
+### Step 7.2 — Dedup listener: `EmailWorker`
+
+`dedup = true` causes Racer to call `RacerDedupService.checkAndMarkProcessed()` before
+invoking the listener. If the message ID was seen within `racer.dedup.ttl-seconds`, the
+message is silently dropped and `racer.dedup.duplicates` is incremented.
 
 ```java
-// src/main/java/com/example/inventory/controller/InventoryController.java
-package com.example.inventory.controller;
+// src/main/java/com/example/notify/worker/EmailWorker.java
+package com.example.notify.worker;
 
-import com.example.inventory.model.InventoryItem;
-import com.example.inventory.service.InventoryAuditConsumer;
-import com.example.inventory.service.InventoryService;
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
+import com.cheetah.racer.annotation.RacerListener;
+import com.cheetah.racer.model.RacerMessage;
+import com.example.notify.model.NotificationResult;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
 
-import java.util.List;
-import java.util.Map;
+@Component
+public class EmailWorker {
 
-@RestController
-@RequestMapping("/api/inventory")
-public class InventoryController {
+    private static final Logger log = LoggerFactory.getLogger(EmailWorker.class);
+    private final ObjectMapper objectMapper;
 
-    private final InventoryService inventoryService;
-    private final InventoryAuditConsumer auditConsumer;
-
-    public InventoryController(InventoryService inventoryService,
-                               InventoryAuditConsumer auditConsumer) {
-        this.inventoryService = inventoryService;
-        this.auditConsumer = auditConsumer;
-    }
-
-    /** Create a new inventory item — publishes ITEM_CREATED to racer:inventory:stock */
-    @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    public Mono<InventoryItem> create(@RequestBody Map<String, Object> body) {
-        return inventoryService.createItem(
-                (String) body.get("sku"),
-                (String) body.get("name"),
-                ((Number) body.get("quantity")).intValue(),
-                (String) body.getOrDefault("location", "WAREHOUSE-A")
-        );
-    }
-
-    /** Get a single item */
-    @GetMapping("/{sku}")
-    public Mono<InventoryItem> get(@PathVariable String sku) {
-        return inventoryService.getItem(sku)
-                .switchIfEmpty(Mono.error(
-                        new ResponseStatusException(HttpStatus.NOT_FOUND, "SKU not found: " + sku)));
+    public EmailWorker(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
     }
 
     /**
-     * Adjust stock level (positive = restock, negative = consume).
-     * Publishes STOCK_UPDATED to racer:inventory:stock.
-     * If new quantity < 10, also publishes LOW_STOCK_ALERT to racer:inventory:alerts.
+     * dedup = true:
+     *   1. Racer calls RacerDedupService.checkAndMarkProcessed(message.getId())
+     *   2. New ID: Redis SET NX EX sets the key for ttl-seconds; method is invoked
+     *   3. Seen ID: message is silently dropped; method is NOT invoked
+     *
+     * Requires racer.dedup.enabled=true (already set in application.properties).
      */
-    @PatchMapping("/{sku}/stock")
-    public Mono<InventoryItem> adjustStock(@PathVariable String sku,
-                                           @RequestBody Map<String, Object> body) {
-        int delta = ((Number) body.get("delta")).intValue();
-        return inventoryService.updateStock(sku, delta)
-                .onErrorMap(IllegalArgumentException.class,
-                        e -> new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage()));
-    }
-
-    /** Return the live audit log captured from racer:inventory:audit */
-    @GetMapping("/audit")
-    public List<String> auditLog() {
-        return auditConsumer.getAuditLog();
+    @RacerListener(channelRef = "email", id = "email-worker", dedup = true)
+    public void onEmailNotification(RacerMessage message) {
+        NotificationResult result = objectMapper.convertValue(
+                message.getPayload(), NotificationResult.class);
+        log.info("[EMAIL] Sending to {} | id={}", result.getRecipient(), result.getId());
+        // Production: call SMTP / SES / SendGrid here
     }
 }
 ```
 
 ---
 
-## Part 4 — Build and Run
+### Step 7.3 — Concurrent listener: `PushWorker`
 
-### Step 4.1 — Build
+`mode = ConcurrencyMode.CONCURRENT` with `concurrency = 4` allows up to 4 push
+notifications to be in-flight simultaneously on the Racer thread pool. The `Mono<Void>`
+return type lets Racer subscribe to the reactive result and catch errors.
+
+```java
+// src/main/java/com/example/notify/worker/PushWorker.java
+package com.example.notify.worker;
+
+import com.cheetah.racer.annotation.ConcurrencyMode;
+import com.cheetah.racer.annotation.RacerListener;
+import com.cheetah.racer.model.RacerMessage;
+import com.example.notify.model.NotificationResult;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+@Component
+public class PushWorker {
+
+    private static final Logger log = LoggerFactory.getLogger(PushWorker.class);
+    private final ObjectMapper objectMapper;
+
+    public PushWorker(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * ConcurrencyMode.SEQUENTIAL (default) — one message at a time.
+     * ConcurrencyMode.CONCURRENT, concurrency=N — up to N messages in parallel.
+     * ConcurrencyMode.AUTO — Racer's AdaptiveConcurrencyTuner adjusts N at runtime
+     *   based on thread-pool queue saturation (requires racer.backpressure.enabled=true).
+     */
+    @RacerListener(channelRef = "push", id = "push-worker",
+                   mode = ConcurrencyMode.CONCURRENT, concurrency = 4)
+    public Mono<Void> onPushNotification(RacerMessage message) {
+        NotificationResult result = objectMapper.convertValue(
+                message.getPayload(), NotificationResult.class);
+        log.info("[PUSH] Dispatching to {} | id={}", result.getRecipient(), result.getId());
+        // Production: call FCM / APNs / Web Push API here
+        return Mono.empty();
+    }
+}
+```
+
+---
+
+### Step 7.4 — Failure simulation: `SmsWorker`
+
+`SmsWorker` deliberately throws when the notification status is `"FAILED"`. This
+demonstrates the automatic DLQ forwarding path and circuit breaker state transitions.
+
+```java
+// src/main/java/com/example/notify/worker/SmsWorker.java
+package com.example.notify.worker;
+
+import com.cheetah.racer.annotation.RacerListener;
+import com.cheetah.racer.model.RacerMessage;
+import com.example.notify.model.NotificationResult;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class SmsWorker {
+
+    private static final Logger log = LoggerFactory.getLogger(SmsWorker.class);
+    private final ObjectMapper objectMapper;
+
+    public SmsWorker(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Failure flow when status = "FAILED":
+     *   1. RuntimeException is thrown
+     *   2. RacerListenerRegistrar catches it
+     *   3. DeadLetterQueueService.enqueue() pushes the message to racer:dlq
+     *   4. racer.listener.failed counter is incremented
+     *   5. RacerCircuitBreaker records the failure in its sliding window
+     *   6. After 3/5 calls fail (60% >= 50% threshold) the circuit OPENS
+     *   7. Subsequent calls are rejected without invoking this method
+     *   8. After 10 s the circuit moves to HALF_OPEN; 2 probe calls; then CLOSED
+     */
+    @RacerListener(channelRef = "sms", id = "sms-worker")
+    public void onSmsNotification(RacerMessage message) {
+        NotificationResult result = objectMapper.convertValue(
+                message.getPayload(), NotificationResult.class);
+
+        if ("FAILED".equalsIgnoreCase(result.getStatus())) {
+            log.error("[SMS] Simulated gateway failure for id={}", result.getId());
+            throw new RuntimeException("SMS gateway timeout for id=" + result.getId());
+        }
+
+        log.info("[SMS] Sending to {} | id={}", result.getRecipient(), result.getId());
+        // Production: call Twilio / AWS SNS here
+    }
+}
+```
+
+---
+
+## Part 8 — Request-Reply
+
+Racer supports non-blocking request-reply over Redis Pub/Sub. The caller publishes a
+`RacerRequest` with a unique correlation ID; the responder receives it, runs the
+handler, and publishes a `RacerReply` back. The caller's `Mono<T>` resolves when the
+correlated reply arrives within the configured timeout.
+
+### Step 8.1 — Client interface (`@RacerClient` + `@RacerRequestReply`)
+
+```java
+// src/main/java/com/example/notify/requestreply/NotificationStatusClient.java
+package com.example.notify.requestreply;
+
+import com.cheetah.racer.annotation.RacerClient;
+import com.cheetah.racer.annotation.RacerRequestReply;
+import reactor.core.publisher.Mono;
+
+/**
+ * Racer generates a JDK dynamic proxy for this interface at startup
+ * (activated by @EnableRacerClients on NotifyApplication).
+ *
+ * Inject it as any Spring bean and call it reactively:
+ *   statusClient.checkStatus("notif-123").subscribe(reply -> log.info(reply));
+ */
+@RacerClient
+public interface NotificationStatusClient {
+
+    /**
+     * 1. Serializes notificationId as the RacerRequest payload
+     * 2. Publishes to racer:notify:requests with a random correlationId
+     * 3. Subscribes to an ephemeral correlation reply channel
+     * 4. Resolves when StatusResponder publishes a matching RacerReply
+     * 5. Times out with RacerRequestReplyTimeoutException after 5 s
+     */
+    @RacerRequestReply(channelRef = "requests", timeout = "5s")
+    Mono<String> checkStatus(String notificationId);
+}
+```
+
+### Step 8.2 — Responder (`@RacerResponder`)
+
+```java
+// src/main/java/com/example/notify/requestreply/StatusResponder.java
+package com.example.notify.requestreply;
+
+import com.cheetah.racer.annotation.RacerResponder;
+import com.cheetah.racer.model.RacerRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class StatusResponder {
+
+    private static final Logger log = LoggerFactory.getLogger(StatusResponder.class);
+
+    /**
+     * Subscribed to racer:notify:requests at startup.
+     *
+     * Supported parameter types (same as @RacerListener):
+     *   RacerRequest — full envelope; getPayload() returns the deserialized Object
+     *   String       — raw payload string
+     *   Any POJO     — payload deserialized into that type via Jackson
+     *
+     * Supported return types:
+     *   String / any POJO — serialized to JSON and sent back as RacerReply payload
+     *   Mono<String> / Mono<T> — unwrapped and used as the reply payload
+     */
+    @RacerResponder(channelRef = "requests")
+    public String handleStatusRequest(RacerRequest request) {
+        String notificationId = (String) request.getPayload();
+        log.info("[RESPONDER] Status query for id={} corrId={}",
+                notificationId, request.getCorrelationId());
+
+        // Production: look up actual delivery status from DB / cache
+        return "{ "id": "" + notificationId + "", "status": "DELIVERED" }";
+    }
+}
+```
+
+---
+
+## Part 9 — Dead Letter Queue
+
+Every exception thrown inside a `@RacerListener`, `@RacerResponder`, or the interceptor
+chain is automatically forwarded to the DLQ (`racer:dlq` Redis list) via
+`DeadLetterQueueService.enqueue()`. No boilerplate is needed.
+
+### Step 9.1 — DLQ controller
+
+```java
+// src/main/java/com/example/notify/controller/DlqApiController.java
+package com.example.notify.controller;
+
+import com.cheetah.racer.model.DeadLetterMessage;
+import com.cheetah.racer.service.DeadLetterQueueService;
+import com.cheetah.racer.service.DlqReprocessorService;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+/**
+ * Custom DLQ REST API that shows how to use DeadLetterQueueService and
+ * DlqReprocessorService programmatically.
+ *
+ * Note: racer.web.dlq-enabled=true already exposes /api/dlq/** from Racer.
+ * This controller at /api/notify/dlq demonstrates the same API wired directly.
+ */
+@RestController
+@RequestMapping("/api/notify/dlq")
+public class DlqApiController {
+
+    private final DeadLetterQueueService dlqService;
+    private final DlqReprocessorService  dlqReprocessor;
+
+    public DlqApiController(DeadLetterQueueService dlqService,
+                             DlqReprocessorService dlqReprocessor) {
+        this.dlqService     = dlqService;
+        this.dlqReprocessor = dlqReprocessor;
+    }
+
+    /**
+     * Returns all messages currently in the DLQ without removing them.
+     * Each DeadLetterMessage contains: originalMessageId, channel, sender,
+     * payload, errorMessage, failedAt timestamp.
+     */
+    @GetMapping
+    public Flux<DeadLetterMessage> peek() {
+        return dlqService.peekAll();
+    }
+
+    /** Returns the current DLQ depth. */
+    @GetMapping("/size")
+    public Mono<Long> size() {
+        return dlqService.size();
+    }
+
+    /**
+     * Pops the oldest DLQ entry and re-publishes its payload to the original channel.
+     * DlqReprocessorService deserializes it and publishes back through the channel
+     * registry — triggering the full interceptor and listener chain again.
+     */
+    @PostMapping("/reprocess")
+    public Mono<String> reprocess() {
+        return dlqReprocessor.reprocessNext()
+                .map(msg -> "Reprocessed: " + msg.getOriginalMessageId())
+                .defaultIfEmpty("DLQ is empty");
+    }
+}
+```
+
+---
+
+## Part 10 — Batch Publishing with `RacerTransaction`
+
+`RacerTransaction.execute()` publishes to multiple channel aliases in a single reactive
+chain (sequential `Flux.concat`). If any publish fails, subsequent channels in the
+batch are skipped (fail-fast).
+
+The broadcast flow in `sendBroadcast()` already demonstrates this. Here is the key API:
+
+```java
+// Inject as a normal Spring bean
+@Autowired
+private RacerTransaction racerTransaction;
+
+// Publish to four channels as a single reactive chain:
+racerTransaction.execute(tx -> {
+    tx.publish("email",  notificationResult);
+    tx.publish("sms",    notificationResult);
+    tx.publish("push",   notificationResult);
+    tx.publish("audit",  notificationResult);
+}).subscribe(
+    counts -> log.info("Batch complete. Subscriber counts: {}", counts),
+    error  -> log.error("Batch failed: {}", error.getMessage())
+);
+```
+
+> `execute()` returns `Mono<List<Long>>` — one `Long` per channel representing the
+> Pub/Sub subscriber count. In durable mode (`XADD`) the value is `0` because stream
+> consumers are not counted as Pub/Sub subscribers.
+
+---
+
+## Part 11 — Priority Channels
+
+When `racer.priority.enabled=true` and a channel alias is listed under
+`racer.priority.channels`, Racer creates priority sub-channels automatically:
+
+```
+racer:notify:push:priority:HIGH
+racer:notify:push:priority:NORMAL
+racer:notify:push:priority:LOW
+```
+
+`@RacerPriority` paired with `@PublishResult` reads the `priority` field from the
+returned object and publishes to the matching sub-channel (already wired in
+`sendUrgentPush()`).
+
+### Subscribe to a specific priority sub-channel
+
+```java
+/**
+ * Subscribe directly to the HIGH priority sub-channel.
+ * racer.priority.strategy=strict means HIGH is fully drained before NORMAL/LOW.
+ *
+ * Use channel = "..." (the raw Redis key) for sub-channels because they are not
+ * registered as named channel aliases.
+ */
+@RacerListener(channel = "racer:notify:push:priority:HIGH", id = "push-high-worker")
+public void onHighPriorityPush(RacerMessage message) {
+    log.info("[PUSH-HIGH] Urgent push: id={}", message.getId());
+}
+```
+
+Add this inside `PushWorker` (or in a dedicated `PriorityPushWorker` class).
+
+---
+
+## Part 12 — Circuit Breaker
+
+The circuit breaker is configured globally in `application.properties` (already done
+in Step 2.3). With `racer.circuit-breaker.enabled=true`, every `@RacerListener`
+dispatch is wrapped in a `RacerCircuitBreaker` named after the listener ID.
+
+```
+State machine for listener "sms-worker":
+
+CLOSED ─── 3 of 5 calls fail (60% >= 50% threshold) ───► OPEN
+  ▲                                                          │
+  │                    10 s wait elapses                     │
+  │                          ▼                               │
+  └──── both probes succeed ─── HALF_OPEN ◄──────────────────┘
+                               (2 probe calls allowed)
+```
+
+State transitions appear in application logs:
+
+```
+[CIRCUIT-BREAKER] 'sms-worker' → OPEN (failure rate 60.00% >= threshold 50.00%)
+[CIRCUIT-BREAKER] 'sms-worker' → HALF_OPEN (wait elapsed)
+[CIRCUIT-BREAKER] 'sms-worker' → CLOSED (half-open probes all succeeded)
+```
+
+When the circuit is OPEN, messages are rejected without invoking `SmsWorker`:
+
+```
+[CIRCUIT-BREAKER] 'sms-worker' call rejected — circuit is OPEN
+```
+
+Observe transitions in practice via Exercise 7 in Part 16.
+
+---
+
+## Part 13 — Durable Delivery
+
+By default `@RacerListener` uses Redis Pub/Sub: messages published while the consumer
+is offline are permanently lost. Switch to durable delivery (Redis Streams + consumer
+groups) by editing `application.properties` — **no code change required**.
+
+### Enable durable email
+
+Uncomment in `application.properties`:
+
+```properties
+racer.channels.email.durable=true
+racer.channels.email.durable-group=email-consumer-group
+racer.channels.email.stream-key=racer:notify:email:stream
+```
+
+After restarting:
+
+- `@PublishResult(channelRef="email")` uses `XADD` instead of `PUBLISH`
+- `EmailWorker`'s `@RacerListener(channelRef="email")` polls via `XREADGROUP` + `XACK`
+- Messages published while `EmailWorker` was offline are replayed on reconnect
+
+`EmailWorker` code is **completely unchanged**.
+
+| | `durable=false` (default) | `durable=true` |
+|---|---|---|
+| Transport | Redis Pub/Sub (`PUBLISH`) | Redis Streams (`XADD`) |
+| Consumer protocol | `receive(ChannelTopic)` | `XREADGROUP` + consumer group |
+| Messages missed while offline | **Lost** | **Replayed** |
+| Code change required | — | None |
+| Properties to add | — | `durable`, `durable-group`, `stream-key` |
+
+---
+
+## Part 14 — REST Controller
+
+```java
+// src/main/java/com/example/notify/controller/NotifyController.java
+package com.example.notify.controller;
+
+import com.example.notify.model.NotificationCommand;
+import com.example.notify.model.NotificationResult;
+import com.example.notify.requestreply.NotificationStatusClient;
+import com.example.notify.service.NotificationService;
+import com.example.notify.worker.AuditCollector;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/notifications")
+public class NotifyController {
+
+    private final NotificationService      notificationService;
+    private final NotificationStatusClient statusClient;
+    private final AuditCollector           auditCollector;
+
+    public NotifyController(NotificationService notificationService,
+                             NotificationStatusClient statusClient,
+                             AuditCollector auditCollector) {
+        this.notificationService = notificationService;
+        this.statusClient        = statusClient;
+        this.auditCollector      = auditCollector;
+    }
+
+    /**
+     * Send a single notification.
+     *   type     : EMAIL | SMS | PUSH | BROADCAST
+     *   priority : HIGH | NORMAL | LOW (optional, defaults to NORMAL)
+     *   id       : optional idempotency key; a UUID is generated if absent
+     */
+    @PostMapping
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public Mono<NotificationResult> send(@RequestBody NotificationCommand cmd) {
+        if (cmd.getId() == null || cmd.getId().isBlank()) {
+            cmd.setId(UUID.randomUUID().toString());
+        }
+        return notificationService.send(cmd);
+    }
+
+    /**
+     * Query notification status via request-reply.
+     * Publishes a RacerRequest, waits up to 5 s for a correlated RacerReply.
+     */
+    @GetMapping("/{id}/status")
+    public Mono<String> status(@PathVariable String id) {
+        return statusClient.checkStatus(id);
+    }
+
+    /** Returns all entries from the in-process audit log. */
+    @GetMapping("/audit")
+    public List<String> audit() {
+        return auditCollector.getEntries();
+    }
+}
+```
+
+---
+
+## Part 15 — Build and Run
+
+### Step 15.1 — Build
 
 ```bash
-cd inventory-service
+cd notify-hub
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)   # macOS
 mvn clean package -DskipTests
 ```
 
-Expected output:
+Expected:
+
 ```
 [INFO] BUILD SUCCESS
-[INFO] inventory-service 1.0.0-SNAPSHOT
+[INFO] notify-hub 1.0.0-SNAPSHOT
 ```
 
-### Step 4.2 — Run
+### Step 15.2 — Run
 
 ```bash
-java -jar target/inventory-service-1.0.0-SNAPSHOT.jar
+java -jar target/notify-hub-1.0.0-SNAPSHOT.jar
 ```
 
-Or with Maven directly:
+Or with Maven:
+
 ```bash
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 mvn spring-boot:run
 ```
 
-Startup log should contain:
+Startup log should include:
+
 ```
-Started InventoryApplication in X.XXX seconds
-[racer] Default channel registered: 'racer:inventory:events'
-[racer] Channel 'stock'   registered → 'racer:inventory:stock'
-[racer] Channel 'alerts'  registered → 'racer:inventory:alerts'
-[racer] Channel 'audit'   registered → 'racer:inventory:audit'
+Started NotifyApplication in X.XXX seconds
+[racer] Default channel registered: 'racer:notify:default'
+[racer] Channel 'email'    registered -> 'racer:notify:email'
+[racer] Channel 'sms'      registered -> 'racer:notify:sms'
+[racer] Channel 'push'     registered -> 'racer:notify:push'
+[racer] Channel 'audit'    registered -> 'racer:notify:audit'
+[racer] Channel 'requests' registered -> 'racer:notify:requests'
+[racer] Registered listener 'audit-collector' -> racer:notify:audit
+[racer] Registered listener 'email-worker'    -> racer:notify:email (dedup)
+[racer] Registered listener 'push-worker'     -> racer:notify:push  (concurrent/4)
+[racer] Registered listener 'sms-worker'      -> racer:notify:sms
+[racer] Registered responder on racer:notify:requests
 ```
 
 ---
 
-## Part 5 — Exercises
+## Part 16 — Exercises
 
-Work through these in order; each builds on the previous one.
+Work through these sequentially. Each exercise demonstrates a distinct Racer feature.
 
 ---
 
-### Exercise 1 — Create an item
+### Exercise 1 — Send an email notification (`@PublishResult`)
 
 ```bash
-curl -s -X POST http://localhost:8090/api/inventory \
+curl -s -X POST http://localhost:8090/api/notifications \
   -H "Content-Type: application/json" \
-  -d '{"sku":"WIDGET-001","name":"Blue Widget","quantity":50,"location":"SHELF-B3"}' | jq
+  -d '{"type":"EMAIL","recipient":"alice@example.com","subject":"Welcome","body":"Hello Alice"}' | jq
 ```
 
-Expected response:
+Application log sequence:
+
+```
+[INTERCEPT]    id=<uuid> channel=racer:notify:email listener=email-worker
+[AUDIT-FILTER] Accepted from sender='notify-hub'
+[EMAIL]        Sending to alice@example.com | id=<uuid>
+AUDIT:         ... | payload={...}
+```
+
+**What Racer did:**
+1. `dispatchEmail()` returned a `Mono<NotificationResult>`
+2. `@PublishResult` AOP tapped the pipeline and published the result to `racer:notify:email`
+3. Both interceptors ran before `EmailWorker.onEmailNotification()`
+4. `auditPublisher.publishAsync()` also published to `racer:notify:audit`
+5. `AuditCollector.onAuditEvent()` appended to the in-memory log
+
+---
+
+### Exercise 2 — Deduplication (`EmailWorker`, `dedup = true`)
+
+Submit the **same notification ID** twice within 60 seconds:
+
+```bash
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"id":"dedup-test-001","type":"EMAIL","recipient":"bob@example.com","body":"First"}' | jq
+
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"id":"dedup-test-001","type":"EMAIL","recipient":"bob@example.com","body":"First"}' | jq
+```
+
+`EmailWorker` logs show exactly **one** entry. The second message is dropped by Redis
+`SET NX EX`. Verify:
+
+```bash
+redis-cli TTL racer:dedup:dedup-test-001   # remaining seconds until the dedup key expires
+```
+
+---
+
+### Exercise 3 — Concurrent push notifications (`PushWorker`, `mode=CONCURRENT`)
+
+Send 10 push notifications in parallel:
+
+```bash
+for i in $(seq 1 10); do
+  curl -s -X POST http://localhost:8090/api/notifications \
+    -H "Content-Type: application/json" \
+    -d "{\"type\":\"PUSH\",\"recipient\":\"device-$i\",\"body\":\"Msg $i\"}" &
+done
+wait
+```
+
+The log shows 4 concurrent entries processing simultaneously (thread names like
+`racer-worker-1` through `racer-worker-4`), rather than sequentially.
+
+---
+
+### Exercise 4 — Broadcast via `RacerTransaction`
+
+```bash
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"type":"BROADCAST","recipient":"everyone","subject":"Sale","body":"50% off today!"}' | jq
+```
+
+All workers fire in sequence. To observe the four channel messages arrive in Redis
+simultaneously, first subscribe to all channels:
+
+```bash
+redis-cli PSUBSCRIBE "racer:notify:*"
+# Then send the broadcast in another terminal
+```
+
+---
+
+### Exercise 5 — Request-Reply (status check)
+
+```bash
+# Send a notification with a known ID:
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"id":"rr-test-42","type":"EMAIL","recipient":"carol@example.com","body":"Test"}' | jq
+
+# Query its status via request-reply:
+curl -s http://localhost:8090/api/notifications/rr-test-42/status
+```
+
+Expected:
+
 ```json
-{
-  "sku":           "WIDGET-001",
-  "name":          "Blue Widget",
-  "quantity":      50,
-  "location":      "SHELF-B3",
-  "eventType":     "ITEM_CREATED",
-  "correlationId": "...",
-  "updatedAt":     "2026-03-01T12:00:00Z"
-}
+{ "id": "rr-test-42", "status": "DELIVERED" }
 ```
 
-What happened in the background:
-
-1. `InventoryService.createItem()` returned the `InventoryItem` mono.
-2. The `@PublishResult` AOP interceptor tapped the reactive pipeline and published the
-   serialized item to `racer:inventory:stock`.
-3. The `InventoryEventRouter` (if a consumer is running on `racer:inventory:events`)
-   would route an `ITEM_CREATED` event to the `audit` channel alias.
-4. `InventoryAuditConsumer` would append it to the in-memory audit log.
-
----
-
-### Exercise 2 — Read the item back
-
-```bash
-curl -s http://localhost:8090/api/inventory/WIDGET-001 | jq
+Round-trip path:
+```
+REST -> NotificationStatusClient.checkStatus()
+     -> RacerRequest published to racer:notify:requests
+     -> StatusResponder.handleStatusRequest()
+     -> RacerReply to ephemeral correlation channel
+     -> Mono<String> resolves in the caller
 ```
 
 ---
 
-### Exercise 3 — Restock (normal update)
+### Exercise 6 — Trigger DLQ via SMS failure
 
 ```bash
-curl -s -X PATCH http://localhost:8090/api/inventory/WIDGET-001/stock \
+curl -s -X POST http://localhost:8090/api/notifications \
   -H "Content-Type: application/json" \
-  -d '{"delta":20}' | jq
+  -d '{"type":"SMS","recipient":"+1555000001","body":"Test","status":"FAILED"}' | jq
 ```
 
-The `STOCK_UPDATED` event is published to `racer:inventory:stock`. Quantity is now 70 —
-no alert triggered.
+Log:
 
----
+```
+[SMS]  Simulated gateway failure for id=...
+[DLQ]  Enqueuing failed message id=... error='SMS gateway timeout...'
+```
 
-### Exercise 4 — Drain stock below alert threshold
+Inspect the DLQ:
 
 ```bash
-curl -s -X PATCH http://localhost:8090/api/inventory/WIDGET-001/stock \
-  -H "Content-Type: application/json" \
-  -d '{"delta":-65}' | jq
+curl -s http://localhost:8090/api/notify/dlq | jq
+curl -s http://localhost:8090/api/dlq | jq          # built-in Racer endpoint
+curl -s http://localhost:8090/api/notify/dlq/size
 ```
 
-Quantity drops to 5. Watch the application logs — you should see **two** Redis publishes:
-
-```
-[racer] publishing to racer:inventory:stock   ← @PublishResult (STOCK_UPDATED)
-[racer] publishing to racer:inventory:alerts  ← alertsPublisher.publishAsync (LOW_STOCK_ALERT)
-```
-
-To observe the raw messages in Redis:
+Reprocess:
 
 ```bash
-redis-cli SUBSCRIBE racer:inventory:alerts
-# (leave this running, then run the PATCH above in another terminal)
+curl -s -X POST http://localhost:8090/api/notify/dlq/reprocess
 ```
 
 ---
 
-### Exercise 5 — Inspect the audit log
+### Exercise 7 — Trip the circuit breaker
 
-```bash
-curl -s http://localhost:8090/api/inventory/audit | jq
-```
+Send 3 failing SMS notifications in quick succession (5-call window, 50% threshold):
 
-You should see entries for every event that was routed through `racer:inventory:audit`.
-
----
-
-### Exercise 6 — Watch activity in Redis directly
-
-Open two terminals:
-
-**Terminal X** — subscribe to all inventory channels:
-```bash
-redis-cli PSUBSCRIBE "racer:inventory:*"
-```
-
-**Terminal Y** — run a batch of creates and updates:
 ```bash
 for i in 1 2 3; do
-  curl -s -X POST http://localhost:8090/api/inventory \
+  curl -s -X POST http://localhost:8090/api/notifications \
     -H "Content-Type: application/json" \
-    -d "{\"sku\":\"SKU-$i\",\"name\":\"Item $i\",\"quantity\":$((i * 5))}" > /dev/null
+    -d "{\"type\":\"SMS\",\"recipient\":\"+155500000$i\",\"body\":\"Fail\",\"status\":\"FAILED\"}"
 done
 ```
 
-Terminal X will show every message as it arrives on each channel.
+The third failure raises the failure rate to 60%. Log:
+
+```
+[CIRCUIT-BREAKER] 'sms-worker' -> OPEN (failure rate 60.00% >= threshold 50.00%)
+```
+
+Now send a normal SMS — it is **rejected** (circuit is OPEN):
+
+```bash
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"type":"SMS","recipient":"+1555999999","body":"Are you there?"}' | jq
+```
+
+Wait 10 seconds, then send a recovery probe:
+
+```bash
+sleep 10
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"type":"SMS","recipient":"+1555999999","body":"Recovery probe 1"}' | jq
+```
+
+Log: `[CIRCUIT-BREAKER] 'sms-worker' -> HALF_OPEN (wait elapsed)`
+
+After 2 successful probes: `[CIRCUIT-BREAKER] 'sms-worker' -> CLOSED`
 
 ---
 
-### Exercise 7 — Verify metrics
+### Exercise 8 — Observe interceptor chain
 
 ```bash
-curl -s http://localhost:8090/actuator/metrics | jq '.names | map(select(startswith("racer")))'
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"type":"PUSH","recipient":"device-XYZ","body":"Test intercept"}' | jq
 ```
 
-Individual metric:
+Log (enable DEBUG on `com.example.notify.interceptor` to see AuditInterceptor):
+
+```
+[INTERCEPT]    id=... channel=racer:notify:push listener=push-worker    <- @Order(10)
+[AUDIT-FILTER] Accepted from sender='notify-hub'                        <- @Order(20)
+[PUSH]         Dispatching to device-XYZ | id=...                       <- PushWorker
+```
+
+---
+
+### Exercise 9 — Inspect audit trail
+
 ```bash
+curl -s http://localhost:8090/api/notifications/audit | jq
+```
+
+Every notification dispatched through any channel appears here, captured in-process by
+`AuditCollector`.
+
+---
+
+### Exercise 10 — Priority sub-channel
+
+```bash
+curl -s -X POST http://localhost:8090/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"type":"PUSH","recipient":"vip-device","body":"Breaking news","priority":"HIGH"}' | jq
+```
+
+Verify the priority sub-channel key in Redis:
+
+```bash
+redis-cli SUBSCRIBE "racer:notify:push:priority:HIGH"
+# Then send from another terminal and watch it arrive
+```
+
+---
+
+### Exercise 11 — Actuator metrics
+
+```bash
+# All Racer-scoped metric names:
+curl -s http://localhost:8090/actuator/metrics \
+  | jq '.names | map(select(startswith("racer")))'
+
+# Published message count (tagged by channel):
 curl -s "http://localhost:8090/actuator/metrics/racer.messages.published" | jq
-```
 
-Prometheus scrape endpoint (if you have Prometheus running):
-```bash
-curl -s http://localhost:8090/actuator/prometheus | grep racer
+# Listener processed / failed (tagged by listenerId):
+curl -s "http://localhost:8090/actuator/metrics/racer.listener.processed" | jq
+curl -s "http://localhost:8090/actuator/metrics/racer.listener.failed"    | jq
+
+# Deduplication drop count:
+curl -s "http://localhost:8090/actuator/metrics/racer.dedup.duplicates" | jq
+
+# DLQ depth:
+curl -s "http://localhost:8090/actuator/metrics/racer.dlq.size" | jq
+
+# All registered channel aliases:
+curl -s http://localhost:8090/api/channels | jq
 ```
 
 ---
 
-## Part 6 — How it all fits together
+### Exercise 12 — Enable durable email delivery
+
+1. Stop the application (`Ctrl+C`).
+2. Uncomment the three durable properties in `application.properties`:
+   ```properties
+   racer.channels.email.durable=true
+   racer.channels.email.durable-group=email-consumer-group
+   racer.channels.email.stream-key=racer:notify:email:stream
+   ```
+3. Restart: `mvn spring-boot:run`
+4. Send an email notification and check the stream was written to:
+   ```bash
+   redis-cli XLEN racer:notify:email:stream
+   redis-cli XRANGE racer:notify:email:stream - +
+   ```
+5. Stop the app, add more entries to the stream directly, then restart — `EmailWorker`
+   replays the missed entries without any code changes.
+
+---
+
+## Part 17 — Architecture & Capability Map
 
 ```
 HTTP Request
-    │
-    ▼
-InventoryController
-    │
-    ▼
-InventoryService.createItem()  ──── @PublishResult ──►  racer:inventory:stock
-    │                                                          │
-    ▼ (if qty < 10)                                            │
-alertsPublisher.publishAsync()  ───────────────────►  racer:inventory:alerts
-                                                               │
-                                              @RacerListener(channelRef="audit")
-                                              (InventoryAuditConsumer.onAuditEvent)
-                                              appends to in-memory audit log
-                                                               │
-                                              GET /api/inventory/audit
+     |
+     v
+NotifyController
+     |
+     +-- POST /notifications -----------------------------------------+
+     |         |                                                       |
+     |         v                                                       |
+     |   NotificationService.send(cmd)                                |
+     |         |                                                       |
+     |         +-- @PublishResult(channelRef="email") --> racer:notify:email
+     |         |               |                              |        |
+     |         |   [CorrelationInterceptor @Order(10)]   EmailWorker  |
+     |         |   [AuditInterceptor       @Order(20)]   (dedup=true) |
+     |         |                                                       |
+     |         +-- @PublishResult(channelRef="sms") ---> racer:notify:sms
+     |         |                                          SmsWorker    |
+     |         |                                          (circuit-  |
+     |         |                                           breaker)   |
+     |         |                                                       |
+     |         +-- @PublishResult(channelRef="push") --> racer:notify:push
+     |         |                                          PushWorker   |
+     |         |                                          (concurrent/4)
+     |         |                                                       |
+     |         +-- RacerTransaction (BROADCAST) -----> all 3 + audit  |
+     |         |                                                       |
+     |         +-- @RacerPublisher("audit") ---------> racer:notify:audit
+     |                                                  AuditCollector |
+     |                                                                 |
+     +-- GET /notifications/{id}/status                               |
+     |         |                                                       |
+     |         v                                                       |
+     |   NotificationStatusClient.checkStatus(id)                     |
+     |         +--> RacerRequest --> racer:notify:requests             |
+     |                               StatusResponder                   |
+     |         <-- RacerReply <-- (ephemeral correlation channel)      |
+     |                                                                 |
+     +-- GET /notifications/audit ---- AuditCollector.getEntries()    |
 ```
 
-**Racer annotations used:**
+**Every Racer annotation and API used in NotifyHub:**
 
-| Annotation | Where | What it does |
+| Annotation / API | Class | Purpose |
 |---|---|---|
-| `@EnableRacer` | `InventoryApplication` | Activates auto-configuration, AOP, registry, field processor |
-| `@RacerPublisher("alerts")` | `InventoryService` | Injects a publisher bound to `racer:inventory:alerts` |
-| `@PublishResult(channelRef="stock")` | `createItem`, `updateStock` | Auto-publishes the return value to `racer:inventory:stock` without any `publishAsync()` call |
-| `@RacerRoute` + `@RacerRouteRule` | `InventoryEventRouter` | Declaratively fans out events using `RouteAction` (FORWARD/FORWARD_AND_PROCESS/DROP/DROP_TO_DLQ) and `RouteMatchSource` (PAYLOAD/SENDER/ID) |
-| `@RacerListener(channelRef="audit")` | `InventoryAuditConsumer` | Subscribes the method via the configured channel alias; handles deserialization, metrics, and DLQ automatically |
+| `@EnableRacer` | `NotifyApplication` | Activate framework |
+| `@EnableRacerClients` | `NotifyApplication` | Generate `@RacerClient` proxies |
+| `@RacerPublisher("audit")` | `NotificationService` | Inject publisher for audit channel |
+| `@PublishResult(channelRef=...)` | `NotificationService` | AOP publish on method return |
+| `@RacerPriority(defaultLevel="HIGH")` | `NotificationService.sendUrgentPush()` | Route to priority sub-channel |
+| `RacerTransaction.execute(tx -> ...)` | `NotificationService.sendBroadcast()` | Batch multi-channel publish |
+| `@RacerRoute` + `@RacerRouteRule` | `NotificationRouter` | Content-based routing by `type` field |
+| `RacerMessageInterceptor` | `CorrelationInterceptor` | Log correlation ID per incoming message |
+| `RacerMessageInterceptor` | `AuditInterceptor` | Reject messages with no sender |
+| `@RacerListener` (plain) | `AuditCollector` | Subscribe to audit channel |
+| `@RacerListener(dedup=true)` | `EmailWorker` | Idempotent email delivery |
+| `@RacerListener(mode=CONCURRENT, concurrency=4)` | `PushWorker` | Parallel push dispatch |
+| `@RacerListener` + exception | `SmsWorker` | Automatic DLQ forwarding on failure |
+| `@RacerClient` + `@RacerRequestReply` | `NotificationStatusClient` | Non-blocking request-reply caller |
+| `@RacerResponder` | `StatusResponder` | Request-reply handler |
+| `DeadLetterQueueService` | `DlqApiController` | Inspect DLQ entries |
+| `DlqReprocessorService` | `DlqApiController` | Re-publish DLQ entries to original channel |
+| `racer.circuit-breaker.*` | `application.properties` | Circuit breaker wrapping SmsWorker |
+| `racer.dedup.*` | `application.properties` | Idempotency window for EmailWorker |
+| `racer.priority.*` | `application.properties` | Priority sub-channels for push and sms |
+| `racer.channels.email.durable=true` | `application.properties` | Switch email to Redis Streams |
+| `racer.web.dlq-enabled=true` | `application.properties` | Enable built-in DLQ web API |
+| Actuator `/metrics` | auto-configured | `racer.messages.published`, `racer.listener.*`, `racer.dedup.*`, `racer.dlq.size` |
 
 ---
 
-## Part 7 — What's next
+## Part 18 — What is Not Covered Here
 
-Once comfortably running, explore these Racer capabilities:
+This tutorial demonstrates every annotation and API available in a single-application
+scope. A few advanced topics have dedicated tutorials:
 
-| Next step | Tutorial |
+| Topic | Tutorial |
 |---|---|
-| Durable delivery with Redis Streams (`@PublishResult(durable=true)`) | [Tutorial 11](TUTORIALS.md#tutorial-11--durable-publishing-publishresult-durabletrue) |
-| Dead Letter Queue — automatic retry on failure | [Tutorial 4](TUTORIALS.md#tutorial-4--dead-letter-queue--reprocessing) |
-| Request-Reply (send a message, wait for a typed response) | [Tutorial 5](TUTORIALS.md#tutorial-5--two-way-request-reply-over-pubsub) |
-| Advanced routing — `RouteMatchSource`, `RouteAction`, method-level `@RacerRoute`, `@Routed` injection | [Tutorial 10](TUTORIALS.md#tutorial-10--content-based-routing-racerroute) |
-| Pre-dispatch message interception (`RacerMessageInterceptor`) | [Tutorial 25](TUTORIALS.md#tutorial-25--message-interceptors-racermessageinterceptor) |
-| Atomic multi-channel batch publish (`RacerTransaction`) | [Tutorial 14](TUTORIALS.md#tutorial-14--atomic-batch-publishing-racertransaction) |
-| Promethues / Actuator metrics deep-dive | [Tutorial 12](TUTORIALS.md#tutorial-12--metrics--observability-actuator--prometheus) |
-| High availability with Redis Sentinel | [Tutorial 15](TUTORIALS.md#tutorial-15--high-availability-sentinel--cluster) |
+| Two-way request-reply over Redis Streams | [Tutorial 6](TUTORIALS.md#tutorial-6--two-way-request-reply-over-redis-streams) |
+| Multiple consumer instances per stream | [Tutorial 16](TUTORIALS.md#tutorial-16--consumer-scaling--stream-sharding) |
+| Stream sharding for very-high-throughput channels | [Tutorial 16](TUTORIALS.md#tutorial-16--consumer-scaling--stream-sharding) |
+| JSON Schema validation on publish / consume | (Tutorial — Schema Registry) |
+| Prometheus + Grafana dashboard setup | [Tutorial 12](TUTORIALS.md#tutorial-12--metrics--observability-actuator--prometheus) |
+| DLQ pruning by age (RacerRetentionService) | [Tutorial 13](TUTORIALS.md#tutorial-13--retention--dlq-pruning) |
+| Pipelined batch publish for maximum throughput | [Tutorial 17](TUTORIALS.md#tutorial-17--pipelined-batch-publishing) |
+| High availability with Redis Sentinel / Cluster | [Tutorial 15](TUTORIALS.md#tutorial-15--high-availability-sentinel--cluster) |
+| Consumer group lag dashboard | [Tutorial 24](TUTORIALS.md#tutorial-24--consumer-group-lag-dashboard) |
 
 ---
 
-## Troubleshooting
+## Part 19 — Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `ExceptionInInitializerError: TypeTag :: UNKNOWN` | Maven is using JDK 24/25 | `export JAVA_HOME=$(/usr/libexec/java_home -v 21)` |
-| `Connection refused` on Redis | Redis not running | `docker compose -f /path/to/racer/compose.yaml up -d` |
-| `NoSuchBeanDefinitionException: RacerChannelPublisher` | `@EnableRacer` missing or `racer` not on classpath | Check POM and add `@EnableRacer` to main class |
-| `@RacerPublisher` field is `null` at runtime | Bean is not a Spring-managed proxy (e.g. `new MyService()`) | Ensure the class is annotated `@Service` / `@Component` and obtained from the context |
-| `@PublishResult` not intercepting calls | AOP proxy not applied — bean called from within the same class | Move the `@PublishResult` method to a separate `@Service` bean |
-| Channel not found for alias | Alias missing in `application.properties` | Add `racer.channels.<alias>.name=...` |
-
----
-
-## Part 8 — Consumer Application: Subscribing from a Separate Service
-
-The `inventory-service` you built in Parts 1–6 publishes events and also consumes its
-own audit channel in-process. In real architectures you often want a **completely
-separate downstream service** — possibly owned by a different team — to react to those
-same events independently.
-
-This part builds `inventory-consumer`, a standalone Spring Boot application that:
-
-- Subscribes to `racer:inventory:stock` for stock change events using `@RacerListener`
-- Subscribes to `racer:inventory:alerts` for low-stock alerts using `@RacerListener`
-- Can switch the `stock` listener from fire-and-forget Pub/Sub to durable,
-    consumer-group-backed delivery by changing channel configuration only
-
-Both apps share the **same Redis instance** but are otherwise fully independent — no
-shared libraries, no direct HTTP calls, no service-discovery coupling.
-
----
-
-### Step 8.1 — Directory layout
-
-Create this structure **alongside** (not inside) `inventory-service`:
-
-```
-inventory-consumer/
-├── pom.xml
-└── src/
-    └── main/
-        ├── java/
-        │   └── com/example/consumer/
-        │       ├── ConsumerApplication.java
-        │       ├── model/
-        │       │   └── InventoryItem.java
-        │       └── listener/
-        │           ├── StockEventListener.java
-        │           └── AlertEventListener.java
-        └── resources/
-            └── application.properties
-```
-
-```bash
-mkdir -p inventory-consumer/src/main/java/com/example/consumer/{model,listener}
-mkdir -p inventory-consumer/src/main/resources
-cd inventory-consumer
-```
-
----
-
-### Step 8.2 — `pom.xml`
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-                             https://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.4.3</version>
-    </parent>
-
-    <groupId>com.example</groupId>
-    <artifactId>inventory-consumer</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
-    <name>inventory-consumer</name>
-
-    <properties>
-        <java.version>21</java.version>
-    </properties>
-
-    <dependencies>
-        <!-- racer — single dependency for all messaging capabilities -->
-        <dependency>
-            <groupId>com.cheetah</groupId>
-            <artifactId>racer</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
-        </dependency>
-
-        <!-- Reactive HTTP layer (for health / metrics endpoints) -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webflux</artifactId>
-        </dependency>
-
-        <!-- Actuator — health + metrics -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-
-        <!-- Lombok -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <configuration>
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </path>
-                    </annotationProcessorPaths>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-```
-
----
-
-### Step 8.3 — `application.properties`
-
-```properties
-# ── Server ──────────────────────────────────────────────────────────────────
-server.port=8091   # different port — both apps run on the same machine
-
-# ── Redis ────────────────────────────────────────────────────────────────────
-spring.data.redis.host=localhost
-spring.data.redis.port=6379
-
-# ── Racer channel aliases ─────────────────────────────────────────────────
-# Mirror the producer's channel names so you can use channelRef in listeners.
-racer.channels.stock.name=racer:inventory:stock
-racer.channels.alerts.name=racer:inventory:alerts
-racer.channels.audit.name=racer:inventory:audit
-
-# Optional durable mode for the stock listener.
-# Enable the same setting in inventory-service when you want stock events persisted
-# to a Redis Stream instead of transient Pub/Sub delivery.
-# racer.channels.stock.durable=true
-# racer.channels.stock.durable-group=inventory-consumer-group
-# racer.channels.stock.stream-key=racer:inventory:stock:stream
-
-# ── Actuator ─────────────────────────────────────────────────────────────────
-management.endpoints.web.exposure.include=health,info,metrics
-management.endpoint.health.show-details=always
-```
-
-> **Tip:** Only `racer.channels.<alias>.name` is required in a consumer for plain
-> Pub/Sub. If you want `@RacerListener(channelRef = "...")` to consume durably, the
-> consumer also uses `durable`, `durable-group`, and `stream-key` from the same alias.
-> `async` and `sender` remain publisher-side concerns.
-
----
-
-### Step 8.4 — Main class
-
-```java
-// src/main/java/com/example/consumer/ConsumerApplication.java
-package com.example.consumer;
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-
-@SpringBootApplication
-// No @EnableRacer needed — RacerAutoConfiguration is registered automatically via
-// META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
-public class ConsumerApplication {
-
-    public static void main(String[] args) {
-        SpringApplication.run(ConsumerApplication.class, args);
-    }
-}
-```
-
----
-
-### Step 8.5 — Domain model
-
-Replicate (or share via a shared library) the domain model from `inventory-service`.
-For this tutorial, define a local copy:
-
-```java
-// src/main/java/com/example/consumer/model/InventoryItem.java
-package com.example.consumer.model;
-
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.time.Instant;
-
-@Data
-@NoArgsConstructor
-@JsonIgnoreProperties(ignoreUnknown = true)   // safe when producer adds new fields
-public class InventoryItem {
-    private String  sku;
-    private String  name;
-    private int     quantity;
-    private String  location;
-    private String  eventType;
-    private String  correlationId;
-    private Instant updatedAt;
-}
-```
-
-> `@JsonIgnoreProperties(ignoreUnknown = true)` prevents the consumer from breaking when
-> the producer adds new fields — a best practice for independent deployability.
-
----
-
-### Step 8.6 — Stock event listener
-
-```java
-// src/main/java/com/example/consumer/listener/StockEventListener.java
-package com.example.consumer.listener;
-
-import com.cheetah.racer.annotation.RacerListener;
-import com.cheetah.racer.model.RacerMessage;
-import com.example.consumer.model.InventoryItem;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
-
-@Component
-public class StockEventListener {
-
-    private static final Logger log = LoggerFactory.getLogger(StockEventListener.class);
-
-    private final ObjectMapper objectMapper;
-
-    public StockEventListener(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-    }
-
-    /**
-     * Subscribes via the configured 'stock' alias.
-     * Every STOCK_UPDATED and ITEM_CREATED event published by inventory-service
-     * is delivered here in real time.
-     *
-     * RacerListenerRegistrar handles: subscription, deserialization,
-     * DLQ forwarding on exception, and Micrometer metrics.
-     */
-    @RacerListener(channelRef = "stock", id = "stock-listener")
-    public void onStockEvent(RacerMessage message) {
-        InventoryItem item = objectMapper.convertValue(message.getPayload(), InventoryItem.class);
-        log.info("[STOCK] eventType={} sku={} qty={} correlationId={}",
-                item.getEventType(), item.getSku(), item.getQuantity(), item.getCorrelationId());
-
-        // Add your business logic here, for example:
-        //   - update a read-model or cache
-        //   - trigger a warehouse management system call
-        //   - feed an analytics pipeline
-    }
-}
-```
-
----
-
-### Step 8.7 — Alert event listener
-
-```java
-// src/main/java/com/example/consumer/listener/AlertEventListener.java
-package com.example.consumer.listener;
-
-import com.cheetah.racer.annotation.RacerListener;
-import com.cheetah.racer.model.RacerMessage;
-import com.example.consumer.model.InventoryItem;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
-
-@Component
-public class AlertEventListener {
-
-    private static final Logger log = LoggerFactory.getLogger(AlertEventListener.class);
-
-    private final ObjectMapper objectMapper;
-
-    public AlertEventListener(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-    }
-
-    /**
-     * Subscribes via the configured 'alerts' alias.
-     * LOW_STOCK_ALERT events trigger this handler whenever inventory-service
-     * detects a quantity below the alert threshold.
-     */
-    @RacerListener(channelRef = "alerts", id = "alert-listener")
-    public void onAlertEvent(RacerMessage message) {
-        InventoryItem alert = objectMapper.convertValue(message.getPayload(), InventoryItem.class);
-        log.warn("[ALERT] LOW STOCK — sku={} qty={} location={}",
-                alert.getSku(), alert.getQuantity(), alert.getLocation());
-
-        // Example reactions:
-        //   - send an email or Slack notification
-        //   - create a purchase order via an ERP API
-        //   - update an ops dashboard
-    }
-}
-```
-
----
-
-### Step 8.8 — Durable `@RacerListener` (optional)
-
-By default, `@RacerListener` uses Redis Pub/Sub: if `inventory-consumer` is offline
-when an event is published, that event is lost. You can now make the same listener
-durable by configuration, with no new annotation and no second listener class.
-
-**Enable durable publishing in `inventory-service`:**
-
-```properties
-# inventory-service/src/main/resources/application.properties
-racer.channels.stock.durable=true
-racer.channels.stock.durable-group=inventory-consumer-group   # optional
-racer.channels.stock.stream-key=racer:inventory:stock:stream  # optional
-```
-
-**Enable durable consumption in `inventory-consumer`:**
-
-```properties
-# inventory-consumer/src/main/resources/application.properties
-racer.channels.stock.durable=true
-racer.channels.stock.durable-group=inventory-consumer-group   # should match the producer-side intent
-racer.channels.stock.stream-key=racer:inventory:stock:stream  # optional; defaults to channel name + :stream
-```
-
-Once both apps are restarted, the existing `StockEventListener` continues to work
-unchanged:
-
-```java
-@RacerListener(channelRef = "stock", id = "stock-listener")
-public void onStockEvent(RacerMessage message) {
-    // same handler, now backed by XREADGROUP instead of Pub/Sub
-}
-```
-
-> **What changes at runtime?**
->
-> |  | `@RacerListener` with `durable=false` | `@RacerListener` with `durable=true` |
-> |---|---|---|
-> | Transport | Redis Pub/Sub (`PUBLISH`) | Redis Streams (`XADD`) |
-> | Consumer side | `receive(ChannelTopic)` | `XREADGROUP` + consumer group |
-> | Messages missed while offline | **Lost** | **Replayed on reconnect** |
-> | Extra listener class required | No | No |
-> | Producer-side setup required | None | Set `racer.channels.<alias>.durable=true` |
-
----
-
-### Step 8.9 — Build and run both apps
-
-**Terminal A** — Redis (already running from Part 1):
-
-```bash
-docker compose -f /path/to/racer/compose.yaml up -d
-```
-
-**Terminal B** — Producer (`inventory-service` on port 8090):
-
-```bash
-cd inventory-service
-export JAVA_HOME=$(/usr/libexec/java_home -v 21)
-mvn spring-boot:run
-```
-
-**Terminal C** — Consumer (`inventory-consumer` on port 8091):
-
-```bash
-cd inventory-consumer
-export JAVA_HOME=$(/usr/libexec/java_home -v 21)
-mvn spring-boot:run
-```
-
-`inventory-consumer` startup log should contain:
-
-```
-Started ConsumerApplication in X.XXX seconds
-[racer] Registered listener 'stock-listener'  → racer:inventory:stock
-[racer] Registered listener 'alert-listener'  → racer:inventory:alerts
-```
-
----
-
-### Step 8.10 — End-to-end test
-
-**Terminal D** — create an item with a low starting quantity (triggers both stock and alert):
-
-```bash
-curl -s -X POST http://localhost:8090/api/inventory \
-  -H "Content-Type: application/json" \
-  -d '{"sku":"GADGET-42","name":"Smart Gadget","quantity":8,"location":"SHELF-A1"}' | jq
-```
-
-Watch `inventory-consumer` logs — you should see **two** entries:
-
-```
-[STOCK]  eventType=ITEM_CREATED   sku=GADGET-42 qty=8  correlationId=...
-[ALERT]  LOW STOCK — sku=GADGET-42 qty=8 location=SHELF-A1
-```
-
-Quantity 8 is already below the alert threshold (10), so both events fire immediately.
-
-**Restock above threshold** (stock event only — no alert):
-
-```bash
-curl -s -X PATCH http://localhost:8090/api/inventory/GADGET-42/stock \
-  -H "Content-Type: application/json" \
-  -d '{"delta":15}' | jq
-```
-
-Consumer logs:
-
-```
-[STOCK]  eventType=STOCK_UPDATED  sku=GADGET-42 qty=23
-```
-
-**Drain back below threshold** (both events fire again):
-
-```bash
-curl -s -X PATCH http://localhost:8090/api/inventory/GADGET-42/stock \
-  -H "Content-Type: application/json" \
-  -d '{"delta":-20}' | jq
-```
-
-Consumer logs:
-
-```
-[STOCK]  eventType=STOCK_UPDATED  sku=GADGET-42 qty=3
-[ALERT]  LOW STOCK — sku=GADGET-42 qty=3 location=SHELF-A1
-```
-
----
-
-### How the two apps fit together
-
-```
-inventory-service (port 8090)                Redis (port 6379)
-─────────────────────────────                ─────────────────
-POST /api/inventory
-  └─▶ InventoryService.createItem()
-        ├─ @PublishResult ──────────────────▶ racer:inventory:stock  ──┐
-        └─ alertsPublisher ─────────────────▶ racer:inventory:alerts ──┤
-                                                                        │
-                                             inventory-consumer (8091)  │
-                                             ─────────────────────────  │
-                                             StockEventListener  ◀──────┤ (Pub/Sub)
-                                             AlertEventListener  ◀──────┘ (Pub/Sub)
-                                             
-if `racer.channels.stock.durable=true` on both sides:
-                                             StockEventListener  ◀────── (Streams via same @RacerListener)
-```
-
-> **Key takeaway:** `inventory-consumer` requires only the `racer` dependency and
-> `@RacerListener` to subscribe to any channel.
-> There is no shared library, no code coupling, and no service-discovery — only a shared
-> Redis instance and agreed-upon channel names.
-
----
-
-### Consumer Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| No messages received by consumer | Producer and consumer targeting different Redis or channel name | Verify `spring.data.redis.*` and `racer.channels.<alias>.name` match exactly in both apps |
-| `@RacerListener` method never called | Bean not picked up by Spring | Ensure class has `@Component` / `@Service` and is within the component-scan root |
-| Durable stock listener never catches up after downtime | `durable=true` missing on producer or consumer alias | Set `racer.channels.stock.durable=true` in both apps and restart them |
-| Durable stock listener reads the wrong stream | Custom `stream-key` differs between producer and consumer | Use the same `racer.channels.stock.stream-key` value in both apps, or leave it blank on both sides |
-| Exception in listener — message lost | DLQ not configured | Add `racer.dlq.*` config or handle errors inside the listener and return normally |
+| `ExceptionInInitializerError: TypeTag :: UNKNOWN` | JDK 24/25 in use | `export JAVA_HOME=$(/usr/libexec/java_home -v 21)` |
+| `Connection refused` (Redis) | Redis not running | `docker compose -f /path/to/racer/compose.yaml up -d` |
+| `NoSuchBeanDefinitionException: RacerChannelPublisher` | `@EnableRacer` missing | Add `@EnableRacer` to `NotifyApplication` |
+| `@RacerPublisher` field is `null` at runtime | Bean not a Spring-managed proxy | Ensure class has `@Service` / `@Component` and comes from the application context |
+| `@PublishResult` does not publish | Self-invocation (same class calling itself) | Move the `@PublishResult` method to a separate `@Service` bean |
+| `NoSuchBeanDefinitionException: NotificationStatusClient` | `@EnableRacerClients` missing | Add `@EnableRacerClients` to `NotifyApplication` |
+| Channel alias not found | Alias missing from `application.properties` | Add `racer.channels.<alias>.name=...` |
+| Deduplication not working | `racer.dedup.enabled=false` | Set `racer.dedup.enabled=true` |
+| Circuit breaker never opens | `racer.circuit-breaker.enabled=false` | Set `racer.circuit-breaker.enabled=true` |
+| DLQ always empty after listener exception | `DeadLetterQueueService` not wired | Ensure the `racer` starter is on the classpath |
+| Durable listener misses messages after restart | `durable=true` only on one side | Set `racer.channels.<alias>.durable=true` on both publisher and consumer |
+| Request-reply times out immediately | `@RacerResponder` not started or wrong alias | Verify `@RacerResponder(channelRef="requests")` and matching alias on both sides |
+| HTTP 400/500 on `POST /notifications` | Unrecognised `type` value | Use `EMAIL`, `SMS`, `PUSH`, or `BROADCAST` (case-insensitive) |

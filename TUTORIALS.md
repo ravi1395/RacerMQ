@@ -7,7 +7,7 @@ Each tutorial is self-contained and builds on a running Racer instance.
 
 ## Table of Contents
 
-0. [Build a New App from Scratch with Racer →](TUTORIAL-NEW-APP.md) *(standalone guide — start here if you are building a new service)*
+0. [Build a Notification Hub — Complete Racer Feature Tour →](TUTORIAL-NEW-APP.md) *(start here — covers every Racer capability with a simple use case)*
 
 1. [Tutorial 1 — Getting Started: Boot Redis + Run Racer](#tutorial-1--getting-started-boot-redis--run-racer)
 2. [Tutorial 2 — Fire-and-Forget Publishing](#tutorial-2--fire-and-forget-publishing)
