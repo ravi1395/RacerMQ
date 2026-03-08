@@ -7,6 +7,8 @@ import com.cheetah.racer.annotation.RouteMatchSource;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
+import com.cheetah.racer.router.dsl.RacerFunctionalRouter;
+import com.cheetah.racer.router.dsl.RouteContext;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -16,6 +18,7 @@ import org.springframework.context.ApplicationContext;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -32,12 +35,12 @@ import java.util.regex.Pattern;
  *
  * <h3>Routing logic</h3>
  * <ol>
- *   <li>For each {@link CompiledRouteRule}, extract the match candidate from the message
- *       (payload field, sender, or id — depending on {@link RouteMatchSource}).</li>
- *   <li>If the candidate value matches the rule's regex pattern, apply the rule's
- *       {@link RouteAction}: forward, forward-and-process, drop, or drop-to-DLQ.</li>
- *   <li>Return a {@link RouteDecision} so the caller knows how to proceed.</li>
- *   <li>If no rule matches, return {@link RouteDecision#PASS} — caller processes locally.</li>
+ *   <li>Annotation rules ({@code @RacerRoute} / {@code @RacerRouteRule}) are evaluated first.</li>
+ *   <li>If no annotation rule matched, each {@link RacerFunctionalRouter} bean is evaluated in
+ *       bean-registration order; the first non-{@link RouteDecision#PASS} decision wins.</li>
+ *   <li>Both systems can coexist in the same application — migrate incrementally.</li>
+ *   <li>If nothing matches, {@link RouteDecision#PASS} is returned and the message is
+ *       processed by the local listener unchanged.</li>
  * </ol>
  */
 @Slf4j
@@ -48,6 +51,7 @@ public class RacerRouterService {
     private final ObjectMapper objectMapper;
 
     private final List<CompiledRouteRule> globalRules = new ArrayList<>();
+    private final List<RacerFunctionalRouter> functionalRouters = new ArrayList<>();
 
     public RacerRouterService(ApplicationContext applicationContext,
                               RacerPublisherRegistry registry,
@@ -81,9 +85,20 @@ public class RacerRouterService {
         });
 
         if (globalRules.isEmpty()) {
-            log.debug("[racer-router] No @RacerRoute beans found — router is inactive.");
+            log.debug("[racer-router] No @RacerRoute beans found — annotation rules inactive.");
         } else {
-            log.info("[racer-router] {} routing rule(s) active.", globalRules.size());
+            log.info("[racer-router] {} annotation routing rule(s) active.", globalRules.size());
+        }
+
+        Map<String, RacerFunctionalRouter> dsls =
+                applicationContext.getBeansOfType(RacerFunctionalRouter.class);
+        functionalRouters.addAll(dsls.values());
+        functionalRouters.forEach(r ->
+                log.info("[racer-router] Functional router registered: '{}' with {} rule(s).",
+                        r.getName(), r.entries().size()));
+
+        if (globalRules.isEmpty() && functionalRouters.isEmpty()) {
+            log.debug("[racer-router] No routing rules found — router is inactive.");
         }
     }
 
@@ -120,15 +135,31 @@ public class RacerRouterService {
     // -----------------------------------------------------------------------
 
     /**
-     * Evaluates the global routing rules against {@code message} and returns a
+     * Evaluates all routing rules against {@code message} and returns a
      * {@link RouteDecision} indicating how the caller should proceed.
      *
+     * <p>Annotation-based global rules are checked first.  If none match (i.e. the
+     * result is {@link RouteDecision#PASS}), each registered {@link RacerFunctionalRouter}
+     * is evaluated in bean-registration order until a non-PASS decision is produced.
+     *
      * @return {@link RouteDecision#PASS} if no rule matched; otherwise the decision
-     *         determined by the first matching rule's {@link RouteAction}
+     *         determined by the first matching rule
      */
     public RouteDecision route(RacerMessage message) {
-        if (globalRules.isEmpty()) return RouteDecision.PASS;
-        return evaluate(message, globalRules);
+        if (!globalRules.isEmpty()) {
+            RouteDecision annotationDecision = evaluate(message, globalRules);
+            if (annotationDecision != RouteDecision.PASS) return annotationDecision;
+        }
+
+        if (!functionalRouters.isEmpty()) {
+            RouteContext ctx = new DefaultRouteContext(message);
+            for (RacerFunctionalRouter router : functionalRouters) {
+                RouteDecision decision = router.evaluate(message, ctx);
+                if (decision != RouteDecision.PASS) return decision;
+            }
+        }
+
+        return RouteDecision.PASS;
     }
 
     /**
@@ -228,20 +259,27 @@ public class RacerRouterService {
 
     /** Returns human-readable rule descriptions for the debug REST endpoint. */
     public List<String> getRuleDescriptions() {
-        return globalRules.stream()
-                .map(r -> {
-                    if (r.source() == RouteMatchSource.PAYLOAD) {
-                        return String.format("source=PAYLOAD field='%s' matches='%s' → alias='%s' action=%s",
-                                r.field(), r.pattern().pattern(), r.alias(), r.action());
-                    }
-                    return String.format("source=%s matches='%s' → alias='%s' action=%s",
-                            r.source(), r.pattern().pattern(), r.alias(), r.action());
-                })
-                .toList();
+        List<String> descriptions = new ArrayList<>();
+
+        globalRules.forEach(r -> {
+            if (r.source() == RouteMatchSource.PAYLOAD) {
+                descriptions.add(String.format("[annotation] source=PAYLOAD field='%s' matches='%s' → alias='%s' action=%s",
+                        r.field(), r.pattern().pattern(), r.alias(), r.action()));
+            } else {
+                descriptions.add(String.format("[annotation] source=%s matches='%s' → alias='%s' action=%s",
+                        r.source(), r.pattern().pattern(), r.alias(), r.action()));
+            }
+        });
+
+        functionalRouters.forEach(router ->
+                descriptions.add(String.format("[functional] router='%s' rules=%d",
+                        router.getName(), router.entries().size())));
+
+        return List.copyOf(descriptions);
     }
 
     public boolean hasRules() {
-        return !globalRules.isEmpty();
+        return !globalRules.isEmpty() || !functionalRouters.isEmpty();
     }
 
     // -----------------------------------------------------------------------
@@ -251,6 +289,39 @@ public class RacerRouterService {
     private String toJsonString(Object value) throws Exception {
         if (value instanceof String s) return s;
         return objectMapper.writeValueAsString(value);
+    }
+
+    // -----------------------------------------------------------------------
+    // DefaultRouteContext — bridges DSL handlers to the publisher registry
+    // -----------------------------------------------------------------------
+
+    /**
+     * {@link RouteContext} implementation that delegates publish operations to
+     * {@link RacerPublisherRegistry}, mirroring what {@link #applyAction} does for
+     * annotation-based rules.
+     */
+    private final class DefaultRouteContext implements RouteContext {
+
+        private final RacerMessage message;
+
+        DefaultRouteContext(RacerMessage message) { this.message = message; }
+
+        @Override
+        public void publishTo(String alias, RacerMessage msg) {
+            publishTo(alias, msg, msg.getSender());
+        }
+
+        @Override
+        public void publishTo(String alias, RacerMessage msg, String sender) {
+            RacerChannelPublisher publisher = registry.getPublisher(alias);
+            publisher.publishAsync(msg.getPayload(), sender)
+                    .subscribe(
+                            count -> log.debug("[racer-router] DSL forwarded id={} → '{}' ({} subscriber(s))",
+                                    message.getId(), alias, count),
+                            ex -> log.error("[racer-router] DSL routing failed for id={} → '{}': {}",
+                                    message.getId(), alias, ex.getMessage())
+                    );
+        }
     }
 
     /** Handles CGLIB-proxied beans where {@code getClass().getAnnotation()} returns null. */

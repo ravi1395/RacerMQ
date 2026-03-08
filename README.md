@@ -9,7 +9,7 @@ A Spring Boot library for annotation-driven reactive Redis messaging. Define pub
 - **Dead Letter Queue (DLQ)** — automatic enqueue on failure; opt-in REST API (`racer.web.dlq-enabled=true`) for inspection and republishing
 - **Multiple Channels** — declare unlimited named channels in `application.properties`
 - **Durable Publishing** — `@PublishResult(durable = true)` writes to Redis Streams for at-least-once delivery
-- **Content-Based Router** — `@RacerRoute` / `@RacerRouteRule` for regex-pattern message routing on payload fields, sender, or message ID; `RouteAction` controls FORWARD / FORWARD\_AND\_PROCESS / DROP / DROP\_TO\_DLQ; method-level `@RacerRoute` on `@RacerListener` handlers; `@Routed` boolean parameter injection; `RacerMessageInterceptor` SPI for pre-dispatch interception; opt-in REST API (`racer.web.router-enabled=true`)
+- **Content-Based Router** — annotation style (`@RacerRoute` / `@RacerRouteRule`) and functional DSL (`RacerFunctionalRouter` builder with `RoutePredicates` / `RouteHandlers`); regex-pattern matching on payload fields, sender, or message ID; native multi-alias fan-out via `multicast`; composable predicates (`.and()`, `.or()`, `.negate()`); `RouteAction` controls FORWARD / FORWARD\_AND\_PROCESS / DROP / DROP\_TO\_DLQ; method-level `@RacerRoute` on `@RacerListener` handlers; `@Routed` boolean parameter injection; `RacerMessageInterceptor` SPI; opt-in REST API (`racer.web.router-enabled=true`)
 - **Atomic Batch Publish** — `RacerTransaction.execute()` for ordered multi-channel publish
 - **Pipelined Batch Publish** — `RacerPipelinedPublisher` issues all commands in parallel for maximum throughput
 - **Consumer Scaling** — configurable concurrency per stream via `@RacerStreamListener(concurrency=N)` and key-based sharding via `RacerShardedStreamPublisher`
@@ -181,7 +181,15 @@ racer/                                   # Library (single-module Maven project)
     │   │   ├── router/
     │   │   │   ├── CompiledRouteRule.java             # Compiled, regex-ready rule (record)
     │   │   │   ├── RouteDecision.java                 # PASS / FORWARDED / FORWARDED_AND_PROCESS / DROPPED / DROPPED_TO_DLQ
-    │   │   │   └── RacerRouterService.java            # compile() / evaluate() / route(); scans @RacerRoute beans
+    │   │   │   ├── RacerRouterService.java            # compile() / evaluate() / route(); annotation + DSL routers
+    │   │   │   └── dsl/
+    │   │   │       ├── RoutePredicate.java            # @FunctionalInterface with .and()/.or()/.negate()
+    │   │   │       ├── RouteHandler.java              # @FunctionalInterface returning RouteDecision
+    │   │   │       ├── RouteContext.java              # Bridge: publishTo(alias, msg)
+    │   │   │       ├── FunctionalRouteEntry.java      # Record pairing predicate + handler
+    │   │   │       ├── RoutePredicates.java           # Static predicate factories
+    │   │   │       ├── RouteHandlers.java             # Static handler factories (forward/multicast/drop)
+    │   │   │       └── RacerFunctionalRouter.java     # Builder-style router bean; evaluated by RacerRouterService
     │   │   ├── service/
     │   │   │   ├── DeadLetterQueueService.java        # DLQ enqueue + republish
     │   │   │   ├── DlqReprocessorService.java         # Republish-only DLQ reprocessor
@@ -586,6 +594,64 @@ public class LoggingInterceptor implements RacerMessageInterceptor {
     }
 }
 ```
+
+**Functional Router DSL:**
+
+As an alternative to the annotation-based `@RacerRoute`, declare a `@Bean` of type
+`RacerFunctionalRouter` using the fluent builder. Functional routers are discovered
+automatically at startup and evaluated (in bean-registration order) after any
+annotation-based rules.
+
+```java
+import static com.cheetah.racer.router.dsl.RouteHandlers.*;
+import static com.cheetah.racer.router.dsl.RoutePredicates.*;
+
+@Configuration
+public class OrderRouterConfig {
+
+    @Bean
+    public RacerFunctionalRouter orderRouter() {
+        return RacerFunctionalRouter.builder()
+                .name("order-router")
+                // Single-alias routes
+                .route(fieldEquals("type", "EMAIL"), forward("email"))
+                .route(fieldEquals("type", "SMS"),   forward("sms"))
+                // True fan-out: one rule → multiple aliases
+                .route(fieldEquals("type", "BROADCAST"),
+                       multicastAndProcess("email", "sms", "push"))
+                // Composable predicates
+                .route(fieldEquals("type", "AUDIT")
+                               .and(senderEquals("checkout-service")), forward("audit"))
+                .defaultRoute(drop())
+                .build();
+    }
+}
+```
+
+**`RoutePredicates` factory methods**
+
+| Method | Description |
+|--------|-------------|
+| `fieldEquals(field, value)` | Exact match against a top-level JSON payload field |
+| `fieldMatches(field, regex)` | Regex match against a top-level JSON payload field |
+| `senderEquals(name)` | Exact match against `RacerMessage.getSender()` |
+| `senderMatches(regex)` | Regex match against `RacerMessage.getSender()` |
+| `idEquals(id)` | Exact match against `RacerMessage.getId()` |
+| `idMatches(regex)` | Regex match against `RacerMessage.getId()` |
+| `any()` | Always-true catch-all |
+| `p.and(q)` / `p.or(q)` / `p.negate()` | Boolean predicate composition |
+
+**`RouteHandlers` factory methods**
+
+| Method | Effect | `RouteDecision` returned |
+|--------|--------|--------------------------|
+| `forward(alias)` | Publish to one alias; skip local handler | `FORWARDED` |
+| `forward(alias, sender)` | Publish with overridden sender; skip local handler | `FORWARDED` |
+| `forwardAndProcess(alias)` | Publish to one alias AND invoke local handler | `FORWARDED_AND_PROCESS` |
+| `multicast(a, b, ...)` | Publish to ALL listed aliases; skip local handler | `FORWARDED` |
+| `multicastAndProcess(a, b, ...)` | Publish to ALL listed aliases AND invoke local handler | `FORWARDED_AND_PROCESS` |
+| `drop()` | Silently discard | `DROPPED` |
+| `dropToDlq()` | Route to the Dead Letter Queue | `DROPPED_TO_DLQ` |
 
 **Runtime API:**
 - `GET /api/router/rules` — list all compiled rules with their index, source, field, pattern, target and action.
@@ -2012,7 +2078,7 @@ All roadmap items through Phase 3 have been **fully implemented**. See [CHANGELO
 - `RacerListenerRegistrar` (BeanPostProcessor) — scans all beans for `@RacerListener` methods; routes to `RacerDeadLetterHandler` on failure
 - `RouterController` — `GET /api/router/rules` (view compiled rules) + `POST /api/router/test` (dry-run)
 
-**Key files:** `RacerRoute.java`, `RacerRouteRule.java`, `RacerRouterService.java`, `RouterController.java`
+**Key files:** `RacerRoute.java`, `RacerRouteRule.java`, `RacerRouterService.java`, `RacerFunctionalRouter.java`, `RoutePredicates.java`, `RouteHandlers.java`, `RouterController.java`
 
 ---
 

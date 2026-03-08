@@ -1992,8 +1992,151 @@ Racer injects `true` when the decision was `FORWARDED_AND_PROCESS`, and `false` 
 
 ---
 
+---
+
+### Step 9 — Functional Router DSL (basic)
+
+The annotation-based `@RacerRoute` works well for static patterns but cannot express
+true fan-out (one rule → multiple aliases) in a single declaration. The
+**Functional Router DSL** solves this with plain Java.
+
+Declare a `@Bean` of type `RacerFunctionalRouter` in any `@Configuration` class:
+
+```java
+import static com.cheetah.racer.router.dsl.RouteHandlers.*;
+import static com.cheetah.racer.router.dsl.RoutePredicates.*;
+
+@Configuration
+public class EventRouterConfig {
+
+    @Bean
+    public RacerFunctionalRouter eventRouter() {
+        return RacerFunctionalRouter.builder()
+                .name("event-router")
+                .route(fieldEquals("type", "EMAIL"), forward("email"))
+                .route(fieldEquals("type", "SMS"),   forward("sms"))
+                .route(fieldEquals("type", "PUSH"),  forward("push"))
+                .defaultRoute(drop())
+                .build();
+    }
+}
+```
+
+`RacerRouterService` auto-discovers all `RacerFunctionalRouter` beans at startup.
+Annotation rules are evaluated first; functional routers are evaluated second, in
+bean-registration order.
+
+---
+
+### Step 10 — Multi-target fan-out with `multicast`
+
+The primary advantage of the DSL over annotations is native fan-out.
+A single rule can publish to **multiple** aliases:
+
+```java
+@Bean
+public RacerFunctionalRouter broadcastRouter() {
+    return RacerFunctionalRouter.builder()
+            .name("broadcast-router")
+            // Publish to email, sms, AND push in one rule, then process locally
+            .route(fieldEquals("type", "BROADCAST"),
+                   multicastAndProcess("email", "sms", "push"))
+            .defaultRoute(drop())
+            .build();
+}
+```
+
+| Handler | Effect |
+|---|---|
+| `multicast("a", "b", "c")` | Publish to all three aliases; skip local handler |
+| `multicastAndProcess("a", "b")` | Publish to both aliases AND invoke local `@RacerListener` |
+| `forward("email")` | Publish to one alias; skip local handler |
+| `forwardAndProcess("email")` | Publish to one alias AND invoke local `@RacerListener` |
+| `drop()` | Discard silently |
+| `dropToDlq()` | Route to the Dead Letter Queue |
+
+---
+
+### Step 11 — Composable predicates
+
+`RoutePredicate` is a `@FunctionalInterface` with `and()`, `or()`, and `negate()`
+default methods, so predicates compose like regular functions:
+
+```java
+@Bean
+public RacerFunctionalRouter conditionalRouter() {
+    return RacerFunctionalRouter.builder()
+            .name("conditional-router")
+            // Match by payload field
+            .route(fieldEquals("type", "AUDIT")
+                       .and(senderEquals("checkout-service")), forward("audit"))
+            // Regex match on a payload field
+            .route(fieldMatches("priority", "^(HIGH|CRITICAL)$"), forward("urgent"))
+            // Match by sender with negation
+            .route(senderMatches(".*-internal").negate(), forward("external-audit"))
+            .defaultRoute(drop())
+            .build();
+}
+```
+
+| Predicate factory | Description |
+|---|---|
+| `fieldEquals(field, value)` | Exact match against a JSON payload field |
+| `fieldMatches(field, regex)` | Regex match against a JSON payload field |
+| `senderEquals(name)` | Exact match against `message.getSender()` |
+| `senderMatches(regex)` | Regex match against `message.getSender()` |
+| `idEquals(id)` | Exact match against `message.getId()` |
+| `idMatches(regex)` | Regex match against `message.getId()` |
+| `any()` | Always true — use as a `defaultRoute` predicate |
+| `p.and(q)` | Both predicates must pass |
+| `p.or(q)` | Either predicate must pass |
+| `p.negate()` | Inverts the predicate |
+
+---
+
+### Step 12 — Mixed annotation + DSL side-by-side
+
+Both systems can coexist in the same application. Annotation rules are evaluated first;
+if none match, each functional router is tried in bean-registration order.
+
+```java
+// Existing annotation-based router (still works unchanged)
+@Service
+@RacerRoute({
+    @RacerRouteRule(field = "type", matches = "LEGACY", to = "legacy-channel")
+})
+public class LegacyRouter {}
+
+// New DSL router handles the rest (evaluated when LegacyRouter produces PASS)
+@Configuration
+public class ModernRouterConfig {
+    @Bean
+    public RacerFunctionalRouter modernRouter() {
+        return RacerFunctionalRouter.builder()
+                .name("modern-router")
+                .route(fieldEquals("type", "EMAIL"),     forward("email"))
+                .route(fieldEquals("type", "BROADCAST"), multicastAndProcess("email", "sms"))
+                .defaultRoute(drop())
+                .build();
+    }
+}
+```
+
+**Routing style comparison:**
+
+| Feature | `@RacerRoute` annotations | `RacerFunctionalRouter` DSL |
+|---|---|---|
+| Configuration style | Annotation on a class | Builder, Java `@Configuration` |
+| Fan-out (multi-alias per rule) | Not supported | `multicast(...)` / `multicastAndProcess(...)` |
+| Runtime / conditional logic | No — static regex only | Full Java logic in predicates |
+| Predicate composition | No | `.and()`, `.or()`, `.negate()` |
+| Testable without Spring | No | Yes — `router.evaluate(msg, ctx)` |
+| Migration required | None — stays working | Adopt incrementally |
+
+---
+
 ### What you built
-A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded.
+A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded. Plus a functional DSL router with composable predicates, true multi-alias fan-out, and seamless coexistence with the annotation-based rules.
 
 ---
 

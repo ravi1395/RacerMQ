@@ -32,7 +32,7 @@ By the end you will have a running service that:
 | 3 | `@RacerPublisher` field injection | `NotificationService` |
 | 4 | `@PublishResult` AOP | `NotificationService.dispatchEmail/Sms/Push()` |
 | 5 | `RacerTransaction` batch publish | `NotificationService.sendBroadcast()` |
-| 6 | `@RacerRoute` + `@RacerRouteRule` | `NotificationRouter` |
+| 6 | `RacerFunctionalRouter` DSL | `NotificationRouterConfig` |
 | 7 | `RacerMessageInterceptor` | `CorrelationInterceptor`, `AuditInterceptor` |
 | 8 | `@RacerListener` (plain) | `AuditCollector` |
 | 9 | `@RacerListener(dedup = true)` | `EmailWorker` |
@@ -109,7 +109,7 @@ notify-hub/
         │       ├── service/
         │       │   └── NotificationService.java
         │       ├── router/
-        │       │   └── NotificationRouter.java
+        │       │   └── NotificationRouterConfig.java
         │       ├── interceptor/
         │       │   ├── CorrelationInterceptor.java
         │       │   └── AuditInterceptor.java
@@ -559,51 +559,68 @@ the router class itself.
 and fans out messages based on the `type` payload field.
 
 ```java
-// src/main/java/com/example/notify/router/NotificationRouter.java
+// src/main/java/com/example/notify/router/NotificationRouterConfig.java
 package com.example.notify.router;
 
-import com.cheetah.racer.annotation.RacerRoute;
-import com.cheetah.racer.annotation.RacerRouteRule;
-import com.cheetah.racer.annotation.RouteAction;
-import org.springframework.stereotype.Service;
+import com.cheetah.racer.router.dsl.RacerFunctionalRouter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import static com.cheetah.racer.router.dsl.RouteHandlers.*;
+import static com.cheetah.racer.router.dsl.RoutePredicates.*;
 
 /**
- * Routes messages on racer:notify:default by their "type" payload field.
- * Rules are evaluated top-to-bottom; the first match wins.
+ * Registers a {@link RacerFunctionalRouter} bean that routes messages arriving on
+ * racer:notify:default by the "type" payload field.
  *
- * RouteAction options:
- *   FORWARD              - re-publish to target alias; skip local @RacerListener handlers
- *   FORWARD_AND_PROCESS  - re-publish AND also invoke local @RacerListener handlers
- *   DROP                 - silently discard; nothing is forwarded
- *   DROP_TO_DLQ          - send directly to the Dead Letter Queue (for poison messages)
+ * Rules are evaluated top-to-bottom; the first matching predicate wins.
  *
- * RouteMatchSource (default = PAYLOAD):
- *   PAYLOAD  - match against a JSON field in the message payload
- *   SENDER   - match against the message sender name
- *   ID       - match against the message ID
+ * Handler options (via RouteHandlers):
+ *   forward(alias)                 - re-publish to one alias; skip local listeners
+ *   forward(alias, sender)         - same, but override the sender name
+ *   forwardAndProcess(alias)       - re-publish AND also invoke local @RacerListener handlers
+ *   multicast(a, b, ...)           - publish to MULTIPLE aliases in a single rule
+ *   multicastAndProcess(a, b, ...) - multicast AND process locally
+ *   drop()                         - silently discard
+ *   dropToDlq()                    - send to the Dead Letter Queue
+ *
+ * Predicate options (via RoutePredicates):
+ *   fieldEquals(field, value)      - exact JSON payload field match
+ *   fieldMatches(field, regex)     - regex JSON payload field match
+ *   senderEquals(name)             - match message sender
+ *   any()                          - catch-all (always true)
+ *   pred1.and(pred2).or(pred3)     - composable boolean logic
  */
-@Service
-@RacerRoute({
-    @RacerRouteRule(field = "type", matches = "EMAIL",
-                    to = "email",  action = RouteAction.FORWARD),
-    @RacerRouteRule(field = "type", matches = "SMS",
-                    to = "sms",    action = RouteAction.FORWARD),
-    @RacerRouteRule(field = "type", matches = "PUSH",
-                    to = "push",   action = RouteAction.FORWARD),
-    // BROADCAST: fan-out to email AND trigger local listeners
-    @RacerRouteRule(field = "type", matches = "BROADCAST",
-                    to = "email",  action = RouteAction.FORWARD_AND_PROCESS),
-    // Catch-all: discard anything unrecognised
-    @RacerRouteRule(field = "type", matches = ".*",
-                    to = "",       action = RouteAction.DROP)
-})
-public class NotificationRouter {
-    // No methods required — RacerRouterService reads the annotations at startup
+@Configuration
+public class NotificationRouterConfig {
+
+    @Bean
+    public RacerFunctionalRouter notificationRouter() {
+        return RacerFunctionalRouter.builder()
+                .name("notification-router")
+                // Single-destination routes
+                .route(fieldEquals("type", "EMAIL"), forward("email"))
+                .route(fieldEquals("type", "SMS"),   forward("sms"))
+                .route(fieldEquals("type", "PUSH"),  forward("push"))
+                // True fan-out: publish to email AND sms in one rule, then process locally
+                .route(fieldEquals("type", "BROADCAST"), multicastAndProcess("email", "sms", "push"))
+                // Composable predicates: audit only if sender is checkout-service
+                .route(fieldEquals("type", "AUDIT")
+                               .and(senderEquals("checkout-service")), forward("audit"))
+                // Catch-all: discard anything unrecognised
+                .defaultRoute(drop())
+                .build();
+    }
 }
 ```
 
-> **First match wins.** Put more-specific patterns before general regex catch-alls.
-> Exact string literals like `"EMAIL"` are implicitly anchored; `".*"` is the wildcard.
+> **First match wins.** Put more-specific predicates before the `defaultRoute` catch-all.
+> Rules are pure Java — no annotation parsing, no reflection, fully testable without a
+> Spring context.
+>
+> **True fan-out** (the `BROADCAST` case) is natively expressed by `multicastAndProcess`.
+> The old annotation-based approach required a workaround with `FORWARD_AND_PROCESS` on
+> a single alias and could not reliably target more than one destination per rule.
 
 ---
 
@@ -1646,7 +1663,7 @@ NotifyController
 | `@PublishResult(channelRef=...)` | `NotificationService` | AOP publish on method return |
 | `@RacerPriority(defaultLevel="HIGH")` | `NotificationService.sendUrgentPush()` | Route to priority sub-channel |
 | `RacerTransaction.execute(tx -> ...)` | `NotificationService.sendBroadcast()` | Batch multi-channel publish |
-| `@RacerRoute` + `@RacerRouteRule` | `NotificationRouter` | Content-based routing by `type` field |
+| `RacerFunctionalRouter` DSL | `NotificationRouterConfig` | Content-based routing by `type` field with native fan-out |
 | `RacerMessageInterceptor` | `CorrelationInterceptor` | Log correlation ID per incoming message |
 | `RacerMessageInterceptor` | `AuditInterceptor` | Reject messages with no sender |
 | `@RacerListener` (plain) | `AuditCollector` | Subscribe to audit channel |
