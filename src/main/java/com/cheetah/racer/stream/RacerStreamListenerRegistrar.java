@@ -92,6 +92,10 @@ public class RacerStreamListenerRegistrar extends AbstractRacerRegistrar {
     /** (streamKey, group) pairs that have been registered, used by {@link RacerConsumerLagMonitor}. */
     private final Map<String, String> trackedStreamGroups = new ConcurrentHashMap<>();
 
+    /** When set, newly registered streams are automatically tracked for consumer lag. */
+    @Nullable
+    private volatile RacerConsumerLagMonitor consumerLagMonitor;
+
     /** Ordered list of message interceptors applied before every handler invocation. */
     private volatile List<RacerMessageInterceptor> interceptors = Collections.emptyList();
 
@@ -145,6 +149,14 @@ public class RacerStreamListenerRegistrar extends AbstractRacerRegistrar {
     /** Returns registered (streamKey → group) pairs for consumer-lag tracking. */
     public Map<String, String> getTrackedStreamGroups() {
         return Collections.unmodifiableMap(trackedStreamGroups);
+    }
+
+    /**
+     * Injects the consumer lag monitor so that streams registered after the monitor
+     * bean is created are automatically tracked.
+     */
+    public void setConsumerLagMonitor(@Nullable RacerConsumerLagMonitor consumerLagMonitor) {
+        this.consumerLagMonitor = consumerLagMonitor;
     }
 
     public RacerStreamListenerRegistrar(
@@ -206,6 +218,10 @@ public class RacerStreamListenerRegistrar extends AbstractRacerRegistrar {
 
         // Register for consumer-lag tracking (3.4)
         trackedStreamGroups.put(streamKey, group);
+        RacerConsumerLagMonitor lagMonitor = this.consumerLagMonitor;
+        if (lagMonitor != null) {
+            lagMonitor.trackStream(streamKey, group);
+        }
 
         final boolean dedupEnabled = ann.dedup();
 

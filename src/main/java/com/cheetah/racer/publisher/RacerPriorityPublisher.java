@@ -7,6 +7,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import reactor.core.publisher.Mono;
 
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * Routes messages to priority sub-channels (R-10 — Message Priority).
  *
@@ -42,6 +44,9 @@ public class RacerPriorityPublisher {
 
     /** Segment inserted between the base channel name and the priority level. */
     public static final String PRIORITY_SEGMENT = ":priority:";
+
+    /** Cache of computed priority channel names to avoid repeated string concatenation. */
+    private static final ConcurrentHashMap<String, String> CHANNEL_NAME_CACHE = new ConcurrentHashMap<>();
 
     private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
@@ -98,7 +103,10 @@ public class RacerPriorityPublisher {
      * @return e.g. {@code racer:orders:priority:HIGH}
      */
     public static String priorityChannelName(String baseChannelName, String level) {
-        return baseChannelName + PRIORITY_SEGMENT + level.toUpperCase();
+        String upperLevel = level.toUpperCase();
+        return CHANNEL_NAME_CACHE.computeIfAbsent(
+                baseChannelName + "|" + upperLevel,
+                k -> baseChannelName + PRIORITY_SEGMENT + upperLevel);
     }
 
     // -------------------------------------------------------------------------

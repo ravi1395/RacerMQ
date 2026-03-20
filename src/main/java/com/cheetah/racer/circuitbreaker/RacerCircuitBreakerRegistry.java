@@ -61,6 +61,11 @@ public class RacerCircuitBreakerRegistry {
                     cfg.getPermittedCallsInHalfOpenState());
             // State ordinals: CLOSED=0, OPEN=1, HALF_OPEN=2
             racerMetrics.registerCircuitBreakerStateGauge(id, () -> cb.getState().ordinal());
+            // Expose additional counters for observability
+            // Transition and rejection counters are recorded inline by the breaker itself
+            // and surfaced via Micrometer by periodic recording in the caller's dispatch path.
+            // For callers using the metrics port directly, the breaker exposes
+            //   getTransitionCount() and getRejectedCount() for gauge-style scraping.
             return cb;
         });
     }

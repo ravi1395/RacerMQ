@@ -46,6 +46,7 @@ import java.lang.annotation.*;
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
+@Repeatable(PublishResults.class)
 public @interface PublishResult {
 
     /**
@@ -117,4 +118,20 @@ public @interface PublishResult {
      * Must be &gt; 0.
      */
     int concurrency() default 4;
+
+    /**
+     * Per-annotation priority level override (e.g. {@code "HIGH"}, {@code "NORMAL"}, {@code "LOW"}).
+     *
+     * <p>When non-empty, the return value is published to the priority sub-channel
+     * {@code <channel>:priority:<LEVEL>} instead of the base channel — regardless of
+     * whether a method-level {@link RacerPriority} annotation is present.
+     *
+     * <p>When empty (the default), falls back to the method-level {@link RacerPriority}
+     * annotation if present, or publishes to the standard (non-priority) channel.
+     *
+     * <p>This attribute is primarily useful when multiple {@code @PublishResult}
+     * annotations are present on the same method and only <em>some</em> channels
+     * require priority routing.
+     */
+    String priority() default "";
 }

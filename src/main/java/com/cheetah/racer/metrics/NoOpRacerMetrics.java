@@ -25,8 +25,11 @@ public final class NoOpRacerMetrics implements RacerMetricsPort {
     @Override public void registerAutoConcurrencyGauge(String listenerId, Supplier<Number> concurrencySupplier) {}
     @Override public void registerStreamConsumerLagGauge(String streamKey, Supplier<Number> lagSupplier) {}
     @Override public void registerCircuitBreakerStateGauge(String listenerId, Supplier<Number> stateSupplier) {}
+    @Override public void recordCircuitBreakerTransition(String listenerId, String fromState, String toState) {}
+    @Override public void recordCircuitBreakerRejection(String listenerId) {}
     @Override public void registerBackPressureActiveGauge(Supplier<Number> activeSupplier) {}
     @Override public void recordBackPressureEvent(String state) {}
+    @Override public void recordBackPressureDrop(String listenerId) {}
     @Override public void recordDedupDuplicate(String listenerId) {}
     @Override public void initializeDedupCounter(String listenerId) {}
 }

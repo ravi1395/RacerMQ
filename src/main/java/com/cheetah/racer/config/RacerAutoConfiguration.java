@@ -79,6 +79,44 @@ import java.util.concurrent.atomic.AtomicInteger;
 @EnableConfigurationProperties(RacerProperties.class)
 public class RacerAutoConfiguration {
 
+    /**
+     * Validates numeric configuration properties at startup and throws
+     * {@link IllegalStateException} on invalid values.
+     */
+    @Bean
+    public Object racerPropertiesValidator(RacerProperties props) {
+        // ── Circuit breaker ──────────────────────────────────────────────
+        RacerProperties.CircuitBreakerProperties cb = props.getCircuitBreaker();
+        if (cb.isEnabled()) {
+            check(cb.getFailureRateThreshold() >= 1 && cb.getFailureRateThreshold() <= 100,
+                    "racer.circuit-breaker.failure-rate-threshold must be between 1 and 100, got " + cb.getFailureRateThreshold());
+            check(cb.getSlidingWindowSize() >= 1,
+                    "racer.circuit-breaker.sliding-window-size must be >= 1, got " + cb.getSlidingWindowSize());
+            check(cb.getWaitDurationInOpenStateSeconds() >= 1,
+                    "racer.circuit-breaker.wait-duration-in-open-state-seconds must be >= 1, got " + cb.getWaitDurationInOpenStateSeconds());
+            check(cb.getPermittedCallsInHalfOpenState() >= 1,
+                    "racer.circuit-breaker.permitted-calls-in-half-open-state must be >= 1, got " + cb.getPermittedCallsInHalfOpenState());
+        }
+        // ── Dedup ────────────────────────────────────────────────────────
+        RacerProperties.DedupProperties dd = props.getDedup();
+        if (dd.isEnabled()) {
+            check(dd.getTtlSeconds() >= 1,
+                    "racer.dedup.ttl-seconds must be >= 1, got " + dd.getTtlSeconds());
+            check(dd.getKeyPrefix() != null && !dd.getKeyPrefix().isBlank(),
+                    "racer.dedup.key-prefix must not be blank");
+        }
+        // ── DLQ ──────────────────────────────────────────────────────────
+        check(props.getDlq().getMaxSize() >= 1,
+                "racer.dlq.max-size must be >= 1, got " + props.getDlq().getMaxSize());
+        return new Object(); // sentinel bean
+    }
+
+    private static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new IllegalStateException("[racer] Invalid configuration: " + message);
+        }
+    }
+
     @Bean
     public RacerPublisherRegistry racerPublisherRegistry(
             RacerProperties racerProperties,
@@ -99,9 +137,11 @@ public class RacerAutoConfiguration {
     public PublishResultAspect publishResultAspect(
             RacerPublisherRegistry racerPublisherRegistry,
             RacerStreamPublisher racerStreamPublisher,
-            RacerProperties racerProperties) {
+            RacerProperties racerProperties,
+            Optional<RacerPriorityPublisher> racerPriorityPublisher) {
 
-        return new PublishResultAspect(racerPublisherRegistry, racerStreamPublisher, racerProperties);
+        return new PublishResultAspect(racerPublisherRegistry, racerStreamPublisher,
+                racerProperties, racerPriorityPublisher.orElse(null));
     }
 
     @Bean
@@ -303,8 +343,10 @@ public class RacerAutoConfiguration {
     @Bean
     public DeadLetterQueueService deadLetterQueueService(
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
-            ObjectMapper objectMapper) {
-        return new DeadLetterQueueService(reactiveStringRedisTemplate, objectMapper);
+            ObjectMapper objectMapper,
+            RacerProperties racerProperties) {
+        return new DeadLetterQueueService(reactiveStringRedisTemplate, objectMapper,
+                racerProperties.getDlq().getMaxSize());
     }
 
     // ── DLQ metrics gauge ────────────────────────────────────────────────────
@@ -379,6 +421,7 @@ public class RacerAutoConfiguration {
             ObjectProvider<RacerDeadLetterHandler> deadLetterHandler,
             ObjectProvider<RacerDedupService> racerDedupService,
             ObjectProvider<RacerCircuitBreakerRegistry> racerCircuitBreakerRegistry,
+            ObjectProvider<RacerConsumerLagMonitor> consumerLagMonitorProvider,
             ApplicationContext applicationContext) {
         RacerStreamListenerRegistrar registrar = new RacerStreamListenerRegistrar(
                 reactiveStringRedisTemplate,
@@ -390,6 +433,10 @@ public class RacerAutoConfiguration {
         registrar.setDeadLetterHandlerProvider(deadLetterHandler);
         registrar.setDedupServiceProvider(racerDedupService);
         registrar.setCircuitBreakerRegistryProvider(racerCircuitBreakerRegistry);
+        RacerConsumerLagMonitor lagMonitor = consumerLagMonitorProvider.getIfAvailable();
+        if (lagMonitor != null) {
+            registrar.setConsumerLagMonitor(lagMonitor);
+        }
         List<RacerMessageInterceptor> interceptors = new ArrayList<>(
                 applicationContext.getBeansOfType(RacerMessageInterceptor.class).values());
         AnnotationAwareOrderComparator.sort(interceptors);

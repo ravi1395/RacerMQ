@@ -83,7 +83,8 @@ public final class MessageEnvelopeBuilder {
                                       String channel, String sender, Object payload,
                                       boolean routed, @Nullable String messageId) {
         return Mono.fromCallable(() -> {
-            Map<String, Object> envelope = new LinkedHashMap<>();
+            // 6 fields standard + 1 optional (routed) → capacity 8 avoids rehash
+            Map<String, Object> envelope = new LinkedHashMap<>(8);
             envelope.put("id",        messageId != null ? messageId : UUID.randomUUID().toString());
             envelope.put("channel",   channel);
             envelope.put("sender",    sender);
@@ -102,7 +103,8 @@ public final class MessageEnvelopeBuilder {
                                                    String channel, String sender,
                                                    String priority, Object payload) {
         return Mono.fromCallable(() -> {
-            Map<String, Object> envelope = new LinkedHashMap<>();
+            // 7 fields → capacity 10 (load-factor 0.75) avoids rehash
+            Map<String, Object> envelope = new LinkedHashMap<>(10);
             envelope.put("id",        UUID.randomUUID().toString());
             envelope.put("channel",   channel);
             envelope.put("sender",    sender);
@@ -120,7 +122,8 @@ public final class MessageEnvelopeBuilder {
     public static Mono<String> buildStream(ObjectMapper objectMapper,
                                             String sender, Object payload) {
         return Mono.fromCallable(() -> {
-            Map<String, Object> envelope = new LinkedHashMap<>();
+            // 4 fields → capacity 6 avoids rehash
+            Map<String, Object> envelope = new LinkedHashMap<>(6);
             envelope.put("id",        UUID.randomUUID().toString());
             envelope.put("sender",    sender);
             envelope.put("timestamp", Instant.now().toString());

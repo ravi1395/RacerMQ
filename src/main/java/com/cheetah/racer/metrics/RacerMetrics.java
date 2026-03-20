@@ -222,6 +222,33 @@ public class RacerMetrics implements RacerMetricsPort {
                 .register(registry);
     }
 
+    /**
+     * Increments {@code racer.circuit.breaker.transitions} for the given listener,
+     * tagged with the old and new state (e.g. CLOSED→OPEN).
+     */
+    @Override
+    public void recordCircuitBreakerTransition(String listenerId, String fromState, String toState) {
+        Counter.builder("racer.circuit.breaker.transitions")
+                .description("Number of circuit breaker state transitions")
+                .tag("listener", listenerId)
+                .tag("from", fromState)
+                .tag("to", toState)
+                .register(registry)
+                .increment();
+    }
+
+    /**
+     * Increments {@code racer.circuit.breaker.rejected} for the given listener.
+     */
+    @Override
+    public void recordCircuitBreakerRejection(String listenerId) {
+        Counter.builder("racer.circuit.breaker.rejected")
+                .description("Number of calls rejected by an open circuit breaker")
+                .tag("listener", listenerId)
+                .register(registry)
+                .increment();
+    }
+
     // -----------------------------------------------------------------------
     // Back-pressure metrics
     // -----------------------------------------------------------------------
@@ -249,6 +276,19 @@ public class RacerMetrics implements RacerMetricsPort {
         Counter.builder("racer.backpressure.events")
                 .description("Number of back-pressure activation / deactivation transitions")
                 .tag("state", state)
+                .register(registry)
+                .increment();
+    }
+
+    /**
+     * Increments {@code racer.backpressure.drops} — a message was routed to the DLQ
+     * because the listener's thread pool was saturated.
+     */
+    @Override
+    public void recordBackPressureDrop(String listenerId) {
+        Counter.builder("racer.backpressure.drops")
+                .description("Messages dropped to DLQ due to back-pressure")
+                .tag("listener", listenerId)
                 .register(registry)
                 .increment();
     }

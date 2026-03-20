@@ -100,6 +100,26 @@ public class RacerProperties {
     /** Retention / pruning configuration. */
     private RetentionProperties retention = new RetentionProperties();
 
+    // ── DLQ capacity ─────────────────────────────────────────────────────────
+
+    /**
+     * Dead Letter Queue capacity settings.
+     * Mapped under {@code racer.dlq.*}.
+     */
+    @Data
+    public static class DlqProperties {
+
+        /**
+         * Maximum number of entries allowed in the DLQ Redis list.
+         * Once exceeded, the oldest entries are trimmed after each enqueue.
+         * Defaults to {@code 10 000}.
+         */
+        private long maxSize = 10_000;
+    }
+
+    /** DLQ capacity configuration. */
+    private DlqProperties dlq = new DlqProperties();
+
     // ── R-8: Consumer Scaling ────────────────────────────────────────────────
 
     /**

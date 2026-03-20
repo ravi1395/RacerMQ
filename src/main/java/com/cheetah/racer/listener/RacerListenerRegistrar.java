@@ -110,6 +110,9 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
     /** Adaptive tuners for AUTO-mode listeners — shut down on application stop. */
     private final Map<String, AdaptiveConcurrencyTuner> tuners = new ConcurrentHashMap<>();
 
+    /** Per-listener schedulers — isolates thread pools so a slow listener cannot starve others. */
+    private final Map<String, Scheduler> perListenerSchedulers = new ConcurrentHashMap<>();
+
     // ── Phase 3 optional extensions ─────────────────────────────────────────
 
     /** Injected when {@code racer.dedup.enabled=true}. */
@@ -231,6 +234,23 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
     @Override
     protected void additionalDisposeCleanup() {
         tuners.values().forEach(AdaptiveConcurrencyTuner::shutdown);
+        perListenerSchedulers.values().forEach(Scheduler::dispose);
+        perListenerSchedulers.clear();
+    }
+
+    /**
+     * Returns (creating on first access) a bounded-elastic scheduler dedicated to
+     * the given listener.  Thread count is capped at the listener's effective
+     * concurrency so that a slow handler cannot monopolize the global pool.
+     */
+    private Scheduler schedulerForListener(String listenerId, int concurrency) {
+        return perListenerSchedulers.computeIfAbsent(listenerId, id ->
+                Schedulers.newBoundedElastic(
+                        Math.max(1, concurrency),
+                        Schedulers.DEFAULT_BOUNDED_ELASTIC_QUEUESIZE,
+                        "racer-" + id,
+                        60,
+                        true));
     }
 
     // ── BeanPostProcessor ────────────────────────────────────────────────────
@@ -318,11 +338,13 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
 
             // flatMap has no reactive cap (Integer.MAX_VALUE); the semaphore inside
             // AdaptiveConcurrencyTuner is the sole throttle and is dynamically resized.
+            final Scheduler scheduler = schedulerForListener(listenerId,
+                    racerProperties.getThreadPool().getMaxSize());
             Disposable sub = listenerContainer
                     .receive(ChannelTopic.of(resolvedChannel))
                     .flatMap(msg ->
                             Mono.fromCallable(() -> { tuner.acquireSlot(); return msg; })
-                                    .subscribeOn(listenerScheduler)
+                                    .subscribeOn(scheduler)
                                     .flatMap(m ->
                                             dispatch(bean, method, m, listenerId, resolvedChannel, dedupEnabled)
                                                     .doFinally(signal -> tuner.releaseSlot()))
@@ -350,11 +372,12 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
                     beanName, method.getName(), resolvedChannel,
                     ann.mode(), effectiveConcurrency, dedupEnabled);
 
+            final Scheduler scheduler = schedulerForListener(listenerId, effectiveConcurrency);
             Disposable sub = listenerContainer
                     .receive(ChannelTopic.of(resolvedChannel))
                     .flatMap(msg ->
                             Mono.fromCallable(() -> msg)
-                                    .subscribeOn(listenerScheduler)
+                                    .subscribeOn(scheduler)
                                     .flatMap(m ->
                                             dispatch(bean, method, m, listenerId, resolvedChannel, dedupEnabled))
                                     .onErrorResume(ex -> {
@@ -475,10 +498,21 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
         }
         return Mono.<Void>defer(() -> {
 
-            // 0a. Back-pressure gate — silently drop when queue is saturated
+            // 0a. Back-pressure gate — route to DLQ when queue is saturated
             if (backPressureActive.get()) {
-                log.debug("[RACER-LISTENER] '{}' back-pressure active — dropping message", listenerId);
-                return Mono.empty();
+                log.warn("[RACER-LISTENER] '{}' back-pressure active — routing message to DLQ", listenerId);
+                racerMetrics.recordBackPressureDrop(listenerId);
+                RacerMessage bpMessage;
+                try {
+                    bpMessage = objectMapper.readValue(rawJson, RacerMessage.class);
+                } catch (Exception parseEx) {
+                    log.error("[RACER-LISTENER] '{}' back-pressure drop — cannot deserialize for DLQ: {}",
+                            listenerId, parseEx.getMessage());
+                    return Mono.empty();
+                }
+                return enqueueDeadLetter(bpMessage,
+                        new IllegalStateException("Back-pressure active on listener '" + listenerId + "'"))
+                        .then();
             }
 
             // 0b. Circuit breaker gate
@@ -487,6 +521,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
             if (cb != null && !cb.isCallPermitted()) {
                 log.debug("[RACER-LISTENER] '{}' circuit {} — skipping message",
                         listenerId, cb.getState());
+                racerMetrics.recordCircuitBreakerRejection(listenerId);
                 return Mono.empty();
             }
 
@@ -656,7 +691,7 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
 
         Mono<Void> invocation = Mono
                 .fromCallable(() -> method.invoke(bean, resolvedArgs))
-                .subscribeOn(listenerScheduler)
+                .subscribeOn(perListenerSchedulers.getOrDefault(listenerId, listenerScheduler))
                 .flatMap(result -> {
                     if (result instanceof Mono<?> mono) {
                         return mono.then();

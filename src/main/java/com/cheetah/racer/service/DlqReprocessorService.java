@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.lang.Nullable;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.util.concurrent.atomic.AtomicLong;
@@ -75,14 +76,25 @@ public class DlqReprocessorService {
                 });
     }
 
+    /** Batch size for iterative DLQ draining — avoids deeply nested Mono chains. */
+    private static final int BATCH_CHUNK = 100;
+
     private Mono<Long> republishBatch(long remaining) {
         if (remaining <= 0) return Mono.just(0L);
 
-        return dlqService.dequeue()
-                .flatMap(dlm -> republishMessage(dlm)
-                        .flatMap(sent -> republishBatch(remaining - 1)
-                                .map(rest -> rest + (sent > 0 ? 1L : 0L))))
-                .defaultIfEmpty(0L);
+        // Iterative expand: dequeue up to BATCH_CHUNK per iteration, accumulate count
+        return Flux.range(0, (int) Math.min(remaining, BATCH_CHUNK))
+                .concatMap(i -> dlqService.dequeue()
+                        .flatMap(this::republishMessage)
+                        .defaultIfEmpty(0L))
+                .reduce(0L, (acc, sent) -> acc + (sent > 0 ? 1L : 0L))
+                .flatMap(count -> {
+                    long next = remaining - BATCH_CHUNK;
+                    if (next > 0 && count > 0) {
+                        return republishBatch(next).map(rest -> rest + count);
+                    }
+                    return Mono.just(count);
+                });
     }
 
     private Mono<Long> republishMessage(DeadLetterMessage dlm) {

@@ -6,7 +6,6 @@ import com.cheetah.racer.model.DeadLetterMessage;
 import com.cheetah.racer.model.RacerMessage;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import reactor.core.publisher.Flux;
@@ -23,11 +22,27 @@ import reactor.core.publisher.Mono;
  * <p>Registered as a Spring bean by {@link com.cheetah.racer.config.RacerAutoConfiguration}.
  */
 @Slf4j
-@RequiredArgsConstructor
 public class DeadLetterQueueService implements RacerDeadLetterHandler {
+
+    /** Default maximum DLQ entries; older entries are trimmed on each enqueue. */
+    public static final long DEFAULT_MAX_SIZE = 10_000;
 
     private final ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate;
     private final ObjectMapper objectMapper;
+    private final long maxSize;
+
+    public DeadLetterQueueService(ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+                                   ObjectMapper objectMapper) {
+        this(reactiveStringRedisTemplate, objectMapper, DEFAULT_MAX_SIZE);
+    }
+
+    public DeadLetterQueueService(ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+                                   ObjectMapper objectMapper,
+                                   long maxSize) {
+        this.reactiveStringRedisTemplate = reactiveStringRedisTemplate;
+        this.objectMapper = objectMapper;
+        this.maxSize = maxSize > 0 ? maxSize : DEFAULT_MAX_SIZE;
+    }
 
     /**
      * Push a failed message to the DLQ (LPUSH — newest entries first).
@@ -40,7 +55,17 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
             log.warn("[DLQ] Enqueuing failed message id={} error='{}'", message.getId(), error.getMessage());
             return reactiveStringRedisTemplate.opsForList()
                     .leftPush(RedisChannels.DEAD_LETTER_QUEUE, json)
-                    .doOnSuccess(size -> log.debug("[DLQ] Queue size after enqueue: {}", size));
+                    .flatMap(size -> {
+                        log.debug("[DLQ] Queue size after enqueue: {}", size);
+                        if (size > maxSize) {
+                            // Trim oldest entries beyond the capacity limit
+                            return reactiveStringRedisTemplate.opsForList()
+                                    .trim(RedisChannels.DEAD_LETTER_QUEUE, 0, maxSize - 1)
+                                    .doOnSuccess(v -> log.warn("[DLQ] Trimmed queue to {} entries (was {})", maxSize, size))
+                                    .thenReturn(size);
+                        }
+                        return Mono.just(size);
+                    });
         } catch (JsonProcessingException e) {
             log.error("[DLQ] Failed to serialize dead letter message", e);
             return Mono.error(e);

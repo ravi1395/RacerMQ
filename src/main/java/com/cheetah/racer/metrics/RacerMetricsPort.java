@@ -38,9 +38,18 @@ public interface RacerMetricsPort {
 
     void registerCircuitBreakerStateGauge(String listenerId, Supplier<Number> stateSupplier);
 
+    /** Increments the circuit breaker transition counter for the given listener. */
+    void recordCircuitBreakerTransition(String listenerId, String fromState, String toState);
+
+    /** Increments the circuit breaker rejected-call counter for the given listener. */
+    void recordCircuitBreakerRejection(String listenerId);
+
     void registerBackPressureActiveGauge(Supplier<Number> activeSupplier);
 
     void recordBackPressureEvent(String state);
+
+    /** Increments the back-pressure drop counter for the given listener. */
+    void recordBackPressureDrop(String listenerId);
 
     void recordDedupDuplicate(String listenerId);
 

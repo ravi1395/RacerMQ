@@ -48,6 +48,11 @@ public class RacerCircuitBreaker {
     /** Probe-call counter used in HALF_OPEN state. */
     private final AtomicInteger halfOpenProbes = new AtomicInteger(0);
 
+    /** Total number of state transitions (CLOSED→OPEN, OPEN→HALF_OPEN, HALF_OPEN→CLOSED, etc.). */
+    private final AtomicLong transitionCount = new AtomicLong(0);
+    /** Total number of calls rejected while the circuit was OPEN. */
+    private final AtomicLong rejectedCount = new AtomicLong(0);
+
     public RacerCircuitBreaker(String name,
                                int slidingWindowSize,
                                float failureRateThreshold,
@@ -73,10 +78,12 @@ public class RacerCircuitBreaker {
                 if (elapsed >= waitDurationMs) {
                     if (state.compareAndSet(State.OPEN, State.HALF_OPEN)) {
                         halfOpenProbes.set(0);
+                        transitionCount.incrementAndGet();
                         log.info("[CIRCUIT-BREAKER] '{}' → HALF_OPEN (wait elapsed)", name);
                     }
                     yield state.get() != State.OPEN; // allow only if CAS succeeded or another thread beat us
                 }
+                rejectedCount.incrementAndGet();
                 yield false;
             }
             case HALF_OPEN -> halfOpenProbes.incrementAndGet() <= permittedCallsInHalfOpen;
@@ -94,6 +101,7 @@ public class RacerCircuitBreaker {
             if (state.compareAndSet(State.HALF_OPEN, State.CLOSED)) {
                 window.clear();
                 failureCount.set(0);
+                transitionCount.incrementAndGet();
                 log.info("[CIRCUIT-BREAKER] '{}' → CLOSED (probes successful)", name);
             }
         } else if (s == State.CLOSED) {
@@ -111,6 +119,7 @@ public class RacerCircuitBreaker {
         if (s == State.HALF_OPEN) {
             if (state.compareAndSet(State.HALF_OPEN, State.OPEN)) {
                 openedAt.set(System.currentTimeMillis());
+                transitionCount.incrementAndGet();
                 log.warn("[CIRCUIT-BREAKER] '{}' → OPEN (probe failed)", name);
             }
         } else if (s == State.CLOSED) {
@@ -140,6 +149,7 @@ public class RacerCircuitBreaker {
             if (rate >= failureRateThreshold) {
                 if (state.compareAndSet(State.CLOSED, State.OPEN)) {
                     openedAt.set(System.currentTimeMillis());
+                    transitionCount.incrementAndGet();
                     log.warn("[CIRCUIT-BREAKER] '{}' → OPEN (failure rate {:.1f}% >= threshold {}%)",
                             name, rate, failureRateThreshold);
                 }
@@ -155,5 +165,15 @@ public class RacerCircuitBreaker {
     /** Returns the listener name this breaker is associated with. */
     public String getName() {
         return name;
+    }
+
+    /** Returns the total number of state transitions since creation. */
+    public long getTransitionCount() {
+        return transitionCount.get();
+    }
+
+    /** Returns the total number of rejected calls (while OPEN) since creation. */
+    public long getRejectedCount() {
+        return rejectedCount.get();
     }
 }
