@@ -174,16 +174,19 @@ public class RacerAutoConfiguration {
     public RacerRouterService racerRouterService(
             ApplicationContext applicationContext,
             RacerPublisherRegistry racerPublisherRegistry,
-            ObjectMapper objectMapper) {
-        return new RacerRouterService(applicationContext, racerPublisherRegistry, objectMapper);
+            ObjectMapper objectMapper,
+            Optional<RacerPriorityPublisher> racerPriorityPublisher) {
+        return new RacerRouterService(applicationContext, racerPublisherRegistry, objectMapper,
+                racerPriorityPublisher.orElse(null));
     }
 
     // ── Transaction support ──────────────────────────────────────────────────
 
     @Bean
     public RacerTransaction racerTransaction(RacerPublisherRegistry racerPublisherRegistry,
+                                              ObjectMapper objectMapper,
                                               Optional<RacerPipelinedPublisher> pipelinedPublisher) {
-        return new RacerTransaction(racerPublisherRegistry, pipelinedPublisher.orElse(null));
+        return new RacerTransaction(racerPublisherRegistry, objectMapper, pipelinedPublisher.orElse(null));
     }
 
     // ── R-9: Pipelined batch publisher ───────────────────────────────────────
@@ -533,6 +536,13 @@ public class RacerAutoConfiguration {
                 objectMapper,
                 racerProperties,
                 racerMetrics.orElse(null));
+    }
+
+    // ── @PublishResult void-method startup validation ──────────────────────
+
+    @Bean
+    public PublishResultMethodValidator publishResultMethodValidator(ApplicationContext applicationContext) {
+        return new PublishResultMethodValidator(applicationContext);
     }
 
     // ── Retention scheduling (opt-in via racer.retention-enabled=true) ──────

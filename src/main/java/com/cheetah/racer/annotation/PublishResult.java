@@ -39,6 +39,27 @@ import java.lang.annotation.*;
  *
  * <p>Requires {@link EnableRacer} to be active and the bean to be a Spring proxy.
  *
+ * <h3>Self-invocation caveat</h3>
+ * <p>{@code @PublishResult} relies on Spring AOP proxying.  When a method annotated
+ * with {@code @PublishResult} is called from <em>within the same bean</em>
+ * ({@code this.method(...)}), the proxy is bypassed and the annotation <strong>never
+ * fires</strong>.</p>
+ * <pre>
+ * // ❌ Self-invocation — annotation is silently ignored:
+ * public void caller() {
+ *     this.createOrder(req);         // proxy bypassed, result NOT published
+ * }
+ *
+ * // ✅ External invocation — works correctly:
+ * {@literal @}Autowired OrderService orderService;
+ * public void caller() {
+ *     orderService.createOrder(req); // goes through proxy, result published
+ * }
+ * </pre>
+ * <p>If you need to invoke the annotated method from within the same class, inject
+ * the bean via {@code @Autowired} (self-injection) or use
+ * {@code applicationContext.getBean(MyService.class).method(...)}.
+ *
  * <p><b>Concurrency note:</b> {@link #mode()} and {@link #concurrency()} only affect
  * {@code Flux&lt;T&gt;} return types. For {@code Mono&lt;T&gt;} and plain objects a single
  * publish operation is always used.

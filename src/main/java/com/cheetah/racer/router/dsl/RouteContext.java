@@ -23,4 +23,19 @@ public interface RouteContext {
      * Publishes {@code message} to the given channel alias with an overridden sender label.
      */
     void publishTo(String alias, RacerMessage message, String sender);
+
+    /**
+     * Publishes {@code message} to the priority sub-channel
+     * {@code <channel>:priority:<level>} for the given alias.
+     *
+     * <p>Requires {@code racer.priority.enabled=true} and a
+     * {@link com.cheetah.racer.publisher.RacerPriorityPublisher} bean to be present.
+     * If priority publishing is not configured, the message is published to the
+     * standard channel as a fallback.
+     *
+     * @param alias channel alias declared under {@code racer.channels.*}
+     * @param message the message to publish
+     * @param level priority level (e.g. {@code "HIGH"}, {@code "NORMAL"}, {@code "LOW"})
+     */
+    void publishToWithPriority(String alias, RacerMessage message, String level);
 }

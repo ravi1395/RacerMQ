@@ -621,6 +621,12 @@ public class RacerProperties {
          * Defaults to {@code 1000}.
          */
         private long lagWarnThreshold = 1_000;
+
+        /**
+         * Lag value above which the health indicator flips to {@code OUT_OF_SERVICE}.
+         * Defaults to {@code 10_000}.  Set to {@code 0} to disable the health-status flip.
+         */
+        private long lagDownThreshold = 10_000;
     }
 
     /** Consumer-group lag configuration (3.4). */

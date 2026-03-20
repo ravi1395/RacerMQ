@@ -1,13 +1,19 @@
 package com.cheetah.racer.health;
 
+import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.service.DeadLetterQueueService;
+import com.cheetah.racer.stream.RacerConsumerLagMonitor;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.boot.actuate.health.ReactiveHealthIndicator;
+import org.springframework.boot.actuate.health.Status;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.lang.Nullable;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Spring Boot Actuator {@link ReactiveHealthIndicator} for the Racer framework.
@@ -31,11 +37,27 @@ public class RacerHealthIndicator implements ReactiveHealthIndicator {
     @Nullable
     private final DeadLetterQueueService dlqService;
 
+    @Nullable
+    private final RacerConsumerLagMonitor lagMonitor;
+
+    @Nullable
+    private final RacerProperties racerProperties;
+
     public RacerHealthIndicator(
             ReactiveRedisTemplate<String, String> redisTemplate,
             @Nullable DeadLetterQueueService dlqService) {
+        this(redisTemplate, dlqService, null, null);
+    }
+
+    public RacerHealthIndicator(
+            ReactiveRedisTemplate<String, String> redisTemplate,
+            @Nullable DeadLetterQueueService dlqService,
+            @Nullable RacerConsumerLagMonitor lagMonitor,
+            @Nullable RacerProperties racerProperties) {
         this.redisTemplate = redisTemplate;
         this.dlqService = dlqService;
+        this.lagMonitor = lagMonitor;
+        this.racerProperties = racerProperties;
     }
 
     @Override
@@ -47,6 +69,7 @@ public class RacerHealthIndicator implements ReactiveHealthIndicator {
                     }
                     return enrichWithDlqDepth(health);
                 })
+                .map(this::enrichWithConsumerLag)
                 .onErrorResume(ex -> Mono.just(
                         Health.down(ex)
                               .withDetail("component", "racer")
@@ -82,5 +105,39 @@ public class RacerHealthIndicator implements ReactiveHealthIndicator {
                     builder.withDetail("dlq.depth", "unavailable");
                     return Mono.just(builder.build());
                 });
+    }
+
+    private Health enrichWithConsumerLag(Health current) {
+        if (lagMonitor == null) {
+            return current;
+        }
+
+        Map<String, AtomicLong> counters = lagMonitor.getLagCounters();
+        if (counters.isEmpty()) {
+            return current;
+        }
+
+        long downThreshold = (racerProperties != null)
+                ? racerProperties.getConsumerLag().getLagDownThreshold()
+                : 10_000;
+
+        Map<String, Long> lagDetails = new LinkedHashMap<>();
+        boolean breached = false;
+        for (Map.Entry<String, AtomicLong> entry : counters.entrySet()) {
+            long lag = entry.getValue().get();
+            lagDetails.put(entry.getKey(), lag);
+            if (downThreshold > 0 && lag > downThreshold) {
+                breached = true;
+            }
+        }
+
+        Status status = breached ? new Status("OUT_OF_SERVICE") : current.getStatus();
+        Health.Builder builder = Health.status(status);
+        current.getDetails().forEach(builder::withDetail);
+        builder.withDetail("consumer-lag", lagDetails);
+        if (breached) {
+            builder.withDetail("consumer-lag.threshold-breached", true);
+        }
+        return builder.build();
     }
 }

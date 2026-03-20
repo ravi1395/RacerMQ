@@ -1,6 +1,8 @@
 package com.cheetah.racer.health;
 
+import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.service.DeadLetterQueueService;
+import com.cheetah.racer.stream.RacerConsumerLagMonitor;
 import org.springframework.boot.actuate.health.ReactiveHealthIndicator;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.context.annotation.Bean;
@@ -24,7 +26,13 @@ public class RacerHealthAutoConfiguration {
     @Bean
     public RacerHealthIndicator racerHealthIndicator(
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
-            Optional<DeadLetterQueueService> dlqService) {
-        return new RacerHealthIndicator(reactiveStringRedisTemplate, dlqService.orElse(null));
+            Optional<DeadLetterQueueService> dlqService,
+            Optional<RacerConsumerLagMonitor> lagMonitor,
+            Optional<RacerProperties> racerProperties) {
+        return new RacerHealthIndicator(
+                reactiveStringRedisTemplate,
+                dlqService.orElse(null),
+                lagMonitor.orElse(null),
+                racerProperties.orElse(null));
     }
 }

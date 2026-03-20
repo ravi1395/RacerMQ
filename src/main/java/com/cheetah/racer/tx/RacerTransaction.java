@@ -2,6 +2,7 @@ package com.cheetah.racer.tx;
 
 import com.cheetah.racer.publisher.RacerPipelinedPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
 import reactor.core.publisher.Flux;
@@ -39,18 +40,27 @@ import java.util.function.Consumer;
 public class RacerTransaction {
 
     private final RacerPublisherRegistry registry;
+    private final ObjectMapper objectMapper;
     @Nullable
     private final RacerPipelinedPublisher pipelinedPublisher;
 
     /** Construct without pipeline support (backward-compatible). */
     public RacerTransaction(RacerPublisherRegistry registry) {
-        this(registry, null);
+        this(registry, new ObjectMapper(), null);
     }
 
     /** Construct with optional pipeline support (R-9). */
     public RacerTransaction(RacerPublisherRegistry registry,
                              @Nullable RacerPipelinedPublisher pipelinedPublisher) {
+        this(registry, new ObjectMapper(), pipelinedPublisher);
+    }
+
+    /** Full constructor with explicit ObjectMapper. */
+    public RacerTransaction(RacerPublisherRegistry registry,
+                             ObjectMapper objectMapper,
+                             @Nullable RacerPipelinedPublisher pipelinedPublisher) {
         this.registry           = registry;
+        this.objectMapper       = objectMapper;
         this.pipelinedPublisher = pipelinedPublisher;
     }
 
@@ -64,7 +74,7 @@ public class RacerTransaction {
      * @return {@code Mono<List<Long>>} — subscriber counts in registration order
      */
     public Mono<List<Long>> execute(Consumer<TxPublisher> configurer) {
-        TxPublisher tx = new TxPublisher(registry);
+        TxPublisher tx = new TxPublisher(registry, objectMapper);
         configurer.accept(tx);
         return tx.commit(pipelinedPublisher)
                 .doOnSuccess(results ->
@@ -83,7 +93,7 @@ public class RacerTransaction {
      * @return {@code Mono<List<Long>>}
      */
     public Mono<List<Long>> execute(Consumer<TxPublisher> configurer, boolean pipelined) {
-        TxPublisher tx = new TxPublisher(registry);
+        TxPublisher tx = new TxPublisher(registry, objectMapper);
         configurer.accept(tx);
         RacerPipelinedPublisher pub = pipelined ? pipelinedPublisher : null;
         return tx.commit(pub)
@@ -101,10 +111,12 @@ public class RacerTransaction {
     public static class TxPublisher {
 
         private final RacerPublisherRegistry registry;
+        private final ObjectMapper objectMapper;
         private final List<PublishEntry> entries = new ArrayList<>();
 
-        TxPublisher(RacerPublisherRegistry registry) {
-            this.registry = registry;
+        TxPublisher(RacerPublisherRegistry registry, ObjectMapper objectMapper) {
+            this.registry     = registry;
+            this.objectMapper = objectMapper;
         }
 
         /**
@@ -131,7 +143,7 @@ public class RacerTransaction {
                         .map(e -> {
                             String channelName = registry.getPublisher(e.alias()).getChannelName();
                             String sender      = e.sender() != null ? e.sender() : "racer";
-                            String payloadStr  = e.payload() instanceof String s ? s : e.payload().toString();
+                            String payloadStr  = serializePayload(e.payload());
                             return new RacerPipelinedPublisher.PipelineItem(channelName, payloadStr, sender);
                         })
                         .toList();
@@ -148,5 +160,17 @@ public class RacerTransaction {
         }
 
         private record PublishEntry(String alias, Object payload, String sender) {}
+
+        /** Serializes non-String payloads to JSON using the configured ObjectMapper. */
+        private String serializePayload(Object payload) {
+            if (payload == null) return "null";
+            if (payload instanceof String s) return s;
+            try {
+                return objectMapper.writeValueAsString(payload);
+            } catch (Exception ex) {
+                log.warn("[racer-tx] Failed to serialize payload, falling back to toString(): {}", ex.getMessage());
+                return payload.toString();
+            }
+        }
     }
 }

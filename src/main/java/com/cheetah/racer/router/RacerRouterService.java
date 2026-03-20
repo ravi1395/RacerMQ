@@ -6,6 +6,7 @@ import com.cheetah.racer.annotation.RouteAction;
 import com.cheetah.racer.annotation.RouteMatchSource;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
+import com.cheetah.racer.publisher.RacerPriorityPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
 import com.cheetah.racer.router.dsl.RacerFunctionalRouter;
 import com.cheetah.racer.router.dsl.RouteContext;
@@ -14,6 +15,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationContext;
+import org.springframework.lang.Nullable;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,6 +51,8 @@ public class RacerRouterService {
     private final ApplicationContext applicationContext;
     private final RacerPublisherRegistry registry;
     private final ObjectMapper objectMapper;
+    @Nullable
+    private final RacerPriorityPublisher priorityPublisher;
 
     private final List<CompiledRouteRule> globalRules = new ArrayList<>();
     private final List<RacerFunctionalRouter> functionalRouters = new ArrayList<>();
@@ -56,9 +60,17 @@ public class RacerRouterService {
     public RacerRouterService(ApplicationContext applicationContext,
                               RacerPublisherRegistry registry,
                               ObjectMapper objectMapper) {
+        this(applicationContext, registry, objectMapper, null);
+    }
+
+    public RacerRouterService(ApplicationContext applicationContext,
+                              RacerPublisherRegistry registry,
+                              ObjectMapper objectMapper,
+                              @Nullable RacerPriorityPublisher priorityPublisher) {
         this.applicationContext = applicationContext;
         this.registry           = registry;
         this.objectMapper       = objectMapper;
+        this.priorityPublisher  = priorityPublisher;
     }
 
     // -----------------------------------------------------------------------
@@ -333,6 +345,24 @@ public class RacerRouterService {
                             ex -> log.error("[racer-router] DSL routing failed for id={} → '{}': {}",
                                     message.getId(), alias, ex.getMessage())
                     );
+        }
+
+        @Override
+        public void publishToWithPriority(String alias, RacerMessage msg, String level) {
+            if (priorityPublisher != null) {
+                String channelName = registry.getPublisher(alias).getChannelName();
+                String sender = msg.getSender();
+                priorityPublisher.publish(channelName, msg.getPayload(), sender, level.toUpperCase())
+                        .subscribe(
+                                count -> log.debug("[racer-router] DSL priority-forwarded id={} → '{}:priority:{}' ({} subscriber(s))",
+                                        message.getId(), alias, level, count),
+                                ex -> log.error("[racer-router] DSL priority routing failed for id={} → '{}:priority:{}': {}",
+                                        message.getId(), alias, level, ex.getMessage())
+                        );
+            } else {
+                log.warn("[racer-router] publishToWithPriority called but no RacerPriorityPublisher configured — falling back to standard publish for id={}", message.getId());
+                publishTo(alias, msg);
+            }
         }
     }
 
