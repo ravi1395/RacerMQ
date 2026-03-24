@@ -112,19 +112,18 @@ public class DlqReprocessorService {
                 message.getId(), message.getChannel(),
                 message.getRetryCount(), RedisChannels.MAX_RETRY_ATTEMPTS);
 
-        try {
-            String json = objectMapper.writeValueAsString(message);
-            return redisTemplate.convertAndSend(message.getChannel(), json)
-                    .doOnSuccess(count -> {
-                        republishedCount.incrementAndGet();
-                        log.info("[DLQ-REPROCESSOR] Republished id={} -> channel='{}' (subscribers={})",
-                                message.getId(), message.getChannel(), count);
-                        racerMetrics.recordDlqReprocessed();
-                    });
-        } catch (JsonProcessingException e) {
-            log.error("[DLQ-REPROCESSOR] Failed to serialize message id={}: {}", message.getId(), e.getMessage());
-            return Mono.error(e);
-        }
+        return Mono.fromCallable(() -> objectMapper.writeValueAsString(message))
+                .flatMap(json -> redisTemplate.convertAndSend(message.getChannel(), json)
+                        .doOnSuccess(count -> {
+                            republishedCount.incrementAndGet();
+                            log.info("[DLQ-REPROCESSOR] Republished id={} -> channel='{}' (subscribers={})",
+                                    message.getId(), message.getChannel(), count);
+                            racerMetrics.recordDlqReprocessed();
+                        }))
+                .onErrorResume(JsonProcessingException.class, e -> {
+                    log.error("[DLQ-REPROCESSOR] Failed to serialize message id={}: {}", message.getId(), e.getMessage());
+                    return Mono.error(e);
+                });
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────

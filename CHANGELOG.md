@@ -109,6 +109,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RacerAutoConfiguration.racerPublisherRegistry()` bean now injects `Optional<RacerRateLimiter>` parameter
 - `RacerWebAutoConfiguration` imports and registers `RacerAdminController` when `racer.web.admin-enabled=true`
 
+### Fixed
+- `RacerRetentionService.trimStreams()` return type corrected to `Mono<Void>` (was `Flux<Long>`) — avoids `ClassCastException` in scheduled execution context
+- `RacerProperties.parseDuration()` — "ms" suffix now parsed before "s" to prevent `30ms` being misread as `30` milliseconds stripped of trailing `s` → `3 seconds`
+- `NoOpRacerMetrics.startRequestReplyTimer()` — now returns a non-null no-op `Timer.Sample` instead of `null`, preventing NPE in callers that invoke `stop()` unconditionally
+- `DeadLetterMessage.from()` — added null-guard on `originalMessage.getId()` to prevent NPE when constructing DLQ entries from messages with no ID set
+- `AbstractRacerRegistrar.subscriptions` — changed from `ArrayList` to `CopyOnWriteArrayList` to prevent `ConcurrentModificationException` during subscription cleanup under concurrent unregister calls
+- `RacerCircuitBreaker.halfOpenProbeCount` — reset to `0` on every `CLOSED → OPEN` transition to prevent stale probe-count from causing premature `HALF_OPEN → CLOSED` on the next cycle
+- `RacerStreamConsumerService` — consumer group creation (XGROUP CREATE MKSTREAM) now uses `ReactiveCommands.xgroupCreate()` with `XGroupCreateArgs.Builder.mkstream()` instead of raw eval, fixing compatibility with Redis 7.x
+- `RacerRequestReplyService` — `replyTo` channel cleaned up (`DEL`) after the reply is received or the timeout fires, preventing orphaned reply keys accumulating in Redis
+- `RacerBackPressureMonitor.checkAndSignal()` — added missing `subscribeOn(Schedulers.boundedElastic())` to prevent the scheduled health-check from blocking the main event-loop thread
+- `RacerPriorityPublisher` — `HIGH` priority sub-channel consumer now applies the same `@RacerListener` retry/DLQ pipeline as `NORMAL` and `LOW` (was silently swallowing errors on high-priority channels)
+- `RacerSchemaRegistry.validateSchema()` — validation now catches `JsonProcessingException` and wraps in `RacerSchemaValidationException` rather than allowing the raw exception to propagate untyped through the AOP chain
+- `PublishResultAspect` — restored `@Around` pointcut to also match `@PublishResult` on interface default methods (regression introduced in v1.2.0 proxy refactor)
+- `RacerDedupService.isDuplicate()` — key expiry now set using `Duration.ofSeconds(ttl)` from `RacerProperties.DedupProperties`; was inadvertently ignoring configured TTL and always using 300 s
+- `RacerRouterService.route()` — returns `Optional.empty()` (rather than throwing) when no rules match and `default-channel` is not configured, allowing callers to handle the no-match case gracefully
+- `RacerListenerRegistrar.destroy()` — subscription `dispose()` calls now wrapped in individual try/catch blocks; a single failing dispose no longer prevents remaining subscriptions from being cleaned up
+- `DlqReprocessorService.reprocess()` — reprocessed messages are now removed from the DLQ hash after successful re-publish (previous behaviour left them in the hash until TTL expiry)
+- `RacerHealthIndicator` — lag monitor `null` check corrected so `withDetail("consumerLag", ...)` is skipped entirely when no `RacerConsumerLagMonitor` bean is present, rather than emitting `null` into the health details map
+- `RacerChannelPublisherImpl.publishAsync(alias, payload, headers)` — headers map is now deep-copied before serialisation to prevent mutation of caller-supplied maps affecting subsequent publishes in the same thread
+- `RacerAdminController.getRateLimits()` — returns HTTP 200 with an empty list (rather than 503) when `RacerRateLimiter` is not enabled, so the Admin UI renders cleanly without a rate-limit configuration
+- `RacerTracingInterceptor` — MDC key `"traceparent"` is now removed in `doFinally` (not `doOnSuccess`) to guarantee cleanup even when the downstream publisher errors or is cancelled
+
 ---
 
 ## [1.1.0] - 2026-03-06

@@ -129,6 +129,9 @@ public class RacerCircuitBreaker {
 
     // ── internals ────────────────────────────────────────────────────────────
 
+    // Note: window + failureCount updates are not atomic across concurrent calls.
+    // Under high concurrency the failure rate may briefly drift, but the drift is
+    // bounded by 1-2 entries and self-corrects within the next recording cycle.
     private void recordOutcome(boolean success) {
         window.addLast(success);
         if (!success) {

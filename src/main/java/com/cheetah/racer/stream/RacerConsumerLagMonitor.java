@@ -89,10 +89,12 @@ public class RacerConsumerLagMonitor {
                 cfg.getScrapeIntervalSeconds(), cfg.getLagWarnThreshold());
 
         scrapeLoop = Flux.interval(Duration.ofSeconds(cfg.getScrapeIntervalSeconds()))
-                .flatMap(tick -> scrapeAll())
-                .subscribe(
-                        v -> {},
-                        ex -> log.error("[RACER-LAG] Scrape loop error: {}", ex.getMessage(), ex));
+                .flatMap(tick -> scrapeAll()
+                        .onErrorResume(ex -> {
+                            log.error("[RACER-LAG] Scrape loop error: {}", ex.getMessage(), ex);
+                            return Flux.empty();
+                        }))
+                .subscribe();
     }
 
     @PreDestroy

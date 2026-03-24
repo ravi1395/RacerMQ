@@ -15,10 +15,10 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -49,7 +49,7 @@ public abstract class AbstractRacerRegistrar
     protected Environment environment;
 
     /** All active subscriptions (pub/sub or polling loops), disposed on shutdown. */
-    protected final List<Disposable> subscriptions = new ArrayList<>();
+    protected final List<Disposable> subscriptions = new CopyOnWriteArrayList<>();
 
     /** Per-listener message counters. Key = listenerId. */
     protected final Map<String, AtomicLong> processedCounts = new ConcurrentHashMap<>();
@@ -81,10 +81,14 @@ public abstract class AbstractRacerRegistrar
      */
     @Nullable
     protected RacerDeadLetterHandler getDeadLetterHandler() {
-        if (deadLetterHandler == null && deadLetterHandlerProvider != null) {
-            deadLetterHandler = deadLetterHandlerProvider.getIfAvailable();
+        // Benign race: concurrent callers may both resolve the provider, but the result
+        // is the same singleton bean — no synchronization needed.
+        RacerDeadLetterHandler handler = deadLetterHandler;
+        if (handler == null && deadLetterHandlerProvider != null) {
+            handler = deadLetterHandlerProvider.getIfAvailable();
+            deadLetterHandler = handler;
         }
-        return deadLetterHandler;
+        return handler;
     }
 
     // ── Template methods ──────────────────────────────────────────────────────
@@ -120,7 +124,10 @@ public abstract class AbstractRacerRegistrar
                     logStats();
                     callback.run();
                 })
-                .subscribe();
+                .subscribe(
+                        v -> {},
+                        ex -> log.error("[{}] Unexpected error during graceful shutdown: {}",
+                                logPrefix(), ex.getMessage(), ex));
     }
 
     @Override

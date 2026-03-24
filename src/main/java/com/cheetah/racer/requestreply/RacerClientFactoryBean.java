@@ -277,10 +277,10 @@ public class RacerClientFactoryBean<T> implements FactoryBean<T>, EnvironmentAwa
     private static Duration parseDuration(String value, Duration fallback) {
         if (value == null || value.isBlank()) return fallback;
         try {
-            // Shorthand: "5s", "30s", "1m"
-            if (value.endsWith("s")) return Duration.ofSeconds(Long.parseLong(value.replace("s", "")));
-            if (value.endsWith("m")) return Duration.ofMinutes(Long.parseLong(value.replace("m", "")));
-            if (value.endsWith("ms")) return Duration.ofMillis(Long.parseLong(value.replace("ms", "")));
+            // Shorthand: "500ms", "5s", "1m" — check "ms" before "s" to avoid substring match
+            if (value.endsWith("ms")) return Duration.ofMillis(Long.parseLong(value.substring(0, value.length() - 2)));
+            if (value.endsWith("s")) return Duration.ofSeconds(Long.parseLong(value.substring(0, value.length() - 1)));
+            if (value.endsWith("m")) return Duration.ofMinutes(Long.parseLong(value.substring(0, value.length() - 1)));
             return Duration.parse(value);
         } catch (Exception e) {
             return fallback;

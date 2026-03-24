@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Instant;
@@ -80,8 +81,11 @@ public class RacerRetentionService {
     public void runRetention() {
         log.info("[racer-retention] Starting scheduled retention run (streamMaxLen={}, dlqMaxAgeHours={})",
                 streamMaxLen, dlqMaxAgeHours);
-        trimStreams();
-        pruneDlq().subscribe();
+        trimStreams()
+                .then(pruneDlq())
+                .subscribe(
+                        pruned -> {},
+                        ex -> log.error("[racer-retention] Retention run failed: {}", ex.getMessage(), ex));
     }
 
     // ── Stream trimming ───────────────────────────────────────────────────────
@@ -92,7 +96,7 @@ public class RacerRetentionService {
      * under {@code racer.channels.*}.
      * Can also be called on-demand from a controller.
      */
-    public void trimStreams() {
+    public Mono<Void> trimStreams() {
         List<String> streamKeys = new ArrayList<>();
         streamKeys.add(RedisChannels.REQUEST_STREAM);
         racerProperties.getChannels().forEach((alias, ch) -> {
@@ -103,18 +107,20 @@ public class RacerRetentionService {
                 streamKeys.add(key);
             }
         });
-        for (String streamKey : streamKeys) {
-            redisTemplate.opsForStream()
-                    .trim(streamKey, streamMaxLen, true)
-                    .subscribe(
-                            trimmed -> {
-                                if (trimmed > 0) {
-                                    totalStreamTrimmed.addAndGet(trimmed);
-                                    log.info("[racer-retention] Trimmed {} entries from stream '{}'", trimmed, streamKey);
-                                }
-                            },
-                            ex -> log.warn("[racer-retention] Cannot trim stream '{}': {}", streamKey, ex.getMessage()));
-        }
+        return Flux.fromIterable(streamKeys)
+                .flatMap(streamKey -> redisTemplate.opsForStream()
+                        .trim(streamKey, streamMaxLen, true)
+                        .doOnNext(trimmed -> {
+                            if (trimmed > 0) {
+                                totalStreamTrimmed.addAndGet(trimmed);
+                                log.info("[racer-retention] Trimmed {} entries from stream '{}'", trimmed, streamKey);
+                            }
+                        })
+                        .onErrorResume(ex -> {
+                            log.warn("[racer-retention] Cannot trim stream '{}': {}", streamKey, ex.getMessage());
+                            return Mono.just(0L);
+                        }))
+                .then();
     }
 
     // ── DLQ pruning ───────────────────────────────────────────────────────────

@@ -19,7 +19,7 @@ public final class NoOpRacerMetrics implements RacerMetricsPort {
     @Override public void recordFailed(String channel, String exceptionClass) {}
     @Override public void recordDlqReprocessed() {}
     @Override public void registerDlqSizeGauge(Supplier<Number> sizeSupplier) {}
-    @Override public Timer.Sample startRequestReplyTimer() { return null; }
+    @Override public Timer.Sample startRequestReplyTimer() { return Timer.start(io.micrometer.core.instrument.Clock.SYSTEM); }
     @Override public void stopRequestReplyTimer(Timer.Sample sample, String transport) {}
     @Override public void registerThreadPoolGauges(ThreadPoolExecutor executor) {}
     @Override public void registerAutoConcurrencyGauge(String listenerId, Supplier<Number> concurrencySupplier) {}

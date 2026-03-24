@@ -99,7 +99,7 @@ public class SchemaController {
             return Mono.just(ResponseEntity.ok(schemaDisabledResponse()));
         }
 
-        String channel = (String) body.get("channel");
+        String channel = body.get("channel") instanceof String s ? s : null;
         Object payload = body.get("payload");
 
         if (channel == null || channel.isBlank()) {
