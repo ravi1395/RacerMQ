@@ -1,3 +1,4 @@
 com.cheetah.racer.config.RacerAutoConfiguration
 com.cheetah.racer.config.RacerWebAutoConfiguration
+com.cheetah.racer.config.RacerSecurityAutoConfiguration
 com.cheetah.racer.health.RacerHealthAutoConfiguration

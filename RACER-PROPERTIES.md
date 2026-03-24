@@ -23,6 +23,10 @@ All properties use the prefix `racer.*` and are configured in `application.prope
 | [Sharding](#sharding) | `racer.sharding.*` | Key-based stream sharding |
 | [Consumer Scaling](#consumer-scaling) | `racer.consumer.*` | Stream consumer concurrency |
 | [Polling](#polling) | `racer.poll.*` | @RacerPoll scheduler toggle |
+| [Dedup](#dedup) | `racer.dedup.*` | Message deduplication |
+| [Circuit Breaker](#circuit-breaker) | `racer.circuit-breaker.*` | Per-listener circuit breaker |
+| [Back-pressure](#back-pressure) | `racer.backpressure.*` | Thread-pool queue back-pressure |
+| [Consumer Lag](#consumer-lag) | `racer.consumer-lag.*` | XPENDING lag monitoring & health |
 
 ---
 
@@ -220,6 +224,65 @@ racer.poll.enabled=true                       # false disables all @RacerPoll me
 
 ---
 
+## Dedup
+
+Idempotent message processing via Redis `SET NX EX`. Disabled by default.
+
+```properties
+racer.dedup.enabled=false                     # activate deduplication (default: false)
+racer.dedup.ttl-seconds=300                   # how long to remember a processed message ID (default: 300)
+racer.dedup.key-prefix=racer:dedup:           # Redis key prefix for dedup entries (default: "racer:dedup:")
+```
+
+Per-listener opt-in: `@RacerListener(dedup = true)` — requires `racer.dedup.enabled=true`.
+
+---
+
+## Circuit Breaker
+
+Count-based sliding-window circuit breaker per listener. Disabled by default.
+
+```properties
+racer.circuit-breaker.enabled=false                    # activate circuit breakers (default: false)
+racer.circuit-breaker.failure-rate-threshold=50        # % failures to open circuit (default: 50)
+racer.circuit-breaker.sliding-window-size=10           # number of calls in the window (default: 10)
+racer.circuit-breaker.wait-duration-in-open-state-seconds=30  # pause before half-open probe (default: 30)
+racer.circuit-breaker.permitted-calls-in-half-open-state=3    # probe calls before closing (default: 3)
+```
+
+---
+
+## Back-pressure
+
+Monitors the listener thread-pool queue and throttles consumption when the fill ratio is high. Disabled by default.
+
+```properties
+racer.backpressure.enabled=false              # activate back-pressure monitor (default: false)
+racer.backpressure.queue-threshold=0.80       # fill ratio (0.0–1.0) that triggers back-pressure (default: 0.80)
+racer.backpressure.check-interval-ms=1000     # how often to check the queue (default: 1000)
+racer.backpressure.stream-poll-backoff-ms=2000  # stream poll interval under back-pressure (default: 2000)
+```
+
+---
+
+## Consumer Lag
+
+Periodic `XPENDING` scraper that exports one `racer.stream.consumer.lag` Micrometer gauge per `(stream, group)` pair. When any lag exceeds `lag-down-threshold` the `GET /actuator/health` endpoint flips to `OUT_OF_SERVICE`. Disabled by default.
+
+```properties
+racer.consumer-lag.enabled=false              # activate lag monitoring (default: false)
+racer.consumer-lag.scrape-interval-seconds=15 # how often to call XPENDING (default: 15)
+racer.consumer-lag.lag-warn-threshold=1000    # lag that triggers a WARN log entry (default: 1000)
+racer.consumer-lag.lag-down-threshold=10000   # lag that flips /actuator/health to OUT_OF_SERVICE (default: 10000)
+                                              # set to 0 to disable the health flip
+```
+
+> **Health integration:** when `racer.consumer-lag.enabled=true`, the `GET /actuator/health` response includes a
+> `consumer-lag` detail map with each tracked `stream|group` key and its current lag value. If any value
+> exceeds `lag-down-threshold`, the overall status becomes `OUT_OF_SERVICE`.
+
+---
+
 ## Complete Example `application.properties`
 
 ```properties
@@ -314,4 +377,5 @@ racer.sharding.enabled=false
 | `racer.consumer.name-prefix` | `consumer` |
 | `racer.consumer.poll-batch-size` | `1` |
 | `racer.consumer.poll-interval-ms` | `200` |
+| `racer.consumer-lag.lag-down-threshold` | `10000` |
 | `racer.poll.enabled` | `true` |

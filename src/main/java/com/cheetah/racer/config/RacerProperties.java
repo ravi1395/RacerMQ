@@ -173,6 +173,30 @@ public class RacerProperties {
          * E.g. {@code racer:orders:stream,racer:audit:stream}.
          */
         private String streams = "";
+
+        // ── Phase 4.1 – Cluster-Aware Publishing ─────────────────────────────
+
+        /**
+         * When {@code true} (Phase 4.1), a consistent-hash ring is used to map
+         * shard keys to shard indices instead of the simple {@code CRC-16 mod N}
+         * strategy.  This allows shards to be added/removed with minimal
+         * redistribution.
+         */
+        private boolean consistentHashEnabled = false;
+
+        /**
+         * Number of virtual nodes placed on the hash ring per physical shard.
+         * More virtual nodes improve distribution uniformity at the cost of
+         * slightly more memory.  Defaults to {@code 150}.
+         */
+        private int virtualNodesPerShard = 150;
+
+        /**
+         * When {@code true} (Phase 4.1), if publishing to the primary shard fails
+         * the publisher automatically retries on the next shard in the hash ring.
+         * Defaults to {@code true} when consistent-hash is active.
+         */
+        private boolean failoverEnabled = true;
     }
 
     /** Sharding configuration (R-8). */
@@ -384,6 +408,65 @@ public class RacerProperties {
 
         /** Expose {@code GET /api/retention/config} when true. Default: {@code false}. */
         private boolean retentionEnabled = false;
+
+        /**
+         * Spring Security integration for Racer web endpoints.
+         * Mapped under {@code racer.web.security.*}.
+         *
+         * <p>When {@code racer.web.security.enabled=true} <em>and</em>
+         * {@code spring-boot-starter-security} is on the classpath, Racer registers
+         * a {@link org.springframework.security.web.server.SecurityWebFilterChain}
+         * that enforces the configured roles on every {@code /api/**} endpoint.
+         *
+         * <p>The chain is registered with {@link org.springframework.core.annotation.Order}
+         * value {@code 99}, leaving order 0-98 free for application-level chains.
+         *
+         * <p>If you already have your own {@code SecurityWebFilterChain} bean for
+         * {@code /api/racer/**} paths you can leave this disabled and secure the
+         * routes yourself.
+         */
+        @Data
+        public static class SecurityProperties {
+
+            /**
+             * When {@code true}, Racer registers its own
+             * {@code SecurityWebFilterChain} protecting {@code /api/**}.
+             * Defaults to {@code false} so existing apps are not broken.
+             */
+            private boolean enabled = false;
+
+            /**
+             * Comma-separated Spring Security role names (without the {@code ROLE_}
+             * prefix) that are required to call <em>read-only</em> endpoints:
+             * {@code GET /api/dlq/**}, {@code GET /api/schema/**},
+             * {@code GET /api/router/**}, {@code GET /api/channels/**},
+             * {@code GET /api/retention/config}.
+             * Defaults to {@code OPS}.
+             */
+            private String readRole = "OPS";
+
+            /**
+             * Comma-separated Spring Security role names (without the {@code ROLE_}
+             * prefix) that are required to call <em>mutating</em> endpoints:
+             * {@code POST /api/dlq/republish/**}, {@code DELETE /api/dlq/clear},
+             * {@code POST /api/retention/trim}.
+             * Defaults to {@code ADMIN}.
+             */
+            private String writeRole = "ADMIN";
+        }
+
+        /** Security configuration for Racer web endpoints. */
+        private SecurityProperties security = new SecurityProperties();
+
+        // ── Phase 4.4 – Admin UI ─────────────────────────────────────────────
+
+        /**
+         * When {@code true} (Phase 4.4), the Racer Admin UI endpoints at
+         * {@code /api/admin/**} and the embedded web console at
+         * {@code /racer-admin/} are registered.
+         * Defaults to {@code false}.
+         */
+        private boolean adminEnabled = false;
     }
 
     /** Web controller opt-in configuration. */
@@ -631,6 +714,98 @@ public class RacerProperties {
 
     /** Consumer-group lag configuration (3.4). */
     private ConsumerLagProperties consumerLag = new ConsumerLagProperties();
+
+    // ── 4.1 Cluster-Aware Publishing ─────────────────────────────────────────
+    //    Extend ShardingProperties below with consistent-hash options.
+
+    // ── 4.2 Distributed Tracing ───────────────────────────────────────────────
+
+    /**
+     * W3C-traceparent propagation settings.
+     * Mapped under {@code racer.tracing.*}.
+     */
+    @Data
+    public static class TracingProperties {
+
+        /**
+         * When {@code false} (default) tracing is not enabled.
+         * Set to {@code true} to propagate W3C {@code traceparent} headers across
+         * all published and consumed messages.
+         */
+        private boolean enabled = false;
+
+        /**
+         * When {@code true} (default) the {@code traceparent} value is written to
+         * MDC under the key {@code "traceparent"} for each consumed message so that
+         * log lines are automatically correlated.
+         */
+        private boolean propagateToMdc = true;
+
+        /**
+         * When {@code true} (default) the {@code traceparent} value is embedded in
+         * the message envelope JSON, enabling end-to-end trace propagation.
+         */
+        private boolean injectIntoEnvelope = true;
+    }
+
+    /** Distributed-tracing configuration (4.2). */
+    private TracingProperties tracing = new TracingProperties();
+
+    // ── 4.3 Rate Limiting ─────────────────────────────────────────────────────
+
+    /**
+     * Per-channel token-bucket rate limiting backed by Redis.
+     * Mapped under {@code racer.rate-limit.*}.
+     */
+    @Data
+    public static class RateLimitProperties {
+
+        /**
+         * When {@code false} (default) rate limiting is disabled globally.
+         */
+        private boolean enabled = false;
+
+        /**
+         * Maximum number of tokens (burst size) per channel bucket.
+         * Defaults to {@code 100}.
+         */
+        private long defaultCapacity = 100;
+
+        /**
+         * Number of tokens refilled per second in each channel bucket.
+         * Defaults to {@code 100}.
+         */
+        private long defaultRefillRate = 100;
+
+        /**
+         * Redis key prefix for rate-limit buckets.
+         * Full key: {@code <keyPrefix><channelAlias>}.
+         * Defaults to {@code "racer:ratelimit:"}.
+         */
+        private String keyPrefix = "racer:ratelimit:";
+
+        /**
+         * Per-channel overrides.  Key is the channel alias (or channel name
+         * when no alias is configured).
+         */
+        private java.util.Map<String, ChannelRateLimitProperties> channels = new java.util.LinkedHashMap<>();
+
+        /**
+         * Per-channel capacity / refill-rate overrides.
+         */
+        @Data
+        public static class ChannelRateLimitProperties {
+            /** Override capacity (-1 = use {@link RateLimitProperties#defaultCapacity}). */
+            private long capacity = -1;
+            /** Override refill rate (-1 = use {@link RateLimitProperties#defaultRefillRate}). */
+            private long refillRate = -1;
+        }
+    }
+
+    /** Rate-limiting configuration (4.3). */
+    private RateLimitProperties rateLimit = new RateLimitProperties();
+
+    // ── 4.4 Admin UI — web properties extended separately in WebProperties ────
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
 

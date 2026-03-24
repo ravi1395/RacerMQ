@@ -131,4 +131,41 @@ public final class MessageEnvelopeBuilder {
             return objectMapper.writeValueAsString(envelope);
         });
     }
+
+    // ── Phase 4.2 — Distributed Tracing ──────────────────────────────────────
+
+    /**
+     * Builds a pub/sub envelope that includes the W3C {@code traceparent} header when
+     * tracing is enabled.
+     *
+     * <pre>{"id":"...","channel":"...","sender":"...","timestamp":"...","payload":"...","traceparent":"00-..."}</pre>
+     *
+     * <p>When {@code traceparent} is {@code null} the output is identical to
+     * {@link #build(ObjectMapper, String, String, Object, boolean, String)}.
+     *
+     * @param objectMapper Jackson mapper used for serialization
+     * @param channel      channel / topic name
+     * @param sender       originator identifier
+     * @param payload      message body
+     * @param routed       whether the message was forwarded by the router
+     * @param messageId    explicit message ID; {@code null} generates a random UUID
+     * @param traceparent  W3C traceparent value; {@code null} omits the field
+     */
+    public static Mono<String> buildWithTrace(ObjectMapper objectMapper,
+                                               String channel, String sender, Object payload,
+                                               boolean routed, @Nullable String messageId,
+                                               @Nullable String traceparent) {
+        return Mono.fromCallable(() -> {
+            Map<String, Object> envelope = new LinkedHashMap<>(10);
+            envelope.put("id",        messageId != null ? messageId : UUID.randomUUID().toString());
+            envelope.put("channel",   channel);
+            envelope.put("sender",    sender);
+            envelope.put("timestamp", Instant.now().toString());
+            envelope.put("payload",   serializePayload(objectMapper, payload));
+            if (routed)       envelope.put("routed",      true);
+            if (traceparent != null && !traceparent.isBlank())
+                              envelope.put("traceparent", traceparent);
+            return objectMapper.writeValueAsString(envelope);
+        });
+    }
 }

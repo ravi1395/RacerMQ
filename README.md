@@ -483,9 +483,23 @@ public Flux<Event> generateEvents() {
 | `durable` | `boolean` | `false` | When `true`, publishes to a **Redis Stream** (XADD) instead of Pub/Sub. |
 | `streamKey` | `String` | `""` | The Redis Stream key to write to when `durable=true` (e.g. `racer:orders:stream`). |
 | `mode` | `ConcurrencyMode` | `SEQUENTIAL` | Dispatch strategy for `Flux<T>` returns. `SEQUENTIAL` = fire-and-forget `doOnNext`; `CONCURRENT` = `flatMap` with up to `concurrency` in-flight publishes. Ignored for `Mono` and POJO returns. |
+| `priority` | `String` | `""` | Priority level for this specific publish (`"HIGH"`, `"NORMAL"`, `"LOW"`). When set, overrides the `@RacerPriority(defaultLevel)` on the same method for this particular channel. Requires `racer.priority.enabled=true`. |
 | `concurrency` | `int` | `4` | Maximum concurrent in-flight publish operations when `mode = CONCURRENT`. |
 
 **Resolution order:** `channel` (direct name) → `channelRef` (alias lookup) → default channel (`racer.default-channel`).
+
+**Repeatable:** `@PublishResult` is `@Repeatable` — stack multiple annotations on a single method to fan out to several channels at once:
+
+```java
+@PublishResult(channelRef = "orders",  priority = "HIGH")
+@PublishResult(channelRef = "audit",   async = false)
+public Order createOrder(OrderRequest req) {
+    return orderService.create(req);
+    // Result published to racer:orders (HIGH priority) AND racer:audit (blocking)
+}
+```
+
+**Startup safety:** if `@PublishResult` is placed on a `void` method, Racer throws a `RacerConfigurationException` at startup — a `void` return type means there is nothing to publish.
 
 **`sender` resolution chain (when `channelRef` is set):**
 1. Annotation `sender` value if non-empty
@@ -505,7 +519,18 @@ public Flux<Event> generateEvents() {
 | `Flux<T>` — `CONCURRENT` | Uses `flatMap(publish, concurrency)` — up to N Redis publishes in flight simultaneously; downstream waits for publish before receiving each element |
 | Any POJO / `void` | Published synchronously or asynchronously after return |
 
-> **Important:** The annotated method must be on a **Spring proxy** (i.e. invoked from outside the bean). Self-invocation inside the same class bypasses the AOP proxy and `@PublishResult` will not fire.
+> **Important — self-invocation:** The annotated method must be invoked through a **Spring proxy** (i.e. called from a _different_ bean). Calling `this.method()` from within the same class bypasses the AOP proxy and `@PublishResult` **will not fire**.
+>
+> ```java
+> // ❌ Self-invocation — @PublishResult is silently ignored:
+> public void caller() { this.createOrder(req); }
+>
+> // ✅ External invocation — works correctly:
+> @Autowired OrderService orderService;
+> public void caller() { orderService.createOrder(req); }
+> ```
+>
+> If you must call the annotated method from within the same class, inject the bean via `@Autowired` (self-injection) or use `applicationContext.getBean(MyService.class).createOrder(req)`.
 
 ---
 
@@ -650,8 +675,10 @@ public class OrderRouterConfig {
 | `forwardAndProcess(alias)` | Publish to one alias AND invoke local handler | `FORWARDED_AND_PROCESS` |
 | `multicast(a, b, ...)` | Publish to ALL listed aliases; skip local handler | `FORWARDED` |
 | `multicastAndProcess(a, b, ...)` | Publish to ALL listed aliases AND invoke local handler | `FORWARDED_AND_PROCESS` |
-| `drop()` | Silently discard | `DROPPED` |
-| `dropToDlq()` | Route to the Dead Letter Queue | `DROPPED_TO_DLQ` |
+| `forwardWithPriority(alias, level)` | Publish to `alias`'s priority sub-channel `{channel}:priority:{LEVEL}`; skip local handler. Falls back to `forward(alias)` when priority is not configured. | `FORWARDED` |
+| `drop()` | Discard and log at DEBUG (`id`, `channel`, truncated payload) | `DROPPED` |
+| `dropQuietly()` | Silently discard with no logging (for health-check pings, etc.) | `DROPPED` |
+| `dropToDlq()` | Route to the Dead Letter Queue (**recommended default route**) | `DROPPED_TO_DLQ` |
 
 **Runtime API:**
 - `GET /api/router/rules` — list all compiled rules with their index, source, field, pattern, target and action.
@@ -1479,8 +1506,50 @@ management.metrics.tags.application=${spring.application.name}
 | `racer.dlq.reprocessed` | Counter | DLQ messages successfully reprocessed |
 | `racer.dlq.size` | Gauge | Current number of entries in `racer:dlq` |
 | `racer.requestreply.latency` | Timer | Round-trip latency for request-reply operations |
+| `racer.stream.consumer.lag` | Gauge | Pending message count per `(stream, group)` — requires `racer.consumer-lag.enabled=true` |
+| `racer.circuit.breaker.state` | Gauge | Circuit breaker state per listener: `0` = CLOSED, `1` = OPEN, `2` = HALF_OPEN |
+| `racer.backpressure.active` | Gauge | `1` while back-pressure is in effect, `0` otherwise |
+| `racer.backpressure.events` | Counter | Transitions into/out of the back-pressure throttle state |
+| `racer.dedup.duplicates` | Counter | Duplicate messages suppressed per listener |
 
 All metrics include a `transport` tag (`pubsub` or `stream`) and an `application` tag set by `management.metrics.tags.application`.
+
+### Health indicator — consumer lag
+
+When `racer.consumer-lag.enabled=true`, the `/actuator/health` response includes a `consumer-lag` detail map showing the pending message count for every tracked `(streamKey|group)` pair:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "racer": {
+      "status": "UP",
+      "details": {
+        "redis.ping": "PONG",
+        "dlq.depth": 0,
+        "consumer-lag": {
+          "racer:orders-stream|order-processors": 12,
+          "racer:audit-stream|audit-consumers": 0
+        }
+      }
+    }
+  }
+}
+```
+
+When any lag value exceeds `racer.consumer-lag.lag-down-threshold` (default `10000`) the status flips to `OUT_OF_SERVICE`:
+
+```json
+{
+  "status": "OUT_OF_SERVICE",
+  "details": {
+    "consumer-lag": { "racer:orders-stream|order-processors": 15000 },
+    "consumer-lag.threshold-breached": true
+  }
+}
+```
+
+Set `racer.consumer-lag.lag-down-threshold=0` to disable the health-status flip while still keeping the detail map visible.
 
 ### Checking metrics with curl
 

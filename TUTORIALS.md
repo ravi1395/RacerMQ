@@ -1074,6 +1074,84 @@ public class InventoryService {
 
 ---
 
+### Step 8 — Fan out to multiple channels with `@Repeatable` `@PublishResult`
+
+`@PublishResult` is `@Repeatable`, so you can stack multiple annotations on a single method to publish the return value to **several channels simultaneously**:
+
+```java
+import com.cheetah.racer.annotation.PublishResult;
+
+@Service
+public class OrderService {
+
+    // Result is published to both racer:orders AND racer:audit in one method call
+    @PublishResult(channelRef = "orders", sender = "order-service")
+    @PublishResult(channelRef = "audit",  async = false, sender = "auditor")
+    public Order createOrder(OrderRequest req) {
+        return orderRepository.save(req.toOrder());
+    }
+}
+```
+
+- Each `@PublishResult` in the stack is processed independently (separate sender, async flag, channel, etc.).
+- `PublishResultAspect` fires once per annotation, so you get `N` Redis `PUBLISH` calls for `N` annotations.
+- Works with `Mono<T>` and `Flux<T>` return types too.
+
+---
+
+### Step 9 — Per-annotation priority with `@PublishResult(priority = …)`
+
+When `racer.priority.enabled=true`, pair a `@PublishResult` with `@RacerPriority` to route to priority sub-channels. By default `@RacerPriority(defaultLevel)` applies to **all** stacked annotations. Use the `priority` attribute on individual `@PublishResult` annotations to assign **different levels per channel**:
+
+```java
+@Service
+public class AlertService {
+
+    // HIGH to the orders channel, LOW to the audit channel — from a single method
+    @PublishResult(channelRef = "orders",  priority = "HIGH")
+    @PublishResult(channelRef = "audit",   priority = "LOW")
+    @RacerPriority(defaultLevel = "NORMAL")   // fallback when priority="" on any annotation above
+    public Alert raiseAlert(AlertRequest req) {
+        return alertRepository.save(req.toAlert());
+    }
+}
+```
+
+Sub-channels used:
+- `racer:orders:priority:HIGH`
+- `racer:audit:priority:LOW`
+
+If `priority = ""` (the default) and `@RacerPriority` is present, `defaultLevel` is used instead.
+
+---
+
+### Step 10 — Startup safety — void method detection
+
+If you accidentally annotate a `void` method with `@PublishResult`, Racer detects this at startup and throws a `RacerConfigurationException` before the application finishes loading:
+
+```java
+// ❌ Racer throws RacerConfigurationException at startup
+@PublishResult(channelRef = "orders")
+public void placeOrder(OrderRequest req) {
+    orderRepository.save(req.toOrder());
+    // There is nothing to publish — void return!
+}
+
+// ✅ Correct — return the value you want published
+@PublishResult(channelRef = "orders")
+public Order placeOrder(OrderRequest req) {
+    return orderRepository.save(req.toOrder());
+}
+```
+
+The error message names the offending class and method:
+```
+RacerConfigurationException: @PublishResult is declared on void method(s) —
+there is no return value to publish. Violations: [com.example.OrderService#placeOrder()]
+```
+
+---
+
 ### Step 6 — Demo injected publisher endpoints
 
 > **Requires** `racer.web.channels-enabled=true` in `application.properties`.
@@ -2077,8 +2155,10 @@ public RacerFunctionalRouter broadcastRouter() {
 | `multicastAndProcess("a", "b")` | Publish to both aliases AND invoke local `@RacerListener` |
 | `forward("email")` | Publish to one alias; skip local handler |
 | `forwardAndProcess("email")` | Publish to one alias AND invoke local `@RacerListener` |
-| `drop()` | Discard silently |
-| `dropToDlq()` | Route to the Dead Letter Queue |
+| `forwardWithPriority("email", "HIGH")` | Publish to `email`'s priority sub-channel `racer:email:priority:HIGH`; skip local handler |
+| `drop()` | Discard and log at DEBUG (message ID, channel, truncated payload) |
+| `dropQuietly()` | Silently discard with no logging (for health-check pings, etc.) |
+| `dropToDlq()` | Route to the Dead Letter Queue (**recommended default route**) |
 
 ---
 
@@ -2160,8 +2240,45 @@ public class ModernRouterConfig {
 
 ---
 
+### Step 13 — Priority routing in the functional DSL
+
+When `racer.priority.enabled=true`, use `forwardWithPriority(alias, level)` to route a message directly to a priority sub-channel inside a functional router:
+
+```java
+import static com.cheetah.racer.router.dsl.RouteHandlers.*;
+import static com.cheetah.racer.router.dsl.RoutePredicates.*;
+
+@Configuration
+public class PriorityRouterConfig {
+
+    @Bean
+    public RacerFunctionalRouter priorityRouter() {
+        return RacerFunctionalRouter.builder()
+                .name("priority-router")
+                // Route urgent notifications to the HIGH sub-channel
+                .route(fieldEquals("urgency", "CRITICAL"),
+                       forwardWithPriority("notifications", "HIGH"))
+                // Route batch messages to LOW
+                .route(fieldEquals("urgency", "BATCH"),
+                       forwardWithPriority("notifications", "LOW"))
+                // Default: standard publish without priority
+                .defaultRoute(forward("notifications"))
+                .build();
+    }
+}
+```
+
+Sub-channels targeted:
+- `racer:notifications:priority:HIGH` — for `urgency = CRITICAL`
+- `racer:notifications:priority:LOW` — for `urgency = BATCH`
+- `racer:notifications` — for everything else
+
+> **Fallback behaviour:** if `RacerPriorityPublisher` is not in the Spring context (i.e. `racer.priority.enabled=false`), `forwardWithPriority` logs a WARN and falls back to a standard `forward(alias)` — the message is still delivered, just without priority routing.
+
+---
+
 ### What you built
-A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded. Plus a functional DSL router with composable predicates, true multi-alias fan-out, and seamless coexistence with the annotation-based rules.
+A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out, priority routing, and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded. Plus a functional DSL router with composable predicates, true multi-alias fan-out, and seamless coexistence with the annotation-based rules.
 
 ---
 
@@ -4232,21 +4349,82 @@ racer_stream_consumer_lag > 500
 
 ---
 
-### What you built
+### Step 6 — Consumer lag in `/actuator/health`
 
+The consumer lag monitor feeds directly into the Spring Boot **health indicator** when both are enabled. No extra configuration is required — `RacerHealthAutoConfiguration` wires them together automatically.
+
+#### 6.1 Enable both features
+
+```properties
+# application.properties
+racer.consumer-lag.enabled=true
+racer.consumer-lag.scrape-interval-seconds=15
+racer.consumer-lag.lag-warn-threshold=500      # WARN log when lag exceeds this
+racer.consumer-lag.lag-down-threshold=5000     # health flips to OUT_OF_SERVICE here
+
+management.endpoints.web.exposure.include=health,metrics,prometheus
+management.endpoint.health.show-details=always
+```
+
+#### 6.2 Inspect the health endpoint
+
+```bash
+curl -s http://localhost:8080/actuator/health | jq .components.racer
+```
+
+When all groups are healthy:
+```json
+{
+  "status": "UP",
+  "details": {
+    "redis.ping": "PONG",
+    "dlq.depth": 0,
+    "consumer-lag": {
+      "racer:orders-stream|order-processors": 12 
+    }
+  }
+}
+```
+
+When lag exceeds `lag-down-threshold`:
+```json
+{
+  "status": "OUT_OF_SERVICE",
+  "details": {
+    "redis.ping": "PONG",
+    "dlq.depth": 0,
+    "consumer-lag": {
+      "racer:orders-stream|order-processors": 6200
+    },
+    "consumer-lag.threshold-breached": true
+  }
+}
+```
+
+This lets your load balancer or Kubernetes liveness probe automatically detect a consumer that is falling behind and take action (e.g. restart the pod or trigger an alert).
+
+#### 6.3 Tune the threshold
+
+| Property | Effect |
+|----------|--------|
+| `racer.consumer-lag.lag-warn-threshold` | Emits a WARN log on each scrape cycle when exceeded (no health change) |
+| `racer.consumer-lag.lag-down-threshold` | Flips `/actuator/health` to `OUT_OF_SERVICE` when any tracked group exceeds this |
+
+Set `racer.consumer-lag.lag-down-threshold=0` to keep the lag details visible in the health response without ever flipping the status.
+
+---
+
+### What you built
 ```
 Redis Stream: racer:orders-stream
 Consumer Group: order-processors
         │
         ▼
-RacerConsumerLagMonitor  (every 5 s)
+RacerConsumerLagMonitor  (every 15 s)
    XPENDING racer:orders-stream order-processors - + 1
         │
-        ▼
-Gauge: racer.stream.consumer.lag{stream="racer:orders-stream", group="order-processors"}
-        │
-        ▼
-Prometheus scrape  →  Grafana panel  →  alert on threshold
+        ├───► Gauge: racer.stream.consumer.lag{…}  →  Prometheus  →  Grafana
+        └───► RacerHealthIndicator → /actuator/health  →  K8s liveness probe
 ```
 
 Real-time visibility into stream back-log with zero code changes — just one property and standard Micrometer / Prometheus tooling.

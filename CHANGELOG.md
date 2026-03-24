@@ -7,25 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [1.2.0] - 2026-03-20
 
-### Planned — Phase 4 Roadmap
+### Added
 
-#### 4.1 — Cluster-Aware Publishing
-- Consistent-hash routing for multi-shard topologies
-- Automatic failover when a shard becomes unavailable
+#### `@PublishResult` — repeatable annotation & per-annotaion priority
+- `@PublishResult` is now `@Repeatable` via the new `@PublishResults` container annotation.
+  Place multiple `@PublishResult` annotations on one method to fan out to several channels simultaneously:
+  ```java
+  @PublishResult(channelRef = "orders")
+  @PublishResult(channelRef = "audit", async = false)
+  public Order createOrder(OrderRequest req) { ... }
+  ```
+- Added **`priority`** attribute to `@PublishResult` (default `""`). When set, this level is used for that specific annotation's publish instead of any `@RacerPriority(defaultLevel)` on the same method. Enables a single method to fan out to _different_ priority levels per channel:
+  ```java
+  @PublishResult(channelRef = "orders",  priority = "HIGH")
+  @PublishResult(channelRef = "audit",   priority = "LOW")
+  @RacerPriority(defaultLevel = "NORMAL")   // fallback when priority="" above
+  public Order placeOrder(OrderRequest req) { ... }
+  ```
+- Added **self-invocation caveat** to `@PublishResult` Javadoc: calling an annotated method via `this.method()` bypasses the Spring AOP proxy and the annotation never fires. The Javadoc now includes a ❌/✅ code example.
+- `PublishResultMethodValidator` (`SmartInitializingSingleton`) scans all Spring beans at startup and throws `RacerConfigurationException` if any `@PublishResult`-annotated method has a `void` return type (which would silently publish nothing).
 
-#### 4.2 — Distributed Tracing (OpenTelemetry)
-- Propagate W3C `traceparent` header across `RacerMessage` hops
-- Auto-instrument `@RacerListener`, `@RacerStreamListener`, and `RacerChannelPublisher`
+#### Router DSL (`RouteHandlers`) enhancements
+- `drop()` now **logs at DEBUG** each discarded message: `[racer-router] DROP id=… channel=… payload=…` (payload truncated to 120 chars). Use this to confirm discard rules are matching.
+- New `dropQuietly()` handler — identical to the old silent `drop()`. Use for health-check pings and other expected high-volume discards where the DEBUG noise isn't wanted.
+- New `forwardWithPriority(String alias, String level)` handler — publishes the message to the priority sub-channel (`{channel}:priority:{LEVEL}`) for the given alias. Requires `racer.priority.enabled=true`; falls back to standard `forward(alias)` with a WARN log if `RacerPriorityPublisher` is not configured.
+- New `priority(String alias, String level, RouteHandler delegate)` composable wrapper — applies `forwardWithPriority` then delegates to the provided inner handler.
+- `DefaultRouteContext` (inside `RacerRouterService`) now implements `publishToWithPriority(alias, msg, level)` and accepts an optional `RacerPriorityPublisher`.
 
-#### 4.3 — Rate Limiting
-- Per-channel token-bucket limiter stored in Redis
-- Configurable burst size and refill rate via `racer.rate-limit.*`
+#### `RacerTransaction` — reliable JSON serialization in pipelined path
+- `TxPublisher`'s pipelined batch path previously called `payload.toString()` on each item, which produced non-JSON output for POJOs. It now uses an injected `ObjectMapper` with a `toString()` fallback on serialisation error.
+- `RacerTransaction` gains a new three-argument constructor `(RacerPublisherRegistry, ObjectMapper, RacerPipelinedPublisher)`. Existing two-argument constructors remain for backward compatibility.
+
+#### Health indicator — consumer group lag
+- `RacerHealthIndicator` now accepts an optional `RacerConsumerLagMonitor` and exposes all tracked `(streamKey|group → lag)` pairs in the `consumer-lag` health detail map.
+- When any lag value exceeds the new `racer.consumer-lag.lag-down-threshold` (default `10000`) the health status flips to `OUT_OF_SERVICE` and a `consumer-lag.threshold-breached: true` detail is added.
+- `RacerHealthAutoConfiguration` auto-wires the optional `RacerConsumerLagMonitor` and `RacerProperties` beans into the health indicator.
+- New property `racer.consumer-lag.lag-down-threshold=10000` — sets the lag level at which health flips to `OUT_OF_SERVICE`. Set to `0` to disable the health-status flip.
+
+### Changed
+- `RacerAutoConfiguration.racerRouterService()` now injects `Optional<RacerPriorityPublisher>` so priority-based routing is available in the functional DSL without any additional configuration in the consumer application.
+- `RacerAutoConfiguration.racerTransaction()` now injects `ObjectMapper` to power the reliable pipelined serialization path.
+- `dropToDlq()` is now the **recommended** default route handler; its Javadoc has been updated accordingly.
+
+---
+
+## [1.3.0] - 2026-03-24
+
+### Added
+
+#### 4.1 — Cluster-Aware Publishing (Consistent Hash Ring)
+- `RacerConsistentHashRing` — virtual-node consistent-hash ring built on a MD5-hashed `TreeMap`; fully immutable after construction and safe for concurrent reads
+  - `getShardFor(key)` — primary shard index for a routing key (clockwise ring walk)
+  - `getFailoverShardFor(key)` — next distinct shard in the ring (falls back to primary when only one shard exists)
+- `RacerShardedStreamPublisher` enhanced with optional `RacerConsistentHashRing` and `failoverEnabled` flag
+  - New 4-arg constructor: `(delegate, shardCount, hashRing, failoverEnabled)`
+  - `publishToShard()` now transparently retries on the failover shard on error when `failoverEnabled=true`
+  - Old `shardFor(key)` method marked `@Deprecated(since = "1.3.0")`; replaced by `primaryShardFor(key)`
+- New `racer.sharding.*` properties: `consistent-hash-enabled` (default `false`), `virtual-nodes-per-shard` (default `150`), `failover-enabled` (default `true`)
+- `RacerAutoConfiguration` wires consistent-hash ring into `racerShardedStreamPublisher` bean when `racer.sharding.consistent-hash-enabled=true`
+
+#### 4.2 — Distributed Tracing (W3C traceparent)
+- `RacerTraceContext` (utility class, no OTel SDK dependency) — W3C `traceparent` header utilities:
+  - `generate()` — new root trace (fresh 16-byte trace-id + 8-byte span-id)
+  - `child(parent)` — child span inheriting trace-id; generates root when parent is null/invalid
+  - `extractTraceId(tp)` / `extractParentId(tp)` — parse individual header components
+  - `isValid(tp)` — structural validation (lengths, hex encoding)
+- `RacerTracingInterceptor` — `RacerMessageInterceptor` at `@Order(1)`:
+  - Stamps `RacerMessage.traceparent` with a generated or child traceparent on every consumed message
+  - Writes the value into the Reactor context under key `"racer.traceparent"`
+  - Optionally populates MDC key `"traceparent"` (controlled by `racer.tracing.propagate-to-mdc`, default `true`); removes it in `doFinally` to prevent thread-pool leakage
+- `RacerMessage` gains field `String traceparent` (nullable)
+- `MessageEnvelopeBuilder.buildWithTrace()` — overload that includes `traceparent` in the JSON envelope when non-null
+- New `racer.tracing.*` properties: `enabled` (default `false`), `propagate-to-mdc` (default `true`), `inject-into-envelope` (default `true`)
+- `RacerAutoConfiguration` registers `racerTracingInterceptor` bean when `racer.tracing.enabled=true`
+
+#### 4.3 — Per-Channel Rate Limiting (Redis token bucket)
+- `RacerRateLimiter` — Redis Lua token-bucket rate limiter:
+  - `checkLimit(channelAlias)` → `Mono<Void>` (empty = allowed; `RacerRateLimitException` = rejected)
+  - Atomically refills bucket based on elapsed time × refill rate; caps at capacity (burst limit)
+  - Per-channel overrides via `racer.rate-limit.channels.<alias>.*`
+  - **Fail-open**: Redis errors log WARN and allow the request (Redis downtime never cascades to publisher failures)
+- `RacerRateLimitException` — new exception extending `RacerException`; carries `channel` field
+- `RacerChannelPublisherImpl` — rate-limit check prepended to all 3 `publishAsync` variants when a `RacerRateLimiter` is injected (null → no-op)
+- `RacerPublisherRegistry` — accepts `Optional<RacerRateLimiter>` in its 6-arg constructor; threads it through to every `RacerChannelPublisherImpl` created in `init()`
+- New `racer.rate-limit.*` properties: `enabled` (default `false`), `default-capacity` (default `100`), `default-refill-rate` (default `100`), `key-prefix` (default `"racer:ratelimit:"`), `channels.<alias>.capacity`, `channels.<alias>.refill-rate`
+- `RacerAutoConfiguration` registers `racerRateLimiter` bean when `racer.rate-limit.enabled=true`; passes `Optional<RacerRateLimiter>` to `racerPublisherRegistry`
 
 #### 4.4 — Racer Admin UI
-- Actuator-backed REST endpoints for live listener stats, DLQ viewer, and circuit breaker state
-- Optional embedded web console
+- `RacerAdminController` — REST controller at `/api/admin/**`:
+  - `GET /api/admin/overview` — timestamp, channel count, feature-flag summary
+  - `GET /api/admin/channels` — all registered channel aliases with resolved Redis channel/stream keys
+  - `GET /api/admin/circuitbreakers` — per-breaker state, transition count, rejected count (or `enabled: false` when registry absent)
+  - `GET /api/admin/ratelimits` — rate-limit configuration snapshot with effective per-channel overrides
+- `src/main/resources/static/racer-admin/index.html` — self-contained Bootstrap 5 admin dashboard; loads all 4 endpoints; auto-refresh; feature pill badges; toast error notifications
+- New `racer.web.admin-enabled` property (default `false`); activates `RacerAdminController` bean in `RacerWebAutoConfiguration`
+
+### Changed
+- `RacerMessage` now has `@Builder(toBuilder = true)` — existing `@Builder` usage is unchanged; the new `toBuilder()` method enables immutable copy-mutation (used by `RacerTracingInterceptor`)
+- `RacerAutoConfiguration.racerPublisherRegistry()` bean now injects `Optional<RacerRateLimiter>` parameter
+- `RacerWebAutoConfiguration` imports and registers `RacerAdminController` when `racer.web.admin-enabled=true`
 
 ---
 

@@ -2,6 +2,7 @@ package com.cheetah.racer.publisher;
 
 import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetricsPort;
+import com.cheetah.racer.ratelimit.RacerRateLimiter;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -53,6 +54,12 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
      */
     private final long streamMaxLen;
 
+    /**
+     * Optional rate limiter (Phase 4.3).  {@code null} when rate limiting is disabled.
+     */
+    @Nullable
+    private final RacerRateLimiter rateLimiter;
+
     public RacerChannelPublisherImpl(ReactiveRedisTemplate<String, String> redisTemplate,
                                      ObjectMapper objectMapper,
                                      String channelName,
@@ -69,7 +76,7 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
                                      @Nullable RacerMetricsPort racerMetrics,
                                      @Nullable RacerSchemaRegistry schemaRegistry) {
         this(redisTemplate, objectMapper, channelName, channelAlias, defaultSender,
-                false, "", 0L, racerMetrics, schemaRegistry);
+                false, "", 0L, racerMetrics, schemaRegistry, null);
     }
 
     /** Full constructor with explicit durable-stream configuration. */
@@ -83,6 +90,24 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
                                      long streamMaxLen,
                                      @Nullable RacerMetricsPort racerMetrics,
                                      @Nullable RacerSchemaRegistry schemaRegistry) {
+        this(redisTemplate, objectMapper, channelName, channelAlias, defaultSender,
+                durable, durableStreamKey, streamMaxLen, racerMetrics, schemaRegistry, null);
+    }
+
+    /**
+     * Full constructor including Phase 4.3 rate limiter.
+     */
+    public RacerChannelPublisherImpl(ReactiveRedisTemplate<String, String> redisTemplate,
+                                     ObjectMapper objectMapper,
+                                     String channelName,
+                                     String channelAlias,
+                                     String defaultSender,
+                                     boolean durable,
+                                     String durableStreamKey,
+                                     long streamMaxLen,
+                                     @Nullable RacerMetricsPort racerMetrics,
+                                     @Nullable RacerSchemaRegistry schemaRegistry,
+                                     @Nullable RacerRateLimiter rateLimiter) {
         this.redisTemplate    = redisTemplate;
         this.objectMapper     = objectMapper;
         this.channelName      = channelName;
@@ -93,6 +118,7 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
         this.streamMaxLen     = streamMaxLen;
         this.racerMetrics     = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
         this.schemaRegistry   = schemaRegistry;
+        this.rateLimiter      = rateLimiter;
     }
 
     @Override
@@ -102,10 +128,14 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
 
     @Override
     public Mono<Long> publishAsync(Object payload, String sender) {
+        Mono<Void> rateLimitCheck = rateLimiter != null
+                ? rateLimiter.checkLimit(channelAlias)
+                : Mono.empty();
         Mono<Void> validate = schemaRegistry != null
                 ? schemaRegistry.validateForPublishReactive(channelName, payload)
                 : Mono.empty();
-        return validate
+        return rateLimitCheck
+                .then(validate)
                 .then(MessageEnvelopeBuilder.build(objectMapper, channelName, sender, payload))
                 .flatMap(json -> {
                     if (durable) {
@@ -130,10 +160,14 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
 
     @Override
     public Mono<Long> publishAsync(Object payload, String sender, String messageId) {
+        Mono<Void> rateLimitCheck = rateLimiter != null
+                ? rateLimiter.checkLimit(channelAlias)
+                : Mono.empty();
         Mono<Void> validate = schemaRegistry != null
                 ? schemaRegistry.validateForPublishReactive(channelName, payload)
                 : Mono.empty();
-        return validate
+        return rateLimitCheck
+                .then(validate)
                 .then(MessageEnvelopeBuilder.build(objectMapper, channelName, sender, payload, false, messageId))
                 .flatMap(json -> {
                     if (durable) {
@@ -158,10 +192,14 @@ public class RacerChannelPublisherImpl implements RacerChannelPublisher {
 
     @Override
     public Mono<Long> publishRoutedAsync(Object payload, String sender) {
+        Mono<Void> rateLimitCheck = rateLimiter != null
+                ? rateLimiter.checkLimit(channelAlias)
+                : Mono.empty();
         Mono<Void> validate = schemaRegistry != null
                 ? schemaRegistry.validateForPublishReactive(channelName, payload)
                 : Mono.empty();
-        return validate
+        return rateLimitCheck
+                .then(validate)
                 .then(MessageEnvelopeBuilder.build(objectMapper, channelName, sender, payload, true))
                 .flatMap(json -> {
                     if (durable) {

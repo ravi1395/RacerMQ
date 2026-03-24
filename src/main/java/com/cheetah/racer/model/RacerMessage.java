@@ -13,7 +13,7 @@ import java.util.UUID;
  * Represents a message exchanged via Redis Pub/Sub.
  */
 @Data
-@Builder
+@Builder(toBuilder = true)
 @NoArgsConstructor
 @AllArgsConstructor
 public class RacerMessage implements Serializable {
@@ -39,6 +39,14 @@ public class RacerMessage implements Serializable {
      */
     @Builder.Default
     private boolean routed = false;
+
+    /**
+     * W3C {@code traceparent} header value for distributed tracing (Phase 4.2).
+     * Format: {@code 00-<16-byte-trace-id>-<8-byte-parent-id>-<flags>}.
+     * Populated automatically when {@code racer.tracing.enabled=true}.
+     * {@code null} when tracing is disabled.
+     */
+    private String traceparent;
 
     /**
      * Factory method to create a new message with auto-generated id and timestamp.

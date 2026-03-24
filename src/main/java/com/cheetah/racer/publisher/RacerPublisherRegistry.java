@@ -4,6 +4,7 @@ import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.metrics.NoOpRacerMetrics;
 import com.cheetah.racer.metrics.RacerMetrics;
 import com.cheetah.racer.metrics.RacerMetricsPort;
+import com.cheetah.racer.ratelimit.RacerRateLimiter;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -51,6 +52,8 @@ public class RacerPublisherRegistry {
     private final RacerMetricsPort racerMetrics;
     @Nullable
     private final RacerSchemaRegistry schemaRegistry;
+    @Nullable
+    private final RacerRateLimiter rateLimiter;
 
     /** alias → publisher; populated by {@link #init()}. */
     private final Map<String, RacerChannelPublisher> registry = new ConcurrentHashMap<>();
@@ -93,11 +96,26 @@ public class RacerPublisherRegistry {
                                   ObjectMapper objectMapper,
                                   Optional<RacerMetrics> metricsOpt,
                                   Optional<RacerSchemaRegistry> schemaRegistryOpt) {
+        this(properties, redisTemplate, objectMapper, metricsOpt, schemaRegistryOpt, Optional.empty());
+    }
+
+    /**
+     * Full constructor including Phase 4.3 rate limiter.
+     *
+     * @param rateLimiterOpt optional rate limiter; absent → no rate limiting
+     */
+    public RacerPublisherRegistry(RacerProperties properties,
+                                  ReactiveRedisTemplate<String, String> redisTemplate,
+                                  ObjectMapper objectMapper,
+                                  Optional<RacerMetrics> metricsOpt,
+                                  Optional<RacerSchemaRegistry> schemaRegistryOpt,
+                                  Optional<RacerRateLimiter> rateLimiterOpt) {
         this.properties     = properties;
         this.redisTemplate  = redisTemplate;
         this.objectMapper   = objectMapper;
         this.racerMetrics   = metricsOpt.<RacerMetricsPort>map(m -> m).orElseGet(NoOpRacerMetrics::new);
         this.schemaRegistry = schemaRegistryOpt.orElse(null);
+        this.rateLimiter    = rateLimiterOpt.orElse(null);
     }
 
     /**
@@ -111,7 +129,8 @@ public class RacerPublisherRegistry {
         // Register the default channel
         registry.put(DEFAULT_ALIAS, new RacerChannelPublisherImpl(
                 redisTemplate, objectMapper,
-                properties.getDefaultChannel(), DEFAULT_ALIAS, "racer", racerMetrics, schemaRegistry));
+                properties.getDefaultChannel(), DEFAULT_ALIAS, "racer",
+                false, "", 0L, racerMetrics, schemaRegistry, rateLimiter));
         log.info("[racer] Default channel registered: '{}'", properties.getDefaultChannel());
 
         // Register each named channel
@@ -129,12 +148,13 @@ public class RacerPublisherRegistry {
                         channelProps.getName(), alias, channelProps.getSender(),
                         true, actualStreamKey,
                         properties.getRetention().getStreamMaxLen(),
-                        racerMetrics, schemaRegistry));
+                        racerMetrics, schemaRegistry, rateLimiter));
                 log.info("[racer] Channel '{}' registered → stream '{}' (durable)", alias, actualStreamKey);
             } else {
                 registry.put(alias, new RacerChannelPublisherImpl(
                         redisTemplate, objectMapper,
-                        channelProps.getName(), alias, channelProps.getSender(), racerMetrics, schemaRegistry));
+                        channelProps.getName(), alias, channelProps.getSender(),
+                        false, "", 0L, racerMetrics, schemaRegistry, rateLimiter));
                 log.info("[racer] Channel '{}' registered → '{}'", alias, channelProps.getName());
             }
         });

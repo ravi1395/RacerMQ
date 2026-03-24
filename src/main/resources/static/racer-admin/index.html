@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Racer Admin Console</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"/>
+  <style>
+    body { background: #f5f6fa; }
+    .navbar-brand span { color: #ff6b35; font-weight: 700; }
+    .card { box-shadow: 0 2px 8px rgba(0,0,0,.08); border: none; }
+    .card-header { font-weight: 600; background: #fff; border-bottom: 2px solid #ff6b35; }
+    .badge-CLOSED   { background: #28a745; color: #fff; }
+    .badge-OPEN     { background: #dc3545; color: #fff; }
+    .badge-HALF_OPEN{ background: #fd7e14; color: #fff; }
+    pre { background: #272822; color: #f8f8f2; padding: 1rem; border-radius: .4rem; font-size:.83rem; }
+    #toast-container { position: fixed; bottom: 1.5rem; right: 1.5rem; z-index: 9999; }
+    .feature-pill { font-size: .75rem; }
+  </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark bg-dark mb-4">
+  <div class="container-fluid">
+    <span class="navbar-brand"><span>Racer</span> Admin Console</span>
+    <button class="btn btn-sm btn-outline-light" onclick="refreshAll()">&#8635; Refresh</button>
+  </div>
+</nav>
+
+<div class="container-fluid px-4">
+
+  <!-- Overview row -->
+  <div class="row g-3 mb-4">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header">Overview</div>
+        <div class="card-body">
+          <div id="overview-features" class="mb-2"></div>
+          <small class="text-muted">Last updated: <span id="overview-ts">—</span> &nbsp;|&nbsp; Channels: <span id="overview-channels">—</span></small>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main panels -->
+  <div class="row g-3">
+
+    <!-- Channels -->
+    <div class="col-md-6">
+      <div class="card h-100">
+        <div class="card-header">Registered Channels</div>
+        <div class="card-body p-0">
+          <table class="table table-sm table-hover mb-0" id="channels-table">
+            <thead class="table-light"><tr><th>Alias</th><th>Redis Channel / Stream</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Circuit Breakers -->
+    <div class="col-md-6">
+      <div class="card h-100">
+        <div class="card-header">Circuit Breakers</div>
+        <div class="card-body p-0">
+          <table class="table table-sm table-hover mb-0" id="cb-table">
+            <thead class="table-light"><tr><th>Name</th><th>State</th><th>Transitions</th><th>Rejected</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rate Limits -->
+    <div class="col-12 mt-3">
+      <div class="card">
+        <div class="card-header">Rate Limits</div>
+        <div class="card-body">
+          <div id="rate-limits-content"></div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- row -->
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script>
+  const BASE = '/api/admin';
+
+  async function fetchJSON(path) {
+    const r = await fetch(path, { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    return r.json();
+  }
+
+  function showToast(msg, type = 'danger') {
+    const id = 'toast-' + Date.now();
+    const el = document.createElement('div');
+    el.innerHTML = `<div id="${id}" class="toast align-items-center text-bg-${type} border-0 show" role="alert">
+      <div class="d-flex"><div class="toast-body">${msg}</div>
+        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+      </div></div>`;
+    document.getElementById('toast-container').appendChild(el);
+    setTimeout(() => el.remove(), 5000);
+  }
+
+  // ── Overview ────────────────────────────────────────────────────────────────
+  async function loadOverview() {
+    try {
+      const d = await fetchJSON(BASE + '/overview');
+      document.getElementById('overview-ts').textContent = new Date(d.timestamp).toLocaleString();
+      document.getElementById('overview-channels').textContent = d.channelCount;
+      const features = d.features || {};
+      const container = document.getElementById('overview-features');
+      container.innerHTML = Object.entries(features).map(([k, v]) =>
+        `<span class="badge rounded-pill feature-pill me-1 ${v ? 'bg-success' : 'bg-secondary'}">${k}: ${v ? 'on' : 'off'}</span>`
+      ).join('');
+    } catch(e) { showToast('Overview: ' + e.message); }
+  }
+
+  // ── Channels ────────────────────────────────────────────────────────────────
+  async function loadChannels() {
+    try {
+      const d = await fetchJSON(BASE + '/channels');
+      const tbody = document.querySelector('#channels-table tbody');
+      const channels = d.channels || {};
+      if (!Object.keys(channels).length) {
+        tbody.innerHTML = '<tr><td colspan="2" class="text-muted text-center py-3">No channels registered</td></tr>';
+        return;
+      }
+      tbody.innerHTML = Object.values(channels).map(c =>
+        `<tr><td><code>${esc(c.alias)}</code></td><td><code>${esc(c.channel)}</code></td></tr>`
+      ).join('');
+    } catch(e) { showToast('Channels: ' + e.message); }
+  }
+
+  // ── Circuit Breakers ─────────────────────────────────────────────────────────
+  async function loadCircuitBreakers() {
+    try {
+      const d = await fetchJSON(BASE + '/circuitbreakers');
+      const tbody = document.querySelector('#cb-table tbody');
+      if (!d.enabled) {
+        tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">Circuit breakers not enabled</td></tr>';
+        return;
+      }
+      const breakers = d.circuitBreakers || {};
+      if (!Object.keys(breakers).length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center py-3">No circuit breakers registered yet</td></tr>';
+        return;
+      }
+      tbody.innerHTML = Object.entries(breakers).map(([name, cb]) =>
+        `<tr>
+          <td><code>${esc(name)}</code></td>
+          <td><span class="badge badge-${esc(cb.state)}">${esc(cb.state)}</span></td>
+          <td>${cb.transitionCount}</td>
+          <td>${cb.rejectedCount}</td>
+        </tr>`
+      ).join('');
+    } catch(e) { showToast('Circuit Breakers: ' + e.message); }
+  }
+
+  // ── Rate Limits ──────────────────────────────────────────────────────────────
+  async function loadRateLimits() {
+    try {
+      const d = await fetchJSON(BASE + '/ratelimits');
+      const el = document.getElementById('rate-limits-content');
+      if (!d.enabled) {
+        el.innerHTML = '<p class="text-muted mb-0">Rate limiting not enabled.</p>';
+        return;
+      }
+      let html = `<div class="row mb-2">
+        <div class="col-auto"><strong>Default capacity:</strong> ${d.defaultCapacity} tokens</div>
+        <div class="col-auto"><strong>Default refill rate:</strong> ${d.defaultRefillRate} tokens/s</div>
+        <div class="col-auto"><strong>Key prefix:</strong> <code>${esc(d.keyPrefix)}</code></div>
+      </div>`;
+      const channels = d.channels || {};
+      if (Object.keys(channels).length) {
+        html += `<table class="table table-sm table-bordered">
+          <thead class="table-light"><tr><th>Channel Alias</th><th>Capacity</th><th>Refill Rate (tokens/s)</th></tr></thead>
+          <tbody>` +
+          Object.entries(channels).map(([alias, ch]) =>
+            `<tr><td><code>${esc(alias)}</code></td><td>${ch.capacity}</td><td>${ch.refillRate}</td></tr>`
+          ).join('') +
+          `</tbody></table>`;
+      } else {
+        html += '<p class="text-muted">No per-channel overrides configured.</p>';
+      }
+      el.innerHTML = html;
+    } catch(e) { showToast('Rate Limits: ' + e.message); }
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;');
+  }
+
+  function refreshAll() {
+    loadOverview();
+    loadChannels();
+    loadCircuitBreakers();
+    loadRateLimits();
+  }
+
+  // Initial load
+  refreshAll();
+</script>
+</body>
+</html>
