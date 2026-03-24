@@ -45,9 +45,13 @@ public class RacerConsistentHashRing {
             for (int v = 0; v < virtualNodesPerShard; v++) {
                 String vKey = "shard-" + shard + "-vnode-" + v;
                 int position = md5Int(vKey);
-                // Resolve collisions by linear probing
+                // Resolve collisions by linear probing (wrap around on overflow)
                 while (ring.containsKey(position)) {
-                    position++;
+                    if (position == Integer.MAX_VALUE) {
+                        position = Integer.MIN_VALUE;
+                    } else {
+                        position++;
+                    }
                 }
                 ring.put(position, shard);
             }

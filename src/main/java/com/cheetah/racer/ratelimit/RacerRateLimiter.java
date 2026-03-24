@@ -95,6 +95,9 @@ public class RacerRateLimiter {
      */
     private final java.util.Map<String, long[]> channelOverrides;
 
+    /** Cached default limits to avoid allocating a new array on every checkLimit call. */
+    private final long[] defaultLimits;
+
     public RacerRateLimiter(ReactiveRedisTemplate<String, String> redisTemplate,
                              long defaultCapacity, long defaultRefillRate, String keyPrefix,
                              java.util.Map<String, com.cheetah.racer.config.RacerProperties.RateLimitProperties.ChannelRateLimitProperties> channels) {
@@ -102,6 +105,7 @@ public class RacerRateLimiter {
         this.defaultCapacity  = defaultCapacity;
         this.defaultRefillRate = defaultRefillRate;
         this.keyPrefix        = keyPrefix;
+        this.defaultLimits    = new long[]{defaultCapacity, defaultRefillRate};
 
         // Pre-resolve overrides into a simple long[] {capacity, refillRate} map
         this.channelOverrides = new java.util.HashMap<>();
@@ -124,24 +128,25 @@ public class RacerRateLimiter {
      *         with {@link RacerRateLimitException} when the bucket is exhausted
      */
     public Mono<Void> checkLimit(String channelAlias) {
-        long[] limits = channelOverrides.getOrDefault(channelAlias,
-                new long[]{defaultCapacity, defaultRefillRate});
+        long[] limits = channelOverrides.getOrDefault(channelAlias, defaultLimits);
         long capacity   = limits[0];
         long refillRate = limits[1];
 
         String key    = keyPrefix + channelAlias;
-        long   now    = Instant.now().getEpochSecond();
         // TTL = capacity / refill-rate + 10 s buffer, minimum 30 s
         long   ttl    = Math.max(30L, capacity / Math.max(1, refillRate) + 10L);
 
-        return redisTemplate.execute(script,
-                        List.of(key),
-                        List.of(String.valueOf(capacity),
-                                String.valueOf(refillRate),
-                                String.valueOf(now),
-                                String.valueOf(ttl)))
-                .next()
-                .defaultIfEmpty(1L)   // fail-open if script returns nothing
+        return Mono.defer(() -> {
+            long now = Instant.now().getEpochSecond();
+            return redisTemplate.execute(script,
+                            List.of(key),
+                            List.of(String.valueOf(capacity),
+                                    String.valueOf(refillRate),
+                                    String.valueOf(now),
+                                    String.valueOf(ttl)))
+                    .next()
+                    .defaultIfEmpty(1L);   // fail-open if script returns nothing
+        })
                 .onErrorResume(ex -> {
                     log.warn("[racer-ratelimit] Redis error in rate limiter for channel='{}', failing open: {}",
                             channelAlias, ex.getMessage());

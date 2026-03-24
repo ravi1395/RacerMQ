@@ -1,6 +1,5 @@
 package com.cheetah.racer.tracing;
 
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.HexFormat;
 
@@ -96,7 +95,8 @@ public final class RacerTraceContext {
         String[] parts = traceparent.split("-", -1);
         if (parts.length < 4) return null;
         String parentId = parts[2];
-        if (parentId.length() != 16) return null;
+        // Must be exactly 16 hex chars and not all zeros (W3C spec)
+        if (parentId.length() != 16 || parentId.equals("0000000000000000")) return null;
         return parentId;
     }
 
@@ -116,7 +116,9 @@ public final class RacerTraceContext {
                 && parts[2].length() == 16
                 && parts[3].length() == 2
                 && isAllHex(parts[1])
-                && isAllHex(parts[2]);
+                && isAllHex(parts[2])
+                && !parts[1].equals("00000000000000000000000000000000")
+                && !parts[2].equals("0000000000000000");
     }
 
     private static boolean isAllHex(String s) {

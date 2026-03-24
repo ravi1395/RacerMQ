@@ -80,7 +80,7 @@ public class RacerTracingInterceptor implements RacerMessageInterceptor {
 
         if (propagateToMdc) {
             return result
-                    .doOnSubscribe(s -> MDC.put(MDC_KEY, traceParent))
+                    .doFirst(() -> MDC.put(MDC_KEY, traceParent))
                     .doFinally(signal -> MDC.remove(MDC_KEY));
         }
         return result;
