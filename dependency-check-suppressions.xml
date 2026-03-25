@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+
+    <!--
+        CVE-2025-68161: Apache Log4j Socket Appender does not verify TLS hostname.
+        Affected component: log4j-CORE (the Socket Appender implementation).
+        Racer only ships log4j-API and log4j-to-slf4j — log4j-core is NOT present
+        in the classpath. The OWASP CPE match on log4j-api is a false positive.
+        Reference: https://www.cve.org/CVERecord?id=CVE-2025-68161
+    -->
+    <suppress>
+        <notes>False positive: CVE-2025-68161 is in log4j-core (Socket Appender).
+        Racer only includes log4j-api; log4j-core is absent.</notes>
+        <packageUrl regex="true">^pkg:maven/org\.apache\.logging\.log4j/log4j\-api@.*$</packageUrl>
+        <cve>CVE-2025-68161</cve>
+    </suppress>
+
+</suppressions>

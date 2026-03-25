@@ -10,11 +10,13 @@ import com.cheetah.racer.listener.RacerMessageInterceptor;
 import com.cheetah.racer.metrics.RacerMetrics;
 import com.cheetah.racer.poll.RacerPollRegistrar;
 import com.cheetah.racer.processor.RacerPublisherFieldProcessor;
+import com.cheetah.racer.publisher.RacerConsistentHashRing;
 import com.cheetah.racer.publisher.RacerPipelinedPublisher;
 import com.cheetah.racer.publisher.RacerPriorityPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
 import com.cheetah.racer.publisher.RacerShardedStreamPublisher;
 import com.cheetah.racer.publisher.RacerStreamPublisher;
+import com.cheetah.racer.ratelimit.RacerRateLimiter;
 import com.cheetah.racer.requestreply.RacerResponderRegistrar;
 import com.cheetah.racer.router.RacerRouterService;
 import com.cheetah.racer.schema.RacerSchemaRegistry;
@@ -23,6 +25,7 @@ import com.cheetah.racer.service.DlqReprocessorService;
 import com.cheetah.racer.service.RacerRetentionService;
 import com.cheetah.racer.stream.RacerConsumerLagMonitor;
 import com.cheetah.racer.stream.RacerStreamListenerRegistrar;
+import com.cheetah.racer.tracing.RacerTracingInterceptor;
 import com.cheetah.racer.tx.RacerTransaction;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -108,6 +111,16 @@ public class RacerAutoConfiguration {
         // ── DLQ ──────────────────────────────────────────────────────────
         check(props.getDlq().getMaxSize() >= 1,
                 "racer.dlq.max-size must be >= 1, got " + props.getDlq().getMaxSize());
+        // ── Rate Limit (4.3) ─────────────────────────────────────────────
+        RacerProperties.RateLimitProperties rl = props.getRateLimit();
+        if (rl.isEnabled()) {
+            check(rl.getDefaultCapacity() >= 1,
+                    "racer.rate-limit.default-capacity must be >= 1, got " + rl.getDefaultCapacity());
+            check(rl.getDefaultRefillRate() >= 1,
+                    "racer.rate-limit.default-refill-rate must be >= 1, got " + rl.getDefaultRefillRate());
+            check(rl.getKeyPrefix() != null && !rl.getKeyPrefix().isBlank(),
+                    "racer.rate-limit.key-prefix must not be blank");
+        }
         return new Object(); // sentinel bean
     }
 
@@ -123,14 +136,16 @@ public class RacerAutoConfiguration {
             ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
             ObjectMapper objectMapper,
             Optional<RacerMetrics> racerMetrics,
-            Optional<RacerSchemaRegistry> racerSchemaRegistry) {
+            Optional<RacerSchemaRegistry> racerSchemaRegistry,
+            Optional<RacerRateLimiter> racerRateLimiter) {
 
         return new RacerPublisherRegistry(
                 racerProperties,
                 reactiveStringRedisTemplate,
                 objectMapper,
                 racerMetrics,
-                racerSchemaRegistry);
+                racerSchemaRegistry,
+                racerRateLimiter);
     }
 
     @Bean
@@ -213,9 +228,18 @@ public class RacerAutoConfiguration {
     public RacerShardedStreamPublisher racerShardedStreamPublisher(
             RacerProperties racerProperties,
             RacerStreamPublisher racerStreamPublisher) {
+        RacerProperties.ShardingProperties sharding = racerProperties.getSharding();
+        RacerConsistentHashRing hashRing = null;
+        if (sharding.isConsistentHashEnabled()) {
+            hashRing = new RacerConsistentHashRing(
+                    sharding.getShardCount(),
+                    sharding.getVirtualNodesPerShard());
+        }
         return new RacerShardedStreamPublisher(
                 racerStreamPublisher,
-                racerProperties.getSharding().getShardCount());
+                sharding.getShardCount(),
+                hashRing,
+                sharding.isFailoverEnabled());
     }
 
     // ── R-10: Priority publisher (optional) ─────────────────────────────────
@@ -557,5 +581,39 @@ public class RacerAutoConfiguration {
     @EnableScheduling
     static class RacerRetentionSchedulingConfiguration {
         // @EnableScheduling activates @Scheduled on RacerRetentionService
+    }
+
+    // ── Phase 4.2: Distributed Tracing ────────────────────────────────────────
+
+    /**
+     * Activated via {@code racer.tracing.enabled=true}.
+     * Propagates W3C {@code traceparent} across all consumed messages and writes
+     * the value to MDC for automatic log correlation.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.tracing.enabled", havingValue = "true")
+    public RacerTracingInterceptor racerTracingInterceptor(RacerProperties racerProperties) {
+        return new RacerTracingInterceptor(racerProperties.getTracing().isPropagateToMdc());
+    }
+
+    // ── Phase 4.3: Rate Limiting ──────────────────────────────────────────────
+
+    /**
+     * Activated via {@code racer.rate-limit.enabled=true}.
+     * Redis-backed token-bucket rate limiter injected into every
+     * {@link RacerPublisherRegistry} channel publisher.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "racer.rate-limit.enabled", havingValue = "true")
+    public RacerRateLimiter racerRateLimiter(
+            ReactiveRedisTemplate<String, String> reactiveStringRedisTemplate,
+            RacerProperties racerProperties) {
+        RacerProperties.RateLimitProperties props = racerProperties.getRateLimit();
+        return new RacerRateLimiter(
+                reactiveStringRedisTemplate,
+                props.getDefaultCapacity(),
+                props.getDefaultRefillRate(),
+                props.getKeyPrefix(),
+                props.getChannels());
     }
 }

@@ -24,8 +24,8 @@ import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -52,7 +52,7 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
 
     private Environment environment;
 
-    private final List<Disposable> subscriptions = new ArrayList<>();
+    private final List<Disposable> subscriptions = new CopyOnWriteArrayList<>();
     private final AtomicLong totalPolls  = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
 
@@ -99,9 +99,16 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
 
         method.setAccessible(true);
 
-        RacerChannelPublisher publisher = !channelRef.isEmpty()
-                ? publisherRegistry.getPublisher(channelRef)
-                : publisherRegistry.getPublisher("");
+        RacerChannelPublisher publisher;
+        if (!channelRef.isEmpty()) {
+            publisher = publisherRegistry.getPublisher(channelRef);
+        } else if (!channel.isEmpty()) {
+            publisher = publisherRegistry.getPublisher(channel);
+        } else {
+            log.error("[RACER-POLL] {}.{}() has neither 'channel' nor 'channelRef' — skipping registration.",
+                    beanName, method.getName());
+            return;
+        }
 
         String resolvedChannel = !channel.isEmpty() ? channel : publisher.getChannelName();
 
@@ -122,11 +129,13 @@ public class RacerPollRegistrar implements BeanPostProcessor, EnvironmentAware {
 
         Disposable sub = ticker
                 .flatMap(tick -> invokeThenPublish(bean, method, publisher,
-                        resolvedChannel, sender, async), 1)
-                .subscribe(
-                        v -> {},
-                        ex -> log.error("[RACER-POLL] Fatal error in poller {}.{}: {}",
-                                beanName, method.getName(), ex.getMessage(), ex));
+                        resolvedChannel, sender, async)
+                        .onErrorResume(ex -> {
+                            log.error("[RACER-POLL] Fatal error in poller {}.{}: {}",
+                                    beanName, method.getName(), ex.getMessage(), ex);
+                            return Mono.empty();
+                        }), 1)
+                .subscribe();
 
         subscriptions.add(sub);
     }

@@ -77,8 +77,9 @@ public class SchemaController {
 
         String schemaJson = schemaRegistry.getSchemaJson(alias);
         if (schemaJson == null) {
+            // Do not echo user-supplied alias back in the error body (prevents input reflection)
             return Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND)
-                    .body(Map.of("error", "No schema registered for alias: " + alias)));
+                    .body(Map.of("error", "No schema registered for the requested alias")));
         }
         return Mono.just(ResponseEntity.ok((Object) Map.of(
                 "alias",  alias,
@@ -98,7 +99,7 @@ public class SchemaController {
             return Mono.just(ResponseEntity.ok(schemaDisabledResponse()));
         }
 
-        String channel = (String) body.get("channel");
+        String channel = body.get("channel") instanceof String s ? s : null;
         Object payload = body.get("payload");
 
         if (channel == null || channel.isBlank()) {
@@ -107,8 +108,9 @@ public class SchemaController {
         }
 
         if (!schemaRegistry.hasSchema(channel)) {
+            // Do not echo user-supplied channel back in the error body (prevents input reflection)
             return Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND).body(
-                    Map.of("error", "No schema registered for channel: " + channel)));
+                    Map.of("error", "No schema registered for the requested channel")));
         }
 
         List<SchemaViolation> violations = schemaRegistry.validateAdHoc(channel, payload);

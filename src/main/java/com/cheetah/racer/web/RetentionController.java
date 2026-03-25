@@ -45,8 +45,8 @@ public class RetentionController {
      */
     @PostMapping("/trim")
     public Mono<ResponseEntity<Map<String, Object>>> trim() {
-        retentionService.trimStreams();
-        return retentionService.pruneDlq()
+        return retentionService.trimStreams()
+                .then(retentionService.pruneDlq())
                 .map(pruned -> ResponseEntity.ok(Map.of(
                         "status",    "trimmed",
                         "dlqPruned", (Object) pruned

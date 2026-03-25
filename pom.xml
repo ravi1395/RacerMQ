@@ -12,7 +12,7 @@
 
 	<groupId>com.cheetah</groupId>
 	<artifactId>racer</artifactId>
-	<version>1.1.0</version>
+	<version>1.3.0</version>
 	<name>racer</name>
 	<description>Reactive Redis Messaging with Pub/Sub and Dead Letter Queue</description>
 	<url>https://github.com/ravichandrasekhar/racer</url>
@@ -43,7 +43,28 @@
 	<properties>
 		<java.version>21</java.version>
 		<testcontainers.version>1.21.3</testcontainers.version>
+		<!-- Security: force Netty upgrade to fix CVE-2025-55163, CVE-2025-58056, CVE-2025-58057, CVE-2025-67735 -->
+		<netty.version>4.1.129.Final</netty.version>
 	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<!-- Force all Netty artifacts to 4.1.129.Final to resolve:
+			     CVE-2025-55163 (CVSS 7.5) - MadeYouReset DDoS
+			     CVE-2025-58057 (CVSS 7.5) - codec-compression resource exhaustion
+			     CVE-2025-67735 (CVSS 6.5) - CRLF injection in HttpRequestEncoder
+			     CVE-2025-58056 (CVSS 7.5) - traffic amplification
+			     Spring Boot BOM declares ${netty.version} so overriding the property above
+			     covers most artifacts; these entries cover any that do not honour the property. -->
+			<dependency>
+				<groupId>io.netty</groupId>
+				<artifactId>netty-bom</artifactId>
+				<version>4.1.129.Final</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
 
 	<dependencies>
 		<dependency>
@@ -90,6 +111,11 @@
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webflux</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-security</artifactId>
 			<optional>true</optional>
 		</dependency>
 

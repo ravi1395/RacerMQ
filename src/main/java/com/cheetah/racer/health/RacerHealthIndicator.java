@@ -77,10 +77,10 @@ public class RacerHealthIndicator implements ReactiveHealthIndicator {
     }
 
     private Mono<Health> checkRedis() {
-        return redisTemplate.getConnectionFactory()
-                .getReactiveConnection()
-                .ping()
-                .timeout(PING_TIMEOUT)
+        return Mono.usingWhen(
+                Mono.fromSupplier(() -> redisTemplate.getConnectionFactory().getReactiveConnection()),
+                conn -> conn.ping().timeout(PING_TIMEOUT),
+                conn -> Mono.fromRunnable(conn::close))
                 .map(pong -> Health.up()
                         .withDetail("redis.ping", pong)
                         .build())
@@ -91,8 +91,7 @@ public class RacerHealthIndicator implements ReactiveHealthIndicator {
     }
 
     private Mono<Health> enrichWithDlqDepth(Health redisHealth) {
-        return dlqService.peekAll()
-                .count()
+        return dlqService.size()
                 .map(depth -> {
                     Health.Builder builder = Health.status(redisHealth.getStatus());
                     redisHealth.getDetails().forEach(builder::withDetail);

@@ -169,7 +169,7 @@ cd notify-hub
         <dependency>
             <groupId>com.cheetah</groupId>
             <artifactId>racer</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
+            <version>1.3.0</version>
         </dependency>
 
         <dependency>

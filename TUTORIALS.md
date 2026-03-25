@@ -34,6 +34,10 @@ Each tutorial is self-contained and builds on a running Racer instance.
 23. [Tutorial 23 — Back-Pressure Monitoring](#tutorial-23--back-pressure-monitoring)
 24. [Tutorial 24 — Consumer Group Lag Dashboard](#tutorial-24--consumer-group-lag-dashboard)
 25. [Tutorial 25 — Message Interceptors (RacerMessageInterceptor)](#tutorial-25--message-interceptors-racermessageinterceptor)
+26. [Tutorial 26 — Distributed Tracing](#tutorial-26--distributed-tracing)
+27. [Tutorial 27 — Per-Channel Rate Limiting](#tutorial-27--per-channel-rate-limiting)
+28. [Tutorial 28 — Cluster-Aware Publishing with Consistent Hashing](#tutorial-28--cluster-aware-publishing-with-consistent-hashing)
+29. [Tutorial 29 — Admin UI Dashboard](#tutorial-29--admin-ui-dashboard)
 
 ---
 
@@ -102,7 +106,7 @@ Expected output:
 > <dependency>
 >     <groupId>com.cheetah</groupId>
 >     <artifactId>racer</artifactId>
->     <version>0.0.1-SNAPSHOT</version>
+>     <version>1.3.0</version>
 > </dependency>
 > ```
 > See [Tutorial 9](#tutorial-9--using-racer-as-a-library-in-a-new-project) for a
@@ -1074,6 +1078,84 @@ public class InventoryService {
 
 ---
 
+### Step 8 — Fan out to multiple channels with `@Repeatable` `@PublishResult`
+
+`@PublishResult` is `@Repeatable`, so you can stack multiple annotations on a single method to publish the return value to **several channels simultaneously**:
+
+```java
+import com.cheetah.racer.annotation.PublishResult;
+
+@Service
+public class OrderService {
+
+    // Result is published to both racer:orders AND racer:audit in one method call
+    @PublishResult(channelRef = "orders", sender = "order-service")
+    @PublishResult(channelRef = "audit",  async = false, sender = "auditor")
+    public Order createOrder(OrderRequest req) {
+        return orderRepository.save(req.toOrder());
+    }
+}
+```
+
+- Each `@PublishResult` in the stack is processed independently (separate sender, async flag, channel, etc.).
+- `PublishResultAspect` fires once per annotation, so you get `N` Redis `PUBLISH` calls for `N` annotations.
+- Works with `Mono<T>` and `Flux<T>` return types too.
+
+---
+
+### Step 9 — Per-annotation priority with `@PublishResult(priority = …)`
+
+When `racer.priority.enabled=true`, pair a `@PublishResult` with `@RacerPriority` to route to priority sub-channels. By default `@RacerPriority(defaultLevel)` applies to **all** stacked annotations. Use the `priority` attribute on individual `@PublishResult` annotations to assign **different levels per channel**:
+
+```java
+@Service
+public class AlertService {
+
+    // HIGH to the orders channel, LOW to the audit channel — from a single method
+    @PublishResult(channelRef = "orders",  priority = "HIGH")
+    @PublishResult(channelRef = "audit",   priority = "LOW")
+    @RacerPriority(defaultLevel = "NORMAL")   // fallback when priority="" on any annotation above
+    public Alert raiseAlert(AlertRequest req) {
+        return alertRepository.save(req.toAlert());
+    }
+}
+```
+
+Sub-channels used:
+- `racer:orders:priority:HIGH`
+- `racer:audit:priority:LOW`
+
+If `priority = ""` (the default) and `@RacerPriority` is present, `defaultLevel` is used instead.
+
+---
+
+### Step 10 — Startup safety — void method detection
+
+If you accidentally annotate a `void` method with `@PublishResult`, Racer detects this at startup and throws a `RacerConfigurationException` before the application finishes loading:
+
+```java
+// ❌ Racer throws RacerConfigurationException at startup
+@PublishResult(channelRef = "orders")
+public void placeOrder(OrderRequest req) {
+    orderRepository.save(req.toOrder());
+    // There is nothing to publish — void return!
+}
+
+// ✅ Correct — return the value you want published
+@PublishResult(channelRef = "orders")
+public Order placeOrder(OrderRequest req) {
+    return orderRepository.save(req.toOrder());
+}
+```
+
+The error message names the offending class and method:
+```
+RacerConfigurationException: @PublishResult is declared on void method(s) —
+there is no return value to publish. Violations: [com.example.OrderService#placeOrder()]
+```
+
+---
+
 ### Step 6 — Demo injected publisher endpoints
 
 > **Requires** `racer.web.channels-enabled=true` in `application.properties`.
@@ -1409,7 +1491,7 @@ my-racer-app/
         <dependency>
             <groupId>com.cheetah</groupId>
             <artifactId>racer</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
+            <version>1.3.0</version>
         </dependency>
 
         <!-- WebFlux for reactive HTTP endpoints -->
@@ -2077,8 +2159,10 @@ public RacerFunctionalRouter broadcastRouter() {
 | `multicastAndProcess("a", "b")` | Publish to both aliases AND invoke local `@RacerListener` |
 | `forward("email")` | Publish to one alias; skip local handler |
 | `forwardAndProcess("email")` | Publish to one alias AND invoke local `@RacerListener` |
-| `drop()` | Discard silently |
-| `dropToDlq()` | Route to the Dead Letter Queue |
+| `forwardWithPriority("email", "HIGH")` | Publish to `email`'s priority sub-channel `racer:email:priority:HIGH`; skip local handler |
+| `drop()` | Discard and log at DEBUG (message ID, channel, truncated payload) |
+| `dropQuietly()` | Silently discard with no logging (for health-check pings, etc.) |
+| `dropToDlq()` | Route to the Dead Letter Queue (**recommended default route**) |
 
 ---
 
@@ -2160,8 +2244,45 @@ public class ModernRouterConfig {
 
 ---
 
+### Step 13 — Priority routing in the functional DSL
+
+When `racer.priority.enabled=true`, use `forwardWithPriority(alias, level)` to route a message directly to a priority sub-channel inside a functional router:
+
+```java
+import static com.cheetah.racer.router.dsl.RouteHandlers.*;
+import static com.cheetah.racer.router.dsl.RoutePredicates.*;
+
+@Configuration
+public class PriorityRouterConfig {
+
+    @Bean
+    public RacerFunctionalRouter priorityRouter() {
+        return RacerFunctionalRouter.builder()
+                .name("priority-router")
+                // Route urgent notifications to the HIGH sub-channel
+                .route(fieldEquals("urgency", "CRITICAL"),
+                       forwardWithPriority("notifications", "HIGH"))
+                // Route batch messages to LOW
+                .route(fieldEquals("urgency", "BATCH"),
+                       forwardWithPriority("notifications", "LOW"))
+                // Default: standard publish without priority
+                .defaultRoute(forward("notifications"))
+                .build();
+    }
+}
+```
+
+Sub-channels targeted:
+- `racer:notifications:priority:HIGH` — for `urgency = CRITICAL`
+- `racer:notifications:priority:LOW` — for `urgency = BATCH`
+- `racer:notifications` — for everything else
+
+> **Fallback behaviour:** if `RacerPriorityPublisher` is not in the Spring context (i.e. `racer.priority.enabled=false`), `forwardWithPriority` logs a WARN and falls back to a standard `forward(alias)` — the message is still delivered, just without priority routing.
+
+---
+
 ### What you built
-A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded. Plus a functional DSL router with composable predicates, true multi-alias fan-out, and seamless coexistence with the annotation-based rules.
+A fully declarative content-based router with payload, sender, and ID matching; configurable per-rule actions including fan-out, priority routing, and DLQ routing; per-listener method-level routing rules; and a boolean injection point that tells each handler whether the message was also forwarded. Plus a functional DSL router with composable predicates, true multi-alias fan-out, and seamless coexistence with the annotation-based rules.
 
 ---
 
@@ -4232,21 +4353,82 @@ racer_stream_consumer_lag > 500
 
 ---
 
-### What you built
+### Step 6 — Consumer lag in `/actuator/health`
 
+The consumer lag monitor feeds directly into the Spring Boot **health indicator** when both are enabled. No extra configuration is required — `RacerHealthAutoConfiguration` wires them together automatically.
+
+#### 6.1 Enable both features
+
+```properties
+# application.properties
+racer.consumer-lag.enabled=true
+racer.consumer-lag.scrape-interval-seconds=15
+racer.consumer-lag.lag-warn-threshold=500      # WARN log when lag exceeds this
+racer.consumer-lag.lag-down-threshold=5000     # health flips to OUT_OF_SERVICE here
+
+management.endpoints.web.exposure.include=health,metrics,prometheus
+management.endpoint.health.show-details=always
+```
+
+#### 6.2 Inspect the health endpoint
+
+```bash
+curl -s http://localhost:8080/actuator/health | jq .components.racer
+```
+
+When all groups are healthy:
+```json
+{
+  "status": "UP",
+  "details": {
+    "redis.ping": "PONG",
+    "dlq.depth": 0,
+    "consumer-lag": {
+      "racer:orders-stream|order-processors": 12 
+    }
+  }
+}
+```
+
+When lag exceeds `lag-down-threshold`:
+```json
+{
+  "status": "OUT_OF_SERVICE",
+  "details": {
+    "redis.ping": "PONG",
+    "dlq.depth": 0,
+    "consumer-lag": {
+      "racer:orders-stream|order-processors": 6200
+    },
+    "consumer-lag.threshold-breached": true
+  }
+}
+```
+
+This lets your load balancer or Kubernetes liveness probe automatically detect a consumer that is falling behind and take action (e.g. restart the pod or trigger an alert).
+
+#### 6.3 Tune the threshold
+
+| Property | Effect |
+|----------|--------|
+| `racer.consumer-lag.lag-warn-threshold` | Emits a WARN log on each scrape cycle when exceeded (no health change) |
+| `racer.consumer-lag.lag-down-threshold` | Flips `/actuator/health` to `OUT_OF_SERVICE` when any tracked group exceeds this |
+
+Set `racer.consumer-lag.lag-down-threshold=0` to keep the lag details visible in the health response without ever flipping the status.
+
+---
+
+### What you built
 ```
 Redis Stream: racer:orders-stream
 Consumer Group: order-processors
         │
         ▼
-RacerConsumerLagMonitor  (every 5 s)
+RacerConsumerLagMonitor  (every 15 s)
    XPENDING racer:orders-stream order-processors - + 1
         │
-        ▼
-Gauge: racer.stream.consumer.lag{stream="racer:orders-stream", group="order-processors"}
-        │
-        ▼
-Prometheus scrape  →  Grafana panel  →  alert on threshold
+        ├───► Gauge: racer.stream.consumer.lag{…}  →  Prometheus  →  Grafana
+        └───► RacerHealthIndicator → /actuator/health  →  K8s liveness probe
 ```
 
 Real-time visibility into stream back-log with zero code changes — just one property and standard Micrometer / Prometheus tooling.
@@ -4417,3 +4599,344 @@ public class RacerInterceptorConfig {
 
 ### What you built
 A pluggable pre-dispatch interception pipeline that runs before every `@RacerListener` handler. Use it for cross-cutting concerns — logging, validation, enrichment, metrics, or security checks — without modifying handler code.
+
+---
+
+## Tutorial 26 — Distributed Tracing
+
+### What you'll learn
+- Enable W3C `traceparent` propagation on outbound `RacerMessage` envelopes
+- Use `RacerTraceContext` to generate, extract, and carry trace context across service hops
+- Configure `RacerTracingInterceptor` to auto-stamp every message with a traceparent
+- Propagate `traceparent` to SLF4J MDC for correlated log lines
+
+### Prerequisites
+Tutorial 25 completed. Redis running (`docker compose up -d redis`).
+
+### Step 1 — Enable tracing in `application.properties`
+
+```properties
+racer.tracing.enabled=true
+racer.tracing.propagate-to-mdc=true
+racer.tracing.inject-into-envelope=true
+```
+
+Set the log pattern to include the MDC value:
+
+```yaml
+# application.yml (or logback-spring.xml equivalent)
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%X{traceparent}] %-5level %logger{36} - %msg%n"
+```
+
+### Step 2 — Publish with automatic traceparent injection
+
+When `racer.tracing.enabled=true`, `RacerTracingInterceptor` (`@Order(1)`) transparently stamps every outbound message. Nothing changes in your publisher code:
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private RacerPublisherRegistry publishers;
+
+    public void placeOrder(String orderId) {
+        publishers.get("orders").publish("orders", "order:" + orderId);
+        // RacerTracingInterceptor intercepts before Redis write
+        // and sets message.traceparent = "00-<traceId>-<spanId>-01"
+    }
+}
+```
+
+### Step 3 — Extract traceparent on the consumer side
+
+```java
+@Component
+public class OrderConsumer {
+
+    @RacerListener(channelRef = "orders")
+    public void onOrder(RacerMessage msg) {
+        String traceparent = RacerTraceContext.extract(msg);
+        // MDC is already populated if racer.tracing.propagate-to-mdc=true
+        // All log lines within this method carry [traceparent] in the pattern
+        log.info("Processing order: {}", msg.getPayload());
+        // ... business logic
+    }
+}
+```
+
+### Step 4 — Manual context propagation (advanced)
+
+Use `RacerTraceContext` directly if you need to propagate context to downstream HTTP calls:
+
+```java
+String tp = RacerTraceContext.extract(msg);
+WebClient.create("http://inventory-service")
+    .post()
+    .uri("/reserve")
+    .header("traceparent", tp)
+    .bodyValue(msg.getPayload())
+    .retrieve()
+    .toBodilessEntity()
+    .block();
+```
+
+### Step 5 — Verify in logs
+
+Run `mvn spring-boot:run` and publish a message. Look for the traceparent in log output:
+
+```
+10:22:01.145 [00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01] INFO  c.c.r.OrderConsumer - Processing order: order:42
+```
+
+### What you built
+End-to-end W3C traceparent propagation from publisher through Redis to consumer, with automatic MDC injection so every log line in a handler is correlated to the originating trace.
+
+---
+
+## Tutorial 27 — Per-Channel Rate Limiting
+
+### What you'll learn
+- Enable Redis token-bucket rate limiting for Racer channels
+- Configure global defaults and per-channel overrides
+- Handle `RacerRateLimitException` for fail-open behavior
+- Inspect live token counts via the Admin UI
+
+### Prerequisites
+Tutorial 25 completed. Redis running.
+
+### Step 1 — Enable rate limiting in `application.properties`
+
+```properties
+# Global defaults
+racer.rate-limit.enabled=true
+racer.rate-limit.default-permits-per-second=100
+racer.rate-limit.default-burst-size=200
+
+# Per-channel overrides
+racer.rate-limit.channels.orders.permits-per-second=500
+racer.rate-limit.channels.orders.burst-size=1000
+racer.rate-limit.channels.notifications.permits-per-second=50
+racer.rate-limit.channels.notifications.burst-size=100
+```
+
+### Step 2 — Catch `RacerRateLimitException` in publishers
+
+```java
+@Service
+@RequiredArgsConstructor
+public class NotificationService {
+
+    private final RacerPublisherRegistry publishers;
+    private final RacerRateLimiter rateLimiter;
+
+    public void sendNotification(String userId, String body) {
+        try {
+            rateLimiter.acquire("notifications"); // throws if exhausted
+            publishers.get("notifications").publish("notifications", body);
+            log.info("Notification sent to user {}", userId);
+        } catch (RacerRateLimitException ex) {
+            log.warn("Rate limit exceeded for 'notifications' — dropping message for user {}: {}",
+                     userId, ex.getMessage());
+            // optionally: queue to a retry topic, increment a counter, send to DLQ
+        }
+    }
+}
+```
+
+**Fail-open guarantee:** If Redis is unavailable, `RacerRateLimiter` defaults to **allow** — a Redis outage never blocks publishing.
+
+### Step 3 — Observe rate limiting behaviour
+
+Send a burst of 300 notifications rapidly (more than the burst-size of 100):
+
+```java
+IntStream.range(0, 300).forEach(i -> notificationService.sendNotification("user-" + i, "Hello!"));
+```
+
+Expected log output (approximately):
+
+```
+INFO  ... Notification sent to user user-0
+...
+INFO  ... Notification sent to user user-99
+WARN  ... Rate limit exceeded for 'notifications' — dropping message for user user-100: ...
+...
+```
+
+### Step 4 — View live token counts
+
+With `racer.web.admin-enabled=true`, call:
+
+```bash
+curl http://localhost:8080/api/admin/ratelimits | jq
+```
+
+```json
+[
+  { "channel": "racer:orders",         "permitsPerSecond": 500, "burstSize": 1000, "availableTokens": 997 },
+  { "channel": "racer:notifications",  "permitsPerSecond": 50,  "burstSize": 100,  "availableTokens": 0   }
+]
+```
+
+### What you built
+Per-channel Redis token-bucket rate limiting with a fail-open fallback, per-channel config overrides, and live observability via the Admin UI.
+
+---
+
+## Tutorial 28 — Cluster-Aware Publishing with Consistent Hashing
+
+### What you'll learn
+- Replace round-robin shard selection with a consistent hash ring
+- Configure `RacerConsistentHashRing` via `racer.sharding.consistent-hash-enabled=true`
+- Understand virtual nodes and their effect on load distribution
+- Enable automatic failover when a shard is unavailable
+
+### Prerequisites
+Tutorial 20 (multi-shard setup) completed. Docker Compose cluster config available (`compose.cluster.yaml`).
+
+### Step 1 — Start the cluster
+
+```bash
+docker compose -f compose.cluster.yaml up -d
+```
+
+This starts three Redis nodes: `redis-shard-1`, `redis-shard-2`, `redis-shard-3`.
+
+### Step 2 — Enable consistent hashing in `application.properties`
+
+```properties
+# Sharding base config
+racer.sharding.enabled=true
+racer.sharding.shards=redis-shard-1:6379,redis-shard-2:6379,redis-shard-3:6379
+
+# Consistent hash ring (v1.3)
+racer.sharding.consistent-hash-enabled=true
+racer.sharding.virtual-nodes-per-shard=150
+racer.sharding.failover-enabled=true
+```
+
+**`virtual-nodes-per-shard`**: Higher values distribute keys more evenly across shards but use more memory for the ring. 150 is a good production default.
+
+### Step 3 — Observe deterministic shard assignment
+
+With consistent hashing, the same message ID always maps to the same shard (unless a shard is removed). To verify:
+
+```java
+@Autowired RacerConsistentHashRing hashRing;
+
+String shard1 = hashRing.getShard("order-uuid-42");
+String shard2 = hashRing.getShard("order-uuid-42");
+assert shard1.equals(shard2); // always true
+```
+
+### Step 4 — Simulate failover
+
+Stop shard-2:
+
+```bash
+docker compose -f compose.cluster.yaml stop redis-shard-2
+```
+
+With `racer.sharding.failover-enabled=true`, messages that would have gone to shard-2 are automatically redirected to the next available shard in the ring. No exception is thrown; a `WARN` log line is emitted:
+
+```
+WARN  RacerConsistentHashRing - Preferred shard [redis-shard-2:6379] unavailable; failing over to [redis-shard-3:6379]
+```
+
+Restart shard-2 — the ring automatically re-routes back:
+
+```bash
+docker compose -f compose.cluster.yaml start redis-shard-2
+```
+
+### What you built
+A consistent-hash ring over a three-node Redis cluster with deterministic key assignment, automatic failover to the next shard, and transparent recovery on node restart.
+
+---
+
+## Tutorial 29 — Admin UI Dashboard
+
+### What you'll learn
+- Enable the `RacerAdminController` REST endpoints
+- Access the live Bootstrap 5 dashboard at `/racer-admin/`
+- Query each admin endpoint individually with `curl`
+- Combine the Admin UI with circuit breakers and rate limiters for full observability
+
+### Prerequisites
+Tutorial 25 completed. Redis running. `racer.web.enabled=true` (default).
+
+### Step 1 — Enable the Admin UI
+
+```properties
+racer.web.admin-enabled=true
+```
+
+Restart the application. The Admin UI is now available at `http://localhost:8080/racer-admin/` and the four REST endpoints are active.
+
+### Step 2 — Open the dashboard in a browser
+
+Navigate to `http://localhost:8080/racer-admin/` in any browser. You will see:
+
+- **Overview card** — instance status, channel count, DLQ depth
+- **Channels table** — alias → channel name, async flag
+- **Circuit Breakers table** — state (`CLOSED` / `OPEN` / `HALF_OPEN`), failure rate
+- **Rate Limits table** — permits-per-second, burst size, available tokens
+
+The dashboard auto-refreshes every 5 seconds.
+
+### Step 3 — Query endpoints with `curl`
+
+**Overview:**
+```bash
+curl http://localhost:8080/api/admin/overview | jq
+```
+```json
+{
+  "status": "UP",
+  "channelCount": 4,
+  "dlqDepth": 0,
+  "circuitBreakers": 3,
+  "rateLimiters": 2,
+  "timestamp": "2026-03-01T10:00:00Z"
+}
+```
+
+**Channels:**
+```bash
+curl http://localhost:8080/api/admin/channels | jq
+```
+
+**Circuit Breakers:**
+```bash
+curl http://localhost:8080/api/admin/circuitbreakers | jq
+```
+
+**Rate Limits:**
+```bash
+curl http://localhost:8080/api/admin/ratelimits | jq
+```
+
+### Step 4 — Trigger a circuit breaker state change
+
+Send messages that cause repeated failures to open a circuit breaker (see Tutorial 22 for setup). Refresh the Admin UI — the affected circuit breaker transitions from `CLOSED` to `HALF_OPEN` to `OPEN`, visible in real time.
+
+### Step 5 — Disable for production (opt-out pattern)
+
+The Admin UI is disabled by default (`racer.web.admin-enabled=false`). To expose only specific endpoints in production, use Spring Security to restrict access to `/api/admin/**`:
+
+```java
+@Bean
+SecurityFilterChain adminSecurity(HttpSecurity http) throws Exception {
+    return http
+        .securityMatcher("/api/admin/**", "/racer-admin/**")
+        .authorizeHttpRequests(auth -> auth.anyRequest().hasRole("RACER_ADMIN"))
+        .httpBasic(Customizer.withDefaults())
+        .build();
+}
+```
+
+### What you built
+A live operational dashboard backed by four REST endpoints, giving you instant visibility into channel configuration, circuit breaker health, and rate limiter token counts — all from a browser or a `curl` command.
+

@@ -49,9 +49,12 @@ public final class RacerStreamUtils {
      * Spring Data Redis or Lettuce add around it.
      */
     private static boolean isBusyGroup(Throwable ex) {
-        if (ex == null) return false;
-        if (ex.getMessage() != null && ex.getMessage().contains("BUSYGROUP")) return true;
-        return isBusyGroup(ex.getCause());
+        Throwable current = ex;
+        for (int depth = 0; current != null && depth < 20; depth++) {
+            if (current.getMessage() != null && current.getMessage().contains("BUSYGROUP")) return true;
+            current = current.getCause();
+        }
+        return false;
     }
 
     /**

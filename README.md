@@ -13,7 +13,11 @@ A Spring Boot library for annotation-driven reactive Redis messaging. Define pub
 - **Atomic Batch Publish** — `RacerTransaction.execute()` for ordered multi-channel publish
 - **Pipelined Batch Publish** — `RacerPipelinedPublisher` issues all commands in parallel for maximum throughput
 - **Consumer Scaling** — configurable concurrency per stream via `@RacerStreamListener(concurrency=N)` and key-based sharding via `RacerShardedStreamPublisher`
+- **Cluster-Aware Publishing** — consistent-hash shard routing via `RacerConsistentHashRing`; automatic failover across shards (v1.3)
 - **Message Priority** — `RacerPriorityPublisher` routes messages to `HIGH`/`NORMAL`/`LOW` sub-channels
+- **Distributed Tracing** — W3C `traceparent` propagation via `RacerTraceContext` and `RacerTracingInterceptor`; MDC integration for correlated logging (v1.3)
+- **Per-Channel Rate Limiting** — Redis token-bucket via `RacerRateLimiter`; fail-open on Redis errors; per-channel overrides (v1.3)
+- **Admin UI** — live dashboard at `/racer-admin/` backed by `RacerAdminController`; overview, channel stats, circuit breaker state, and rate limit info (v1.3)
 - **Micrometer Metrics** — Prometheus/Actuator instrumentation for published/consumed/failed/DLQ/latency counters
 - **Retention Service** — scheduled `XTRIM` + DLQ age-based eviction; opt-in REST API (`racer.web.retention-enabled=true`)
 - **High Availability** — Sentinel and Cluster Docker Compose topologies included
@@ -51,21 +55,25 @@ A Spring Boot library for annotation-driven reactive Redis messaging. Define pub
    - [Router APIs](#router-apis)
    - [Channel Registry APIs](#channel-registry-apis)
    - [Schema APIs](#schema-apis)
+   - [Admin UI APIs](#admin-ui-apis)
 10. [Observability & Metrics](#observability--metrics)
 11. [High Availability](#high-availability)
 12. [Consumer Scaling & Sharding](#consumer-scaling--sharding)
 13. [Pipelined Publishing](#pipelined-publishing)
 14. [Message Priority](#message-priority)
-15. [End-to-End Flows](#end-to-end-flows)
-16. [Extending the Application](#extending-the-application)
-17. [Error Handling & DLQ Behaviour](#error-handling--dlq-behaviour)
-18. [Comparison with Other Brokers](#comparison-with-other-brokers)
+15. [Cluster-Aware Publishing](#cluster-aware-publishing)
+16. [Distributed Tracing](#distributed-tracing)
+17. [Per-Channel Rate Limiting](#per-channel-rate-limiting)
+18. [End-to-End Flows](#end-to-end-flows)
+19. [Extending the Application](#extending-the-application)
+20. [Error Handling & DLQ Behaviour](#error-handling--dlq-behaviour)
+21. [Comparison with Other Brokers](#comparison-with-other-brokers)
     - [Architecture at a Glance](#architecture-at-a-glance)
     - [Advantages of Racer](#advantages-of-racer)
     - [Disadvantages & Mitigations](#disadvantages--mitigations)
     - [When to Use What](#when-to-use-what)
-19. [Roadmap & Implementation Status](#roadmap--implementation-status)
-20. [Tutorials](TUTORIALS.md) *(separate file)*
+22. [Roadmap & Implementation Status](#roadmap--implementation-status)
+23. [Tutorials](TUTORIALS.md) *(separate file)*
 
 ---
 
@@ -103,6 +111,7 @@ A Spring Boot library for annotation-driven reactive Redis messaging. Define pub
  │    /api/router/**       racer.web.router-enabled=true                        │
  │    GET /api/channels    racer.web.channels-enabled=true                      │
  │    /api/schema/**       racer.web.schema-enabled=true                        │
+ │    /api/admin/**        racer.web.admin-enabled=true  (v1.3)                 │
  └───────────────────────────────────────────────────────────────────────────────┘
 
 Metrics: RacerMetrics (Micrometer) wired into all publish/consume/DLQ paths
@@ -173,6 +182,8 @@ racer/                                   # Library (single-module Maven project)
     │   │   │   ├── RacerChannelPublisher.java         # Publisher interface
     │   │   │   ├── RacerChannelPublisherImpl.java     # Pub/Sub implementation (+ metrics)
     │   │   │   ├── RacerPublisherRegistry.java        # Multi-channel registry
+    │   │   │   ├── RacerShardedStreamPublisher.java   # Key-based shard publisher (CRC-16)
+    │   │   │   ├── RacerConsistentHashRing.java       # Consistent-hash ring for cluster-aware publishing (v1.3)
     │   │   │   └── RacerStreamPublisher.java          # Durable stream publisher (XADD)
     │   │   ├── requestreply/
     │   │   │   ├── RacerResponderRegistrar.java       # BeanPostProcessor for @RacerResponder
@@ -197,6 +208,12 @@ racer/                                   # Library (single-module Maven project)
     │   │   ├── stream/
     │   │   │   ├── RacerStreamListenerRegistrar.java  # BeanPostProcessor for @RacerStreamListener
     │   │   │   └── RacerStreamUtils.java              # Static utility: XGROUP CREATE (ensureGroup) + XACK (ackRecord)
+    │   │   ├── tracing/
+    │   │   │   ├── RacerTraceContext.java             # W3C traceparent propagation context (v1.3)
+    │   │   │   └── RacerTracingInterceptor.java       # @Order(1) interceptor: MDC propagation for correlated logging (v1.3)
+    │   │   ├── ratelimit/
+    │   │   │   ├── RacerRateLimiter.java              # Redis token-bucket rate limiter (v1.3)
+    │   │   │   └── RacerRateLimitException.java       # Thrown when rate limit is exceeded (v1.3)
     │   │   ├── tx/
     │   │   │   └── RacerTransaction.java              # Atomic ordered multi-channel publish
     │   │   ├── util/
@@ -206,9 +223,14 @@ racer/                                   # Library (single-module Maven project)
     │   │       ├── RetentionController.java           # Conditional on racer.web.retention-enabled
     │   │       ├── RouterController.java              # Conditional on racer.web.router-enabled
     │   │       ├── ChannelRegistryController.java     # Conditional on racer.web.channels-enabled
-    │   │       └── SchemaController.java              # Conditional on racer.web.schema-enabled
-    │   └── resources/META-INF/spring/
-    │       └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+    │   │       ├── SchemaController.java              # Conditional on racer.web.schema-enabled
+    │   │       └── RacerAdminController.java          # Conditional on racer.web.admin-enabled (v1.3)
+    │   └── resources/
+    │       ├── META-INF/spring/
+    │       │   └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+    │       └── static/
+    │           └── racer-admin/
+    │               └── index.html                         # Bootstrap 5 Admin UI dashboard (v1.3)
     └── test/java/com/cheetah/racer/
         └── (unit tests)
 
@@ -332,6 +354,17 @@ Started RacerDemoApplication in X.XXX seconds
 | `racer.sharding.enabled` | `false` | Enable key-based stream sharding (R-8) |
 | `racer.sharding.shard-count` | `4` | Number of shard suffixes: `stream:0` … `stream:N-1` (R-8) |
 | `racer.sharding.streams` | — | Comma-separated base stream keys to shard (R-8) |
+| `racer.sharding.consistent-hash-enabled` | `false` | Use `RacerConsistentHashRing` for consistent-hash shard routing (v1.3) |
+| `racer.sharding.virtual-nodes-per-shard` | `150` | Virtual nodes per shard in the hash ring — higher = more even distribution (v1.3) |
+| `racer.sharding.failover-enabled` | `true` | Automatically route to the next shard when the primary shard is unavailable (v1.3) |
+| `racer.tracing.enabled` | `false` | Enable W3C `traceparent` propagation via `RacerTracingInterceptor` (v1.3) |
+| `racer.tracing.propagate-to-mdc` | `true` | Copy `traceparent` to SLF4J MDC for correlated log lines (v1.3) |
+| `racer.tracing.inject-into-envelope` | `true` | Stamp `traceparent` on outbound `RacerMessage` envelopes (v1.3) |
+| `racer.rate-limit.enabled` | `false` | Enable Redis token-bucket per-channel rate limiting (v1.3) |
+| `racer.rate-limit.default-permits-per-second` | `100` | Default token refill rate (requests/second) for all channels (v1.3) |
+| `racer.rate-limit.default-burst-size` | `200` | Default burst capacity (maximum token bucket size) (v1.3) |
+| `racer.rate-limit.channels.<alias>.permits-per-second` | — | Per-channel override for refill rate (v1.3) |
+| `racer.rate-limit.channels.<alias>.burst-size` | — | Per-channel override for burst capacity (v1.3) |
 | `racer.pubsub.concurrency` | `256` | Max in-flight Pub/Sub messages processed concurrently (R-11) |
 | `racer.poll.enabled` | `true` | Enable/disable all `@RacerPoll` pollers (R-11) |
 | `racer.request-reply.default-timeout` | `30s` | Default timeout for `@RacerRequestReply` calls |
@@ -345,6 +378,7 @@ Started RacerDemoApplication in X.XXX seconds
 | `racer.web.router-enabled` | `false` | Expose `/api/router/**` REST endpoints |
 | `racer.web.channels-enabled` | `false` | Expose `GET /api/channels` REST endpoint |
 | `racer.web.schema-enabled` | `false` | Expose `/api/schema/**` REST endpoints |
+| `racer.web.admin-enabled` | `false` | Expose `/api/admin/**` and serve `/racer-admin/` Admin UI dashboard (v1.3) |
 | `management.endpoints.web.exposure.include` | `health,info` | Actuator endpoints to expose (add `metrics,prometheus`) |
 | `management.metrics.tags.application` | — | Tag all metrics with app name |
 | `logging.level.com.cheetah.racer` | `DEBUG` | Log level |
@@ -483,9 +517,23 @@ public Flux<Event> generateEvents() {
 | `durable` | `boolean` | `false` | When `true`, publishes to a **Redis Stream** (XADD) instead of Pub/Sub. |
 | `streamKey` | `String` | `""` | The Redis Stream key to write to when `durable=true` (e.g. `racer:orders:stream`). |
 | `mode` | `ConcurrencyMode` | `SEQUENTIAL` | Dispatch strategy for `Flux<T>` returns. `SEQUENTIAL` = fire-and-forget `doOnNext`; `CONCURRENT` = `flatMap` with up to `concurrency` in-flight publishes. Ignored for `Mono` and POJO returns. |
+| `priority` | `String` | `""` | Priority level for this specific publish (`"HIGH"`, `"NORMAL"`, `"LOW"`). When set, overrides the `@RacerPriority(defaultLevel)` on the same method for this particular channel. Requires `racer.priority.enabled=true`. |
 | `concurrency` | `int` | `4` | Maximum concurrent in-flight publish operations when `mode = CONCURRENT`. |
 
 **Resolution order:** `channel` (direct name) → `channelRef` (alias lookup) → default channel (`racer.default-channel`).
+
+**Repeatable:** `@PublishResult` is `@Repeatable` — stack multiple annotations on a single method to fan out to several channels at once:
+
+```java
+@PublishResult(channelRef = "orders",  priority = "HIGH")
+@PublishResult(channelRef = "audit",   async = false)
+public Order createOrder(OrderRequest req) {
+    return orderService.create(req);
+    // Result published to racer:orders (HIGH priority) AND racer:audit (blocking)
+}
+```
+
+**Startup safety:** if `@PublishResult` is placed on a `void` method, Racer throws a `RacerConfigurationException` at startup — a `void` return type means there is nothing to publish.
 
 **`sender` resolution chain (when `channelRef` is set):**
 1. Annotation `sender` value if non-empty
@@ -505,7 +553,18 @@ public Flux<Event> generateEvents() {
 | `Flux<T>` — `CONCURRENT` | Uses `flatMap(publish, concurrency)` — up to N Redis publishes in flight simultaneously; downstream waits for publish before receiving each element |
 | Any POJO / `void` | Published synchronously or asynchronously after return |
 
-> **Important:** The annotated method must be on a **Spring proxy** (i.e. invoked from outside the bean). Self-invocation inside the same class bypasses the AOP proxy and `@PublishResult` will not fire.
+> **Important — self-invocation:** The annotated method must be invoked through a **Spring proxy** (i.e. called from a _different_ bean). Calling `this.method()` from within the same class bypasses the AOP proxy and `@PublishResult` **will not fire**.
+>
+> ```java
+> // ❌ Self-invocation — @PublishResult is silently ignored:
+> public void caller() { this.createOrder(req); }
+>
+> // ✅ External invocation — works correctly:
+> @Autowired OrderService orderService;
+> public void caller() { orderService.createOrder(req); }
+> ```
+>
+> If you must call the annotated method from within the same class, inject the bean via `@Autowired` (self-injection) or use `applicationContext.getBean(MyService.class).createOrder(req)`.
 
 ---
 
@@ -650,8 +709,10 @@ public class OrderRouterConfig {
 | `forwardAndProcess(alias)` | Publish to one alias AND invoke local handler | `FORWARDED_AND_PROCESS` |
 | `multicast(a, b, ...)` | Publish to ALL listed aliases; skip local handler | `FORWARDED` |
 | `multicastAndProcess(a, b, ...)` | Publish to ALL listed aliases AND invoke local handler | `FORWARDED_AND_PROCESS` |
-| `drop()` | Silently discard | `DROPPED` |
-| `dropToDlq()` | Route to the Dead Letter Queue | `DROPPED_TO_DLQ` |
+| `forwardWithPriority(alias, level)` | Publish to `alias`'s priority sub-channel `{channel}:priority:{LEVEL}`; skip local handler. Falls back to `forward(alias)` when priority is not configured. | `FORWARDED` |
+| `drop()` | Discard and log at DEBUG (`id`, `channel`, truncated payload) | `DROPPED` |
+| `dropQuietly()` | Silently discard with no logging (for health-check pings, etc.) | `DROPPED` |
+| `dropToDlq()` | Route to the Dead Letter Queue (**recommended default route**) | `DROPPED_TO_DLQ` |
 
 **Runtime API:**
 - `GET /api/router/rules` — list all compiled rules with their index, source, field, pattern, target and action.
@@ -1103,13 +1164,14 @@ Consumer names within group: **`<group>-<index>`** e.g. `orders-group-0`, `order
 
 ```json
 {
-  "id":         "uuid-auto-generated",
-  "channel":    "racer:messages",
-  "payload":    "your message content",
-  "sender":     "racer-demo",
-  "timestamp":  "2026-03-01T10:00:00Z",
-  "retryCount": 0,
-  "priority":   "NORMAL"
+  "id":           "uuid-auto-generated",
+  "channel":      "racer:messages",
+  "payload":      "your message content",
+  "sender":       "racer-demo",
+  "timestamp":    "2026-03-01T10:00:00Z",
+  "retryCount":   0,
+  "priority":     "NORMAL",
+  "traceparent":  "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 }
 ```
 
@@ -1169,6 +1231,7 @@ All REST endpoints are **opt-in** and only exposed when the corresponding proper
 | Router | `racer.web.router-enabled=true` | `/api/router` |
 | Channels | `racer.web.channels-enabled=true` | `/api/channels` |
 | Schema | `racer.web.schema-enabled=true` | `/api/schema` |
+| Admin UI | `racer.web.admin-enabled=true` | `/api/admin` + `/racer-admin/` |
 
 ---
 
@@ -1448,6 +1511,108 @@ See the full schema API documentation and `RacerSchemaRegistry` javadoc for endp
 
 ---
 
+### Admin UI APIs
+
+Base path: `/api/admin` (requires `racer.web.admin-enabled=true`)
+
+`RacerAdminController` exposes a live operational dashboard for the Racer instance. The static web UI is served at `http://localhost:8080/racer-admin/` (Bootstrap 5 single-page app, auto-configured alongside the REST endpoints).
+
+Enable in `application.properties`:
+```properties
+racer.web.admin-enabled=true
+```
+
+---
+
+#### `GET /api/admin/overview`
+
+Health-level summary of the Racer instance.
+
+**Response `200 OK`**
+
+```json
+{
+  "status":          "UP",
+  "channelCount":    4,
+  "dlqDepth":        0,
+  "circuitBreakers": 3,
+  "rateLimiters":    2,
+  "timestamp":       "2026-03-01T10:00:00Z"
+}
+```
+
+**curl example:**
+```bash
+curl http://localhost:8080/api/admin/overview
+```
+
+---
+
+#### `GET /api/admin/channels`
+
+Lists all registered channel aliases with their publish configuration.
+
+**Response `200 OK`**
+
+```json
+[
+  { "alias": "__default__", "channel": "racer:messages",      "async": true },
+  { "alias": "orders",      "channel": "racer:orders",        "async": true },
+  { "alias": "notifications","channel": "racer:notifications", "async": true },
+  { "alias": "audit",       "channel": "racer:audit",         "async": false }
+]
+```
+
+**curl example:**
+```bash
+curl http://localhost:8080/api/admin/channels
+```
+
+---
+
+#### `GET /api/admin/circuitbreakers`
+
+Returns the current state of every registered `RacerCircuitBreaker`.
+
+**Response `200 OK`**
+
+```json
+[
+  { "listenerId": "sms-worker",   "state": "CLOSED",    "failureRate": 0.0  },
+  { "listenerId": "email-worker", "state": "CLOSED",    "failureRate": 0.0  },
+  { "listenerId": "push-worker",  "state": "HALF_OPEN", "failureRate": 55.0 }
+]
+```
+
+States: `CLOSED` (healthy), `OPEN` (rejecting calls), `HALF_OPEN` (probe phase).
+
+**curl example:**
+```bash
+curl http://localhost:8080/api/admin/circuitbreakers
+```
+
+---
+
+#### `GET /api/admin/ratelimits`
+
+Returns current rate limiter configuration and token bucket status for each channel.
+
+**Response `200 OK`**
+
+```json
+[
+  { "channel": "racer:orders",        "permitsPerSecond": 100, "burstSize": 200, "availableTokens": 197 },
+  { "channel": "racer:notifications", "permitsPerSecond": 500, "burstSize": 1000, "availableTokens": 998 }
+]
+```
+
+**curl example:**
+```bash
+curl http://localhost:8080/api/admin/ratelimits
+```
+
+---
+
 ## Observability & Metrics
 
 Racer integrates with **Micrometer** via `RacerMetrics` (auto-configured when `micrometer-core` is on the classpath). When `RacerMetrics` is absent from the context, a `NoOpRacerMetrics` implementation is used automatically — no null checks required in any component. To provide a custom metrics backend, implement the `RacerMetricsPort` interface and register the bean. The `racer-demo` module includes `spring-boot-starter-actuator` and `micrometer-registry-prometheus`, all served on port **8080**.
@@ -1479,8 +1644,50 @@ management.metrics.tags.application=${spring.application.name}
 | `racer.dlq.reprocessed` | Counter | DLQ messages successfully reprocessed |
 | `racer.dlq.size` | Gauge | Current number of entries in `racer:dlq` |
 | `racer.requestreply.latency` | Timer | Round-trip latency for request-reply operations |
+| `racer.stream.consumer.lag` | Gauge | Pending message count per `(stream, group)` — requires `racer.consumer-lag.enabled=true` |
+| `racer.circuit.breaker.state` | Gauge | Circuit breaker state per listener: `0` = CLOSED, `1` = OPEN, `2` = HALF_OPEN |
+| `racer.backpressure.active` | Gauge | `1` while back-pressure is in effect, `0` otherwise |
+| `racer.backpressure.events` | Counter | Transitions into/out of the back-pressure throttle state |
+| `racer.dedup.duplicates` | Counter | Duplicate messages suppressed per listener |
 
 All metrics include a `transport` tag (`pubsub` or `stream`) and an `application` tag set by `management.metrics.tags.application`.
+
+### Health indicator — consumer lag
+
+When `racer.consumer-lag.enabled=true`, the `/actuator/health` response includes a `consumer-lag` detail map showing the pending message count for every tracked `(streamKey|group)` pair:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "racer": {
+      "status": "UP",
+      "details": {
+        "redis.ping": "PONG",
+        "dlq.depth": 0,
+        "consumer-lag": {
+          "racer:orders-stream|order-processors": 12,
+          "racer:audit-stream|audit-consumers": 0
+        }
+      }
+    }
+  }
+}
+```
+
+When any lag value exceeds `racer.consumer-lag.lag-down-threshold` (default `10000`) the status flips to `OUT_OF_SERVICE`:
+
+```json
+{
+  "status": "OUT_OF_SERVICE",
+  "details": {
+    "consumer-lag": { "racer:orders-stream|order-processors": 15000 },
+    "consumer-lag.threshold-breached": true
+  }
+}
+```
+
+Set `racer.consumer-lag.lag-down-threshold=0` to disable the health-status flip while still keeping the detail map visible.
 
 ### Checking metrics with curl
 
@@ -1740,6 +1947,143 @@ public RacerMessage submitOrder(OrderRequest req) {
 If the returned `RacerMessage.priority` is blank/null, `defaultLevel` from `@RacerPriority` is used as the fallback.
 
 > See [Tutorial 18](TUTORIALS.md#tutorial-18--message-priority-channels) for a full walkthrough.
+
+---
+
+## Cluster-Aware Publishing
+
+> **v1.3 — opt-in:** `racer.sharding.consistent-hash-enabled=true`
+
+`RacerConsistentHashRing` implements a virtual-node consistent hash ring over the configured shard list (`racer.sharding.shards`). When enabled, `RacerShardedStreamPublisher` maps each message to a deterministic shard by hashing the message ID — spreading load evenly and keeping the same key on the same shard across topology changes.
+
+**How it works:**
+
+1. At startup the ring is built from `racer.sharding.shards` × `racer.sharding.virtual-nodes-per-shard` virtual nodes.
+2. `publish(alias, payload)` hashes `message.getId()` to select the target shard.
+3. If the selected shard is unavailable and `racer.sharding.failover-enabled=true`, the ring automatically routes to the next live shard.
+
+**Key properties:**
+
+| Property | Default | Description |
+|---|---|---|
+| `racer.sharding.consistent-hash-enabled` | `false` | Replace round-robin sharding with consistent hash ring |
+| `racer.sharding.virtual-nodes-per-shard` | `150` | Virtual node count (higher = more even distribution) |
+| `racer.sharding.failover-enabled` | `true` | Route to next shard when preferred shard is unavailable |
+
+**Configuration example:**
+
+```properties
+racer.sharding.enabled=true
+racer.sharding.shards=redis-shard-1:6379,redis-shard-2:6379,redis-shard-3:6379
+racer.sharding.consistent-hash-enabled=true
+racer.sharding.virtual-nodes-per-shard=150
+racer.sharding.failover-enabled=true
+```
+
+> See [Tutorial 28](TUTORIALS.md#tutorial-28--cluster-aware-publishing-with-consistent-hashing) for a full walkthrough.
+
+---
+
+## Distributed Tracing
+
+> **v1.3 — opt-in:** `racer.tracing.enabled=true`
+
+`RacerTracingInterceptor` (`@Order(1)`) intercepts every outbound `RacerMessage` and stamps a W3C `traceparent` header generated by `RacerTraceContext`. Inbound listeners extract the traceparent and (optionally) propagate it to the SLF4J MDC so all log lines within a message handler are correlated to the originating trace.
+
+**How it works:**
+
+1. On publish — `RacerTracingInterceptor` calls `RacerTraceContext.generate()` → sets `message.traceparent`.
+2. On consume — `traceparent` is read from the incoming `RacerMessage` envelope.
+3. If `racer.tracing.propagate-to-mdc=true` — sets `MDC.put("traceparent", ...)` for the duration of the listener call.
+
+**`RacerTraceContext` API:**
+
+```java
+// Generate a new W3C traceparent
+String tp = RacerTraceContext.generate();
+// "00-<16-byte trace-id>-<8-byte span-id>-01"
+
+// Extract from a received message
+String tp = RacerTraceContext.extract(message);
+
+// Propagate to MDC
+RacerTraceContext.propagateToMdc(tp);   // sets MDC key "traceparent"
+RacerTraceContext.clearMdc();            // clears after handler returns
+```
+
+**Key properties:**
+
+| Property | Default | Description |
+|---|---|---|
+| `racer.tracing.enabled` | `false` | Enable W3C `traceparent` propagation |
+| `racer.tracing.propagate-to-mdc` | `true` | Copy `traceparent` to SLF4J MDC |
+| `racer.tracing.inject-into-envelope` | `true` | Stamp `traceparent` on outbound envelopes |
+
+**Configuration example:**
+
+```properties
+racer.tracing.enabled=true
+racer.tracing.propagate-to-mdc=true
+racer.tracing.inject-into-envelope=true
+```
+
+```yaml
+logging.pattern.console: "%d{HH:mm:ss} [%X{traceparent}] %-5level %logger{36} - %msg%n"
+```
+
+> See [Tutorial 26](TUTORIALS.md#tutorial-26--distributed-tracing) for a full walkthrough.
+
+---
+
+## Per-Channel Rate Limiting
+
+> **v1.3 — opt-in:** `racer.rate-limit.enabled=true`
+
+`RacerRateLimiter` wraps a Redis-backed token-bucket algorithm. Each channel gets its own bucket (sized by `burstSize`) that refills at `permitsPerSecond`. When a channel's bucket is exhausted, `RacerRateLimiter.tryAcquire()` returns `false`, a `RacerRateLimitException` is thrown, and the publish call fails open (the caller is responsible for back-off or fallback without crashing the instance).
+
+**How it works:**
+
+1. `RacerRateLimiter.tryAcquire(channel)` atomically decrements the token bucket in Redis.
+2. On `false` → `RacerRateLimiter` throws `RacerRateLimitException`.
+3. Catch `RacerRateLimitException` to log, drop, or queue the rejected message.
+
+**Fail-open semantics:** if Redis is unavailable the rate limiter defaults to **allow** so a Redis outage does not halt publishing entirely.
+
+**`RacerRateLimitException` usage:**
+
+```java
+@Autowired RacerRateLimiter rateLimiter;
+
+try {
+    rateLimiter.acquire("orders");   // throws if exhausted
+    publisher.publish("orders", payload);
+} catch (RacerRateLimitException ex) {
+    log.warn("Rate limit exceeded for channel 'orders': {}", ex.getMessage());
+    // optionally queue for retry
+}
+```
+
+**Key properties:**
+
+| Property | Default | Description |
+|---|---|---|
+| `racer.rate-limit.enabled` | `false` | Enable Redis token-bucket rate limiting |
+| `racer.rate-limit.default-permits-per-second` | `100` | Default refill rate if no channel override |
+| `racer.rate-limit.default-burst-size` | `200` | Default burst bucket capacity |
+| `racer.rate-limit.channels.<alias>.permits-per-second` | — | Per-channel refill rate override |
+| `racer.rate-limit.channels.<alias>.burst-size` | — | Per-channel burst capacity override |
+
+**Configuration example:**
+
+```properties
+racer.rate-limit.enabled=true
+racer.rate-limit.default-permits-per-second=100
+racer.rate-limit.default-burst-size=200
+racer.rate-limit.channels.orders.permits-per-second=500
+racer.rate-limit.channels.orders.burst-size=1000
+```
+
+> See [Tutorial 27](TUTORIALS.md#tutorial-27--per-channel-rate-limiting) for a full walkthrough.
 
 ---
 
@@ -2053,16 +2397,16 @@ This section explains how it compares architecturally to dedicated message broke
 
 ## Roadmap & Implementation Status
 
-All roadmap items through Phase 3 have been **fully implemented**. See [CHANGELOG.md](CHANGELOG.md) for the full release notes.
+All roadmap items through Phase 4 have been **fully implemented**. See [CHANGELOG.md](CHANGELOG.md) for the full release notes.
 
-### Phase 4 — Planned
+### ✅ Phase 4 — Done (v1.3.0)
 
-| # | Feature | Description |
-|---|---------|-------------|
-| 4.1 | **Cluster-Aware Publishing** | Consistent-hash routing across shards; automatic failover |
-| 4.2 | **Distributed Tracing** | OpenTelemetry W3C `traceparent` propagation through `RacerMessage` hops |
-| 4.3 | **Rate Limiting** | Per-channel Redis token-bucket via `racer.rate-limit.*` |
-| 4.4 | **Admin UI** | Actuator-backed REST endpoints + embedded web console for live stats, DLQ viewer, and circuit breaker state |
+| # | Feature | Description | Key Artifacts |
+|---|---------|-------------|---------------|
+| 4.1 | **Cluster-Aware Publishing** | Consistent-hash routing across shards with automatic failover | `RacerConsistentHashRing`, `racer.sharding.consistent-hash-enabled` |
+| 4.2 | **Distributed Tracing** | W3C `traceparent` propagation through `RacerMessage` hops; MDC integration | `RacerTraceContext`, `RacerTracingInterceptor`, `racer.tracing.enabled` |
+| 4.3 | **Per-Channel Rate Limiting** | Redis token-bucket rate limiter; fail-open on Redis outage | `RacerRateLimiter`, `RacerRateLimitException`, `racer.rate-limit.enabled` |
+| 4.4 | **Admin UI** | Four REST endpoints + Bootstrap 5 live dashboard at `/racer-admin/` | `RacerAdminController`, `racer.web.admin-enabled` |
 
 ---
 

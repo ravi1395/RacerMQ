@@ -28,7 +28,7 @@ public class DeadLetterMessage implements Serializable {
         return DeadLetterMessage.builder()
                 .id(message.getId())
                 .originalMessage(message)
-                .errorMessage(error.getMessage())
+                .errorMessage(error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName())
                 .exceptionClass(error.getClass().getName())
                 .failedAt(Instant.now())
                 .attemptCount(message.getRetryCount() + 1)

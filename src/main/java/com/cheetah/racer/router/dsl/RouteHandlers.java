@@ -151,9 +151,13 @@ public final class RouteHandlers {
         return (msg, ctx) -> {
             if (log.isDebugEnabled()) {
                 String payload = msg.getPayload();
+                // Truncate and strip control characters (CR/LF) to prevent log injection
                 String summary = payload != null && payload.length() > 120
                         ? payload.substring(0, 120) + "…"
                         : payload;
+                if (summary != null) {
+                    summary = summary.replace('\r', ' ').replace('\n', ' ');
+                }
                 log.debug("[racer-router] DROP id={} channel={} payload={}",
                         msg.getId(), msg.getChannel(), summary);
             }

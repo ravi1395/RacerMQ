@@ -50,26 +50,24 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
     @Override
     public Mono<Long> enqueue(RacerMessage message, Throwable error) {
         DeadLetterMessage dlm = DeadLetterMessage.from(message, error);
-        try {
-            String json = objectMapper.writeValueAsString(dlm);
-            log.warn("[DLQ] Enqueuing failed message id={} error='{}'", message.getId(), error.getMessage());
-            return reactiveStringRedisTemplate.opsForList()
-                    .leftPush(RedisChannels.DEAD_LETTER_QUEUE, json)
-                    .flatMap(size -> {
-                        log.debug("[DLQ] Queue size after enqueue: {}", size);
-                        if (size > maxSize) {
-                            // Trim oldest entries beyond the capacity limit
-                            return reactiveStringRedisTemplate.opsForList()
-                                    .trim(RedisChannels.DEAD_LETTER_QUEUE, 0, maxSize - 1)
-                                    .doOnSuccess(v -> log.warn("[DLQ] Trimmed queue to {} entries (was {})", maxSize, size))
-                                    .thenReturn(size);
-                        }
-                        return Mono.just(size);
-                    });
-        } catch (JsonProcessingException e) {
-            log.error("[DLQ] Failed to serialize dead letter message", e);
-            return Mono.error(e);
-        }
+        return Mono.fromCallable(() -> objectMapper.writeValueAsString(dlm))
+                .doOnNext(json -> log.warn("[DLQ] Enqueuing failed message id={} error='{}'", message.getId(), error.getMessage()))
+                .flatMap(json -> reactiveStringRedisTemplate.opsForList()
+                        .leftPush(RedisChannels.DEAD_LETTER_QUEUE, json)
+                        .flatMap(size -> {
+                            log.debug("[DLQ] Queue size after enqueue: {}", size);
+                            if (size > maxSize) {
+                                return reactiveStringRedisTemplate.opsForList()
+                                        .trim(RedisChannels.DEAD_LETTER_QUEUE, 0, maxSize - 1)
+                                        .doOnSuccess(v -> log.warn("[DLQ] Trimmed queue to {} entries (was {})", maxSize, size))
+                                        .thenReturn(size);
+                            }
+                            return Mono.just(size);
+                        }))
+                .onErrorResume(JsonProcessingException.class, e -> {
+                    log.error("[DLQ] Failed to serialize dead letter message", e);
+                    return Mono.error(e);
+                });
     }
 
     /**
@@ -91,12 +89,11 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
     }
 
     private Mono<DeadLetterMessage> deserializeDlm(String json) {
-        try {
-            return Mono.just(objectMapper.readValue(json, DeadLetterMessage.class));
-        } catch (JsonProcessingException e) {
-            log.error("[DLQ] Failed to deserialize dead letter message", e);
-            return Mono.error(e);
-        }
+        return Mono.fromCallable(() -> objectMapper.readValue(json, DeadLetterMessage.class))
+                .onErrorResume(JsonProcessingException.class, e -> {
+                    log.error("[DLQ] Failed to deserialize dead letter message", e);
+                    return Mono.error(e);
+                });
     }
 
     /**
