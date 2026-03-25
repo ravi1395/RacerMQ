@@ -26,7 +26,7 @@ import org.springframework.security.web.server.SecurityWebFilterChain;
  * </ol>
  *
  * <p>When active, it registers a {@link SecurityWebFilterChain} at {@link Order} {@code 99}
- * that applies role-based access control to all {@code /api/**} paths:
+ * that applies role-based access control to all {@code /api/**} and {@code /racer-admin/**} paths:
  * <ul>
  *   <li><strong>Write role</strong> ({@code racer.web.security.write-role}, default {@code ADMIN}):
  *       required for all mutating operations —
@@ -34,7 +34,7 @@ import org.springframework.security.web.server.SecurityWebFilterChain;
  *       {@code POST /api/retention/trim}.</li>
  *   <li><strong>Read role</strong> ({@code racer.web.security.read-role}, default {@code OPS}):
  *       required for all remaining read-only {@code GET} and {@code POST} calls
- *       under {@code /api/**}.</li>
+ *       under {@code /api/**}, and the Admin UI dashboard at {@code /racer-admin/**}.</li>
  * </ul>
  *
  * <p>Example {@code application.yml}:
@@ -85,12 +85,12 @@ public class RacerSecurityAutoConfiguration {
         String writeRole = sec.getWriteRole();
         String readRole  = sec.getReadRole();
 
-        log.info("[racer-security] Protecting /api/** — write role: '{}', read role: '{}'",
+        log.info("[racer-security] Protecting /api/** and /racer-admin/** — write role: '{}', read role: '{}'",
                 writeRole, readRole);
 
         return http
                 .securityMatcher(org.springframework.security.web.server.util.matcher
-                        .ServerWebExchangeMatchers.pathMatchers("/api/**"))
+                        .ServerWebExchangeMatchers.pathMatchers("/api/**", "/racer-admin/**"))
                 .authorizeExchange(exchanges -> exchanges
                         // Mutating DLQ operations
                         .pathMatchers(HttpMethod.POST, "/api/dlq/republish/**").hasRole(writeRole)
