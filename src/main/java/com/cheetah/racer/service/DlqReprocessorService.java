@@ -13,6 +13,7 @@ import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.lang.Nullable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -113,6 +114,7 @@ public class DlqReprocessorService {
                 message.getRetryCount(), RedisChannels.MAX_RETRY_ATTEMPTS);
 
         return Mono.fromCallable(() -> objectMapper.writeValueAsString(message))
+                .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(json -> redisTemplate.convertAndSend(message.getChannel(), json)
                         .doOnSuccess(count -> {
                             republishedCount.incrementAndGet();

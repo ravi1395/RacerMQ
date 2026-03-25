@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * Manages the Dead Letter Queue (DLQ) in Redis.
@@ -51,6 +52,7 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
     public Mono<Long> enqueue(RacerMessage message, Throwable error) {
         DeadLetterMessage dlm = DeadLetterMessage.from(message, error);
         return Mono.fromCallable(() -> objectMapper.writeValueAsString(dlm))
+                .subscribeOn(Schedulers.boundedElastic())
                 .doOnNext(json -> log.warn("[DLQ] Enqueuing failed message id={} error='{}'", message.getId(), error.getMessage()))
                 .flatMap(json -> reactiveStringRedisTemplate.opsForList()
                         .leftPush(RedisChannels.DEAD_LETTER_QUEUE, json)
@@ -90,6 +92,7 @@ public class DeadLetterQueueService implements RacerDeadLetterHandler {
 
     private Mono<DeadLetterMessage> deserializeDlm(String json) {
         return Mono.fromCallable(() -> objectMapper.readValue(json, DeadLetterMessage.class))
+                .subscribeOn(Schedulers.boundedElastic())
                 .onErrorResume(JsonProcessingException.class, e -> {
                     log.error("[DLQ] Failed to deserialize dead letter message", e);
                     return Mono.error(e);

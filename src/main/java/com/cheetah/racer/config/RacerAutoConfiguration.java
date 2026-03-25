@@ -190,9 +190,10 @@ public class RacerAutoConfiguration {
             ApplicationContext applicationContext,
             RacerPublisherRegistry racerPublisherRegistry,
             ObjectMapper objectMapper,
-            Optional<RacerPriorityPublisher> racerPriorityPublisher) {
+            Optional<RacerPriorityPublisher> racerPriorityPublisher,
+            Optional<RacerMetrics> racerMetrics) {
         return new RacerRouterService(applicationContext, racerPublisherRegistry, objectMapper,
-                racerPriorityPublisher.orElse(null));
+                racerPriorityPublisher.orElse(null), racerMetrics.orElse(null));
     }
 
     // ── Transaction support ──────────────────────────────────────────────────

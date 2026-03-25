@@ -4,6 +4,8 @@ import com.cheetah.racer.annotation.RacerRoute;
 import com.cheetah.racer.annotation.RacerRouteRule;
 import com.cheetah.racer.annotation.RouteAction;
 import com.cheetah.racer.annotation.RouteMatchSource;
+import com.cheetah.racer.metrics.NoOpRacerMetrics;
+import com.cheetah.racer.metrics.RacerMetricsPort;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
 import com.cheetah.racer.publisher.RacerPriorityPublisher;
@@ -53,6 +55,7 @@ public class RacerRouterService {
     private final ObjectMapper objectMapper;
     @Nullable
     private final RacerPriorityPublisher priorityPublisher;
+    private final RacerMetricsPort racerMetrics;
 
     private final List<CompiledRouteRule> globalRules = new ArrayList<>();
     private final List<RacerFunctionalRouter> functionalRouters = new ArrayList<>();
@@ -60,17 +63,26 @@ public class RacerRouterService {
     public RacerRouterService(ApplicationContext applicationContext,
                               RacerPublisherRegistry registry,
                               ObjectMapper objectMapper) {
-        this(applicationContext, registry, objectMapper, null);
+        this(applicationContext, registry, objectMapper, null, null);
     }
 
     public RacerRouterService(ApplicationContext applicationContext,
                               RacerPublisherRegistry registry,
                               ObjectMapper objectMapper,
                               @Nullable RacerPriorityPublisher priorityPublisher) {
+        this(applicationContext, registry, objectMapper, priorityPublisher, null);
+    }
+
+    public RacerRouterService(ApplicationContext applicationContext,
+                              RacerPublisherRegistry registry,
+                              ObjectMapper objectMapper,
+                              @Nullable RacerPriorityPublisher priorityPublisher,
+                              @Nullable RacerMetricsPort racerMetrics) {
         this.applicationContext = applicationContext;
         this.registry           = registry;
         this.objectMapper       = objectMapper;
         this.priorityPublisher  = priorityPublisher;
+        this.racerMetrics       = racerMetrics != null ? racerMetrics : new NoOpRacerMetrics();
     }
 
     // -----------------------------------------------------------------------
@@ -244,8 +256,11 @@ public class RacerRouterService {
                 .subscribe(
                         count -> log.debug("[racer-router] message id={} → '{}' ({} subscriber(s))",
                                 message.getId(), rule.alias(), count),
-                        ex -> log.error("[racer-router] Routing failed for message id={}: {}",
-                                message.getId(), ex.getMessage())
+                        ex -> {
+                            racerMetrics.recordFailed(rule.alias(), ex.getClass().getSimpleName());
+                            log.error("[racer-router] Routing failed for message id={}: {}",
+                                    message.getId(), ex.getMessage());
+                        }
                 );
 
         log.info("[racer-router] Forwarded message id={} → alias='{}' action={}",
@@ -342,8 +357,11 @@ public class RacerRouterService {
                     .subscribe(
                             count -> log.debug("[racer-router] DSL forwarded id={} → '{}' ({} subscriber(s))",
                                     message.getId(), alias, count),
-                            ex -> log.error("[racer-router] DSL routing failed for id={} → '{}': {}",
-                                    message.getId(), alias, ex.getMessage())
+                            ex -> {
+                                racerMetrics.recordFailed(alias, ex.getClass().getSimpleName());
+                                log.error("[racer-router] DSL routing failed for id={} → '{}': {}",
+                                        message.getId(), alias, ex.getMessage());
+                            }
                     );
         }
 
@@ -356,8 +374,11 @@ public class RacerRouterService {
                         .subscribe(
                                 count -> log.debug("[racer-router] DSL priority-forwarded id={} → '{}:priority:{}' ({} subscriber(s))",
                                         message.getId(), alias, level, count),
-                                ex -> log.error("[racer-router] DSL priority routing failed for id={} → '{}:priority:{}': {}",
-                                        message.getId(), alias, level, ex.getMessage())
+                                ex -> {
+                                    racerMetrics.recordFailed(alias, ex.getClass().getSimpleName());
+                                    log.error("[racer-router] DSL priority routing failed for id={} → '{}:priority:{}': {}",
+                                            message.getId(), alias, level, ex.getMessage());
+                                }
                         );
             } else {
                 log.warn("[racer-router] publishToWithPriority called but no RacerPriorityPublisher configured — falling back to standard publish for id={}", message.getId());
