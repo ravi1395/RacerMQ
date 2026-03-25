@@ -605,39 +605,45 @@ public class RacerListenerRegistrar extends AbstractRacerRegistrar {
                                        RacerMessage message,
                                        String listenerId, String channel,
                                        @Nullable RacerCircuitBreaker cb) {
-        // 2. Routing — per-listener rules first, then global
-        RouteDecision routeDecision = RouteDecision.PASS;
+        // 2. Routing — per-listener rules first, then global (fully reactive: errors → DLQ)
+        Mono<RouteDecision> routeStep;
         List<CompiledRouteRule> listenerRules = perListenerRules.get(listenerId);
-        if (listenerRules != null && racerRouterService != null) {
-            routeDecision = racerRouterService.evaluate(message, listenerRules);
-        }
-        if (routeDecision == RouteDecision.PASS && racerRouterService != null) {
-            routeDecision = racerRouterService.route(message);
-        }
-
-        if (routeDecision == RouteDecision.DROPPED) {
-            log.debug("[RACER-LISTENER] '{}' message id={} dropped by routing rule",
-                    listenerId, message.getId());
-            return Mono.empty();
-        }
-        if (routeDecision == RouteDecision.DROPPED_TO_DLQ) {
-            log.debug("[RACER-LISTENER] '{}' message id={} dropped to DLQ by routing rule",
-                    listenerId, message.getId());
-            if (cb != null) cb.onFailure();
-            return enqueueDeadLetter(message, new IllegalStateException("Dropped to DLQ by routing rule"))
-                    .doOnTerminate(() -> incrementFailed(listenerId)).then();
-        }
-        if (routeDecision == RouteDecision.FORWARDED) {
-            log.debug("[RACER-LISTENER] '{}' message id={} forwarded — skipping local dispatch",
-                    listenerId, message.getId());
-            return Mono.empty();
+        if (racerRouterService == null) {
+            routeStep = Mono.just(RouteDecision.PASS);
+        } else if (listenerRules != null) {
+            routeStep = racerRouterService.evaluateReactive(message, listenerRules)
+                    .flatMap(d -> d == RouteDecision.PASS
+                            ? racerRouterService.routeReactive(message)
+                            : Mono.just(d));
+        } else {
+            routeStep = racerRouterService.routeReactive(message);
         }
 
-        final boolean wasForwarded = routeDecision == RouteDecision.FORWARDED_AND_PROCESS;
+        return routeStep.flatMap(routeDecision -> {
+            if (routeDecision == RouteDecision.DROPPED) {
+                log.debug("[RACER-LISTENER] '{}' message id={} dropped by routing rule",
+                        listenerId, message.getId());
+                return Mono.empty();
+            }
+            if (routeDecision == RouteDecision.DROPPED_TO_DLQ) {
+                log.debug("[RACER-LISTENER] '{}' message id={} dropped to DLQ by routing rule",
+                        listenerId, message.getId());
+                if (cb != null) cb.onFailure();
+                return enqueueDeadLetter(message, new IllegalStateException("Dropped to DLQ by routing rule"))
+                        .doOnTerminate(() -> incrementFailed(listenerId)).then();
+            }
+            if (routeDecision == RouteDecision.FORWARDED) {
+                log.debug("[RACER-LISTENER] '{}' message id={} forwarded — skipping local dispatch",
+                        listenerId, message.getId());
+                return Mono.empty();
+            }
 
-        // 3. Interceptor chain → invoke local handler
-        return buildInterceptorChain(message, listenerId, channel, method)
-                .flatMap(intercepted -> invokeLocal(bean, method, intercepted, listenerId, channel, cb, wasForwarded));
+            final boolean wasForwarded = routeDecision == RouteDecision.FORWARDED_AND_PROCESS;
+
+            // 3. Interceptor chain → invoke local handler
+            return buildInterceptorChain(message, listenerId, channel, method)
+                    .flatMap(intercepted -> invokeLocal(bean, method, intercepted, listenerId, channel, cb, wasForwarded));
+        });
     }
 
     /** Builds the ordered interceptor chain around a single message. */

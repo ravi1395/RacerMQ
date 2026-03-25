@@ -19,6 +19,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationContext;
 import org.springframework.lang.Nullable;
 
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -244,6 +247,132 @@ public class RacerRouterService {
         return RouteDecision.PASS;
     }
 
+    // -----------------------------------------------------------------------
+    // Reactive routing — preferred path from RacerListenerRegistrar
+    // -----------------------------------------------------------------------
+
+    /**
+     * Reactive variant of {@link #route(RacerMessage)}.
+     *
+     * <p>Unlike the synchronous version, publishing is fully chained into the reactive
+     * pipeline: the returned {@code Mono} only completes after the message has been
+     * handed off to Redis.  Any Redis failure propagates as an error so the caller's
+     * DLQ handling can capture it, rather than silently swallowing the loss.
+     *
+     * @param message the inbound message
+     * @return a {@code Mono} that emits the routing decision when all publish I/O completes
+     */
+    public Mono<RouteDecision> routeReactive(RacerMessage message) {
+        if (message.isRouted()) {
+            log.debug("[racer-router] Skipping already-routed message id={}", message.getId());
+            return Mono.just(RouteDecision.PASS);
+        }
+
+        Mono<RouteDecision> annotationStep = globalRules.isEmpty()
+                ? Mono.just(RouteDecision.PASS)
+                : evaluateReactive(message, globalRules);
+
+        return annotationStep.flatMap(decision -> {
+            if (decision != RouteDecision.PASS) return Mono.just(decision);
+            if (functionalRouters.isEmpty())    return Mono.just(RouteDecision.PASS);
+            return evaluateFunctionalReactive(message);
+        });
+    }
+
+    /**
+     * Reactive variant of {@link #evaluate(RacerMessage, List)}.
+     *
+     * <p>Rule matching is synchronous (CPU-bound); only the publish I/O step is async.
+     *
+     * @param message the inbound message
+     * @param rules   ordered list of compiled rules to evaluate
+     * @return a {@code Mono} that emits the first matching rule's decision, or
+     *         {@link RouteDecision#PASS} if no rule matched
+     */
+    public Mono<RouteDecision> evaluateReactive(RacerMessage message, List<CompiledRouteRule> rules) {
+        if (rules.isEmpty()) return Mono.just(RouteDecision.PASS);
+        if (message.isRouted()) {
+            log.debug("[racer-router] Skipping already-routed message id={} in evaluateReactive()", message.getId());
+            return Mono.just(RouteDecision.PASS);
+        }
+
+        // Rule matching is CPU-bound — done synchronously inside Mono.defer
+        return Mono.defer(() -> {
+            JsonNode[] payloadNode = {null}; // parsed lazily
+
+            for (CompiledRouteRule rule : rules) {
+                String candidate;
+                try {
+                    if (rule.source() == RouteMatchSource.SENDER) {
+                        candidate = message.getSender();
+                    } else if (rule.source() == RouteMatchSource.ID) {
+                        candidate = message.getId();
+                    } else {
+                        if (payloadNode[0] == null) {
+                            payloadNode[0] = objectMapper.readTree(toJsonString(message.getPayload()));
+                        }
+                        JsonNode fieldNode = payloadNode[0].get(rule.field());
+                        if (fieldNode == null) continue;
+                        candidate = fieldNode.asText();
+                    }
+                } catch (Exception ex) {
+                    log.debug("[racer-router] Cannot evaluate rule for message id={}: {}",
+                            message.getId(), ex.getMessage());
+                    continue;
+                }
+
+                if (candidate != null && rule.pattern().matcher(candidate).matches()) {
+                    return applyActionReactive(message, rule);
+                }
+            }
+            return Mono.just(RouteDecision.PASS);
+        });
+    }
+
+    /** Evaluates functional routers reactively, executing deferred publishes after the handler. */
+    private Mono<RouteDecision> evaluateFunctionalReactive(RacerMessage message) {
+        return Mono.defer(() -> {
+            for (RacerFunctionalRouter router : functionalRouters) {
+                DefaultRouteContext ctx = new DefaultRouteContext(message);
+                RouteDecision decision = router.evaluate(message, ctx);
+                if (decision != RouteDecision.PASS) {
+                    // Execute all deferred publishes collected by publishTo/publishToWithPriority
+                    return ctx.executePendingPublishes().thenReturn(decision);
+                }
+            }
+            return Mono.just(RouteDecision.PASS);
+        });
+    }
+
+    /**
+     * Reactive version of {@link #applyAction}: returns a {@code Mono} that completes
+     * once the publish has been handed off to Redis, propagating any Redis error to the
+     * caller instead of silently swallowing it.
+     */
+    private Mono<RouteDecision> applyActionReactive(RacerMessage message, CompiledRouteRule rule) {
+        if (rule.action() == RouteAction.DROP)         return Mono.just(RouteDecision.DROPPED);
+        if (rule.action() == RouteAction.DROP_TO_DLQ) return Mono.just(RouteDecision.DROPPED_TO_DLQ);
+
+        RacerChannelPublisher publisher = registry.getPublisher(rule.alias());
+        String sender = rule.sender().isBlank() ? message.getSender() : rule.sender();
+        RouteDecision decision = rule.action() == RouteAction.FORWARD_AND_PROCESS
+                ? RouteDecision.FORWARDED_AND_PROCESS
+                : RouteDecision.FORWARDED;
+
+        return publisher.publishRoutedAsync(message.getPayload(), sender)
+                .doOnNext(count -> log.debug("[racer-router] message id={} → '{}' ({} subscriber(s))",
+                        message.getId(), rule.alias(), count))
+                .doOnSuccess(count -> log.info("[racer-router] Forwarded message id={} → alias='{}' action={}",
+                        message.getId(), rule.alias(), rule.action()))
+                .doOnError(ex -> {
+                    racerMetrics.recordFailed(rule.alias(), ex.getClass().getSimpleName());
+                    log.error("[racer-router] Routing failed for message id={} → '{}': {}",
+                            message.getId(), rule.alias(), ex.getMessage());
+                })
+                .thenReturn(decision);
+        // Errors propagate to the caller — RacerListenerRegistrar will send to DLQ
+    }
+
     private RouteDecision applyAction(RacerMessage message, CompiledRouteRule rule) {
         if (rule.action() == RouteAction.DROP)         return RouteDecision.DROPPED;
         if (rule.action() == RouteAction.DROP_TO_DLQ) return RouteDecision.DROPPED_TO_DLQ;
@@ -338,10 +467,17 @@ public class RacerRouterService {
      * {@link RouteContext} implementation that delegates publish operations to
      * {@link RacerPublisherRegistry}, mirroring what {@link #applyAction} does for
      * annotation-based rules.
+     *
+     * <p>Publish operations are <em>deferred</em>: calling {@code publishTo()} enqueues
+     * a {@code Mono<Void>} rather than subscribing immediately.  The deferred operations
+     * are executed as a reactive chain when {@link #executePendingPublishes()} is called
+     * from {@link #evaluateFunctionalReactive}, ensuring errors surface instead of being
+     * silently swallowed.
      */
     private final class DefaultRouteContext implements RouteContext {
 
         private final RacerMessage message;
+        private final List<Mono<Void>> pendingPublishes = new ArrayList<>();
 
         DefaultRouteContext(RacerMessage message) { this.message = message; }
 
@@ -353,16 +489,17 @@ public class RacerRouterService {
         @Override
         public void publishTo(String alias, RacerMessage msg, String sender) {
             RacerChannelPublisher publisher = registry.getPublisher(alias);
-            publisher.publishRoutedAsync(msg.getPayload(), sender)
-                    .subscribe(
-                            count -> log.debug("[racer-router] DSL forwarded id={} → '{}' ({} subscriber(s))",
-                                    message.getId(), alias, count),
-                            ex -> {
+            pendingPublishes.add(
+                    publisher.publishRoutedAsync(msg.getPayload(), sender)
+                            .doOnNext(count -> log.debug("[racer-router] DSL forwarded id={} → '{}' ({} subscriber(s))",
+                                    message.getId(), alias, count))
+                            .doOnError(ex -> {
                                 racerMetrics.recordFailed(alias, ex.getClass().getSimpleName());
                                 log.error("[racer-router] DSL routing failed for id={} → '{}': {}",
                                         message.getId(), alias, ex.getMessage());
-                            }
-                    );
+                            })
+                            .then()
+            );
         }
 
         @Override
@@ -370,20 +507,30 @@ public class RacerRouterService {
             if (priorityPublisher != null) {
                 String channelName = registry.getPublisher(alias).getChannelName();
                 String sender = msg.getSender();
-                priorityPublisher.publish(channelName, msg.getPayload(), sender, level.toUpperCase())
-                        .subscribe(
-                                count -> log.debug("[racer-router] DSL priority-forwarded id={} → '{}:priority:{}' ({} subscriber(s))",
-                                        message.getId(), alias, level, count),
-                                ex -> {
+                pendingPublishes.add(
+                        priorityPublisher.publish(channelName, msg.getPayload(), sender, level.toUpperCase())
+                                .doOnNext(count -> log.debug("[racer-router] DSL priority-forwarded id={} → '{}:priority:{}' ({} subscriber(s))",
+                                        message.getId(), alias, level, count))
+                                .doOnError(ex -> {
                                     racerMetrics.recordFailed(alias, ex.getClass().getSimpleName());
                                     log.error("[racer-router] DSL priority routing failed for id={} → '{}:priority:{}': {}",
                                             message.getId(), alias, level, ex.getMessage());
-                                }
-                        );
+                                })
+                                .then()
+                );
             } else {
                 log.warn("[racer-router] publishToWithPriority called but no RacerPriorityPublisher configured — falling back to standard publish for id={}", message.getId());
                 publishTo(alias, msg);
             }
+        }
+
+        /**
+         * Executes all deferred publish operations sequentially.
+         * The first error propagates to the caller (no silent swallowing).
+         */
+        Mono<Void> executePendingPublishes() {
+            if (pendingPublishes.isEmpty()) return Mono.empty();
+            return Flux.concat(pendingPublishes).then();
         }
     }
 

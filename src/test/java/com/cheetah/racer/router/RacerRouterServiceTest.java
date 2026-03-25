@@ -186,4 +186,50 @@ class RacerRouterServiceTest {
         assertThat(emptyRouter.route(
                 RacerMessage.create("ch", "{\"type\":\"ORDER\"}", "s"))).isEqualTo(PASS);
     }
+
+    // ------------------------------------------------------------------
+    // routeReactive() — fully reactive path (M-4 fix)
+    // ------------------------------------------------------------------
+
+    @Test
+    void routeReactive_matchingMessage_emitsForwarded() {
+        RacerMessage msg = RacerMessage.create("racer:messages", "{\"type\":\"ORDER\"}", "svc");
+
+        RouteDecision decision = routerService.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(FORWARDED);
+    }
+
+    @Test
+    void routeReactive_noMatchingRule_emitsPass() {
+        RacerMessage msg = RacerMessage.create("racer:messages", "{\"type\":\"AUDIT\"}", "svc");
+
+        RouteDecision decision = routerService.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(PASS);
+    }
+
+    @Test
+    void routeReactive_redisFailure_propagatesError() {
+        // Simulate Redis being unreachable — publish call fails
+        when(ordersPublisher.publishRoutedAsync(anyString(), anyString()))
+                .thenReturn(Mono.error(new RuntimeException("Redis connection refused")));
+
+        RacerMessage msg = RacerMessage.create("racer:messages", "{\"type\":\"ORDER\"}", "svc");
+
+        // Error must propagate (not be swallowed), so the caller's DLQ handling kicks in
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> routerService.routeReactive(msg).block())
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Redis connection refused");
+    }
+
+    @Test
+    void routeReactive_alreadyRouted_emitsPass() {
+        RacerMessage msg = RacerMessage.create("racer:messages", "{\"type\":\"ORDER\"}", "svc");
+        msg.setRouted(true); // simulate a message already forwarded once
+
+        RouteDecision decision = routerService.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(PASS);
+    }
 }
