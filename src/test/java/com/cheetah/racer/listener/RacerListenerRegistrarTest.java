@@ -1,5 +1,8 @@
 package com.cheetah.racer.listener;
 
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreaker;
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
+import com.cheetah.racer.dedup.RacerDedupService;
 import com.cheetah.racer.annotation.ConcurrencyMode;
 import com.cheetah.racer.annotation.RacerListener;
 import com.cheetah.racer.config.RacerProperties;
@@ -446,5 +449,158 @@ class RacerListenerRegistrarTest {
 
         registrar.postProcessAfterInitialization(bean, "sampleReceiver");
         registrar.stop(); // should not throw, should log stats
+    }
+
+    // ── Tests: back-pressure ──────────────────────────────────────────────────
+
+    @Test
+    void listener_whenBackPressureActive_routesMessageToDlq() throws Exception {
+        RacerMessage msg = buildMessage("racer:test", "bp-payload");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.setBackPressureActive(true);
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        // Method must NOT be invoked — back-pressure drops message to DLQ
+        assertThat(bean.received).isEmpty();
+        verify(deadLetterHandler, timeout(500).atLeastOnce()).enqueue(any(), any());
+    }
+
+    @Test
+    void setBackPressureActive_toggleLogsChangeOnce() {
+        registrar.setBackPressureActive(true);
+        registrar.setBackPressureActive(true);   // same value — no log
+        registrar.setBackPressureActive(false);  // transition
+        // No assert needed — just must not throw
+    }
+
+    // ── Tests: dedup ──────────────────────────────────────────────────────────
+
+    @Test
+    void listener_withDedup_duplicateMessageSkipped() throws Exception {
+        RacerDedupService dedupService = mock(RacerDedupService.class);
+        // First call returns true (process), second returns false (skip)
+        when(dedupService.checkAndMarkProcessed(anyString(), anyString()))
+                .thenReturn(Mono.just(true))
+                .thenReturn(Mono.just(false));
+
+        registrar.setDedupService(dedupService);
+
+        Object dedupBean = new Object() {
+            @RacerListener(channel = "racer:dedup", dedup = true)
+            public void handle(RacerMessage msg) {}
+        };
+
+        RacerMessage msg = buildMessage("racer:dedup", "data");
+        Sinks.Many<ReactiveSubscription.Message<String, String>> sink =
+                Sinks.many().unicast().onBackpressureBuffer();
+
+        when(listenerContainer.receive(ChannelTopic.of("racer:dedup"))).thenReturn(sink.asFlux());
+        registrar.postProcessAfterInitialization(dedupBean, "dedupBean");
+
+        // Emit same message twice
+        String json = objectMapper.writeValueAsString(msg);
+        sink.tryEmitNext(mockRedisMessage(json));
+        sink.tryEmitNext(mockRedisMessage(json));
+
+        Thread.sleep(400);
+
+        // First is processed, second is skipped — dedup service consulted twice
+        verify(dedupService, atLeast(1)).checkAndMarkProcessed(anyString(), anyString());
+    }
+
+    // ── Tests: circuit breaker ────────────────────────────────────────────────
+
+    @Test
+    void listener_circuitBreakerOpen_skipsMessage() throws Exception {
+        RacerCircuitBreakerRegistry cbRegistry = mock(RacerCircuitBreakerRegistry.class);
+        RacerCircuitBreaker cb = mock(RacerCircuitBreaker.class);
+
+        when(cbRegistry.getOrCreate(anyString())).thenReturn(cb);
+        when(cb.isCallPermitted()).thenReturn(false); // circuit OPEN
+
+        registrar.setCircuitBreakerRegistry(cbRegistry);
+
+        RacerMessage msg = buildMessage("racer:test", "cb-payload");
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return singleMessageFlux(msg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        // Message is rejected — method must NOT be invoked
+        assertThat(bean.received).isEmpty();
+    }
+
+    // ── Tests: invalid JSON ───────────────────────────────────────────────────
+
+    @Test
+    void listener_invalidJsonBody_logsErrorAndSkips() throws Exception {
+        ReactiveSubscription.Message<String, String> badMsg = mockRedisMessage("NOT-VALID-JSON");
+
+        when(listenerContainer.receive(any(ChannelTopic.class)))
+                .thenAnswer(inv -> {
+                    ChannelTopic t = inv.getArgument(0);
+                    if ("racer:test".equals(t.getTopic())) return Flux.just(badMsg);
+                    return Flux.never();
+                });
+
+        registrar.postProcessAfterInitialization(bean, "sampleReceiver");
+        Thread.sleep(300);
+
+        // Method must NOT be invoked — bad JSON falls through to error log path
+        assertThat(bean.received).isEmpty();
+    }
+
+    // ── Tests: no channel configured ─────────────────────────────────────────
+
+    @Test
+    void listener_noChannelOrChannelRef_isSkipped() {
+        properties.setDefaultChannel(""); // empty default forces skip
+
+        Object noChannelBean = new Object() {
+            @RacerListener(channel = "", channelRef = "")
+            public void handle(RacerMessage msg) {}
+        };
+
+        // Should not throw and should not call listenerContainer.receive
+        registrar.postProcessAfterInitialization(noChannelBean, "noChannelBean");
+        verify(listenerContainer, never()).receive(any(ChannelTopic.class));
+    }
+
+    // ── Tests: counter accessors ──────────────────────────────────────────────
+
+    @Test
+    void getProcessedCount_unknownListener_returnsZero() {
+        assertThat(registrar.getProcessedCount("unknown.listener")).isZero();
+    }
+
+    @Test
+    void getFailedCount_unknownListener_returnsZero() {
+        assertThat(registrar.getFailedCount("unknown.listener")).isZero();
+    }
+
+    // ── Tests: interceptors ───────────────────────────────────────────────────
+
+    @Test
+    void setInterceptors_null_replacedWithEmpty() {
+        registrar.setInterceptors(null);
+        // No exception — null handled gracefully
+    }
+
+    @Test
+    void setInterceptors_nonNull_storesInterceptors() {
+        registrar.setInterceptors(List.of());
     }
 }

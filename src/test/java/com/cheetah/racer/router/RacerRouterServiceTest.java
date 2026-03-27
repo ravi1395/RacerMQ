@@ -5,6 +5,9 @@ import com.cheetah.racer.annotation.RacerRouteRule;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
+import com.cheetah.racer.router.dsl.RacerFunctionalRouter;
+import com.cheetah.racer.router.dsl.RouteHandlers;
+import com.cheetah.racer.router.dsl.RoutePredicates;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.BeforeEach;
@@ -22,7 +25,7 @@ import java.util.Map;
 import static com.cheetah.racer.router.RouteDecision.*;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 /**
  * Unit tests for {@link RacerRouterService}.
@@ -56,6 +59,10 @@ class RacerRouterServiceTest {
         // Wire beans with annotation
         when(applicationContext.getBeansWithAnnotation(RacerRoute.class))
                 .thenReturn(Map.of("sampleRouter", new SampleRouter()));
+
+        // No functional routers by default
+        when(applicationContext.getBeansOfType(RacerFunctionalRouter.class))
+                .thenReturn(Map.of());
 
         // Registry stubs
         when(registry.getPublisher("orders")).thenReturn(ordersPublisher);
@@ -176,6 +183,8 @@ class RacerRouterServiceTest {
     void routerWithNoRules_routeReturnsFalse() {
         when(applicationContext.getBeansWithAnnotation(RacerRoute.class))
                 .thenReturn(Map.of());
+        when(applicationContext.getBeansOfType(RacerFunctionalRouter.class))
+                .thenReturn(Map.of());
 
         RacerRouterService emptyRouter =
                 new RacerRouterService(applicationContext, registry, objectMapper);
@@ -230,5 +239,143 @@ class RacerRouterServiceTest {
         RouteDecision decision = routerService.routeReactive(msg).block();
 
         assertThat(decision).isEqualTo(PASS);
+    }
+
+    // ------------------------------------------------------------------
+    // Functional router (DefaultRouteContext) tests
+    // ------------------------------------------------------------------
+
+    private RacerRouterService buildWithFunctionalRouter(RacerFunctionalRouter router) {
+        when(applicationContext.getBeansWithAnnotation(RacerRoute.class)).thenReturn(Map.of());
+        when(applicationContext.getBeansOfType(RacerFunctionalRouter.class))
+                .thenReturn(Map.of("testRouter", router));
+        RacerRouterService svc = new RacerRouterService(applicationContext, registry, objectMapper);
+        svc.init();
+        return svc;
+    }
+
+    @Test
+    void functionalRouter_matchingMessage_forwardsViaPublishTo() {
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("test-router")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forward("orders"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+
+        RacerMessage msg = RacerMessage.create("ch", "{\"type\":\"ORDER\"}", "svc");
+        RouteDecision decision = svc.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(FORWARDED);
+        verify(ordersPublisher, atLeastOnce()).publishRoutedAsync(anyString(), anyString());
+    }
+
+    @Test
+    void functionalRouter_noMatch_returnsPass() {
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("test-router")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forward("orders"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+
+        RacerMessage msg = RacerMessage.create("ch", "{\"type\":\"UNKNOWN\"}", "svc");
+        RouteDecision decision = svc.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(PASS);
+        verify(ordersPublisher, never()).publishRoutedAsync(anyString(), anyString());
+    }
+
+    @Test
+    void functionalRouter_forwardAndProcess_returnsForwardedAndProcess() {
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("fwd-and-process")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forwardAndProcess("orders"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+
+        RacerMessage msg = RacerMessage.create("ch", "{\"type\":\"ORDER\"}", "svc");
+        RouteDecision decision = svc.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(FORWARDED_AND_PROCESS);
+        verify(ordersPublisher, atLeastOnce()).publishRoutedAsync(anyString(), anyString());
+    }
+
+    @Test
+    void functionalRouter_multicast_publishesToMultipleAliases() {
+        when(registry.getPublisher("notifications")).thenReturn(notificationsPublisher);
+
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("multicast-router")
+                .route(RoutePredicates.fieldEquals("type", "BROADCAST"),
+                        RouteHandlers.multicast("orders", "notifications"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+
+        RacerMessage msg = RacerMessage.create("ch", "{\"type\":\"BROADCAST\"}", "svc");
+        RouteDecision decision = svc.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(FORWARDED);
+        verify(ordersPublisher, atLeastOnce()).publishRoutedAsync(anyString(), anyString());
+        verify(notificationsPublisher, atLeastOnce()).publishRoutedAsync(anyString(), anyString());
+    }
+
+    @Test
+    void functionalRouter_defaultRoute_catchesUnmatched() {
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("default-router")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forward("orders"))
+                .defaultRoute(RouteHandlers.forward("notifications"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+
+        RacerMessage msg = RacerMessage.create("ch", "{\"type\":\"ANYTHING_ELSE\"}", "svc");
+        RouteDecision decision = svc.routeReactive(msg).block();
+
+        assertThat(decision).isEqualTo(FORWARDED);
+        verify(notificationsPublisher, atLeastOnce()).publishRoutedAsync(anyString(), anyString());
+    }
+
+    @Test
+    void functionalRouter_publishToError_propagatesError() {
+        when(ordersPublisher.publishRoutedAsync(anyString(), anyString()))
+                .thenReturn(Mono.error(new RuntimeException("DSL Redis error")));
+
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("error-router")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forward("orders"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+
+        RacerMessage msg = RacerMessage.create("ch", "{\"type\":\"ORDER\"}", "svc");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> svc.routeReactive(msg).block())
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("DSL Redis error");
+    }
+
+    @Test
+    void functionalRouter_hasRules_isTrue() {
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("any-router")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forward("orders"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+        assertThat(svc.hasRules()).isTrue();
+    }
+
+    @Test
+    void functionalRouter_getRuleDescriptions_containsFunctionalEntry() {
+        RacerFunctionalRouter router = RacerFunctionalRouter.builder()
+                .name("desc-router")
+                .route(RoutePredicates.fieldEquals("type", "ORDER"), RouteHandlers.forward("orders"))
+                .build();
+
+        RacerRouterService svc = buildWithFunctionalRouter(router);
+        assertThat(svc.getRuleDescriptions()).anyMatch(d -> d.contains("desc-router"));
     }
 }

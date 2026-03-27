@@ -92,4 +92,45 @@ class DlqReprocessorServiceTest {
                 .expectNext(0L)
                 .verifyComplete();
     }
+
+    // ── republishAll — with messages ───────────────────────────────────────────
+
+    @Test
+    void republishAll_withThreeMessages_publishesAllAndReturnsCount() {
+        RacerMessage msg1 = RacerMessage.create("racer:orders", "payload1", "svc");
+        RacerMessage msg2 = RacerMessage.create("racer:orders", "payload2", "svc");
+        RacerMessage msg3 = RacerMessage.create("racer:orders", "payload3", "svc");
+        DeadLetterMessage dlm1 = DeadLetterMessage.from(msg1, sampleError);
+        DeadLetterMessage dlm2 = DeadLetterMessage.from(msg2, sampleError);
+        DeadLetterMessage dlm3 = DeadLetterMessage.from(msg3, sampleError);
+
+        when(dlqService.size()).thenReturn(Mono.just(3L));
+        when(dlqService.dequeue())
+                .thenReturn(Mono.just(dlm1), Mono.just(dlm2), Mono.just(dlm3), Mono.empty());
+        when(redisTemplate.convertAndSend(eq("racer:orders"), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        StepVerifier.create(service.republishAll())
+                .expectNext(3L)
+                .verifyComplete();
+
+        assertThat(service.getRepublishedCount()).isEqualTo(3L);
+    }
+
+    @Test
+    void republishAll_withSingleMessage_returnsOneAndIncrementsCounter() {
+        RacerMessage msg = RacerMessage.create("racer:events", "data", "svc");
+        DeadLetterMessage dlm = DeadLetterMessage.from(msg, sampleError);
+
+        when(dlqService.size()).thenReturn(Mono.just(1L));
+        when(dlqService.dequeue()).thenReturn(Mono.just(dlm), Mono.empty());
+        when(redisTemplate.convertAndSend(eq("racer:events"), anyString()))
+                .thenReturn(Mono.just(2L));
+
+        StepVerifier.create(service.republishAll())
+                .expectNext(1L)
+                .verifyComplete();
+
+        assertThat(service.getRepublishedCount()).isEqualTo(1L);
+    }
 }

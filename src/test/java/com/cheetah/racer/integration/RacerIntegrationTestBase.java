@@ -5,6 +5,7 @@ import com.cheetah.racer.config.RedisConfig;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.service.DeadLetterQueueService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -127,10 +128,24 @@ abstract class RacerIntegrationTestBase {
             if (started) return;
             synchronized (DockerRedisExtension.class) {
                 if (started) return;
+                Assumptions.assumeTrue(isDockerAvailable(),
+                        "Docker not available — skipping integration tests");
                 start();
                 started = true;
                 // Register for cleanup at the root context
                 ctx.getRoot().getStore(NS).put("redis", this);
+            }
+        }
+
+        private static boolean isDockerAvailable() {
+            try {
+                Process p = new ProcessBuilder("docker", "info")
+                        .redirectErrorStream(true)
+                        .start();
+                p.getInputStream().readAllBytes();
+                return p.waitFor() == 0;
+            } catch (Exception e) {
+                return false;
             }
         }
 

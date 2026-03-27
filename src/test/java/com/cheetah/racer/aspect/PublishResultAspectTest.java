@@ -4,6 +4,8 @@ import com.cheetah.racer.annotation.ConcurrencyMode;
 import com.cheetah.racer.annotation.PublishResult;
 import com.cheetah.racer.annotation.PublishResults;
 import com.cheetah.racer.annotation.RacerPriority;
+import com.cheetah.racer.config.RacerProperties;
+import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
 import com.cheetah.racer.publisher.RacerPriorityPublisher;
 import com.cheetah.racer.publisher.RacerPublisherRegistry;
@@ -487,4 +489,250 @@ class PublishResultAspectTest {
     @RacerPriority(defaultLevel = "HIGH")
     @SuppressWarnings("unused")
     private void priorityAnnotatedMethod() {}
+
+    // ── 3-arg constructor with RacerProperties ────────────────────────────────
+
+    @Test
+    void threeArgConstructor_withProperties_sendsChannelRefConfiguredSender() throws Throwable {
+        RacerProperties props = new RacerProperties();
+        RacerProperties.ChannelProperties ch = new RacerProperties.ChannelProperties();
+        ch.setSender("orders-service");
+        ch.setAsync(true);
+        props.getChannels().put("orders", ch);
+
+        PublishResultAspect aspectWithProps = new PublishResultAspect(registry, streamPublisher, props);
+
+        when(annotation.sender()).thenReturn("");            // blank → fall through to props
+        when(annotation.channelRef()).thenReturn("orders");
+        when(annotation.channel()).thenReturn(CHANNEL);     // direct channel name still there
+        when(pjp.proceed()).thenReturn("payload");
+
+        Object result = aspectWithProps.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("payload");
+
+        verify(publisher, times(1)).publishAsync(eq("payload"), eq("orders-service"));
+    }
+
+    @Test
+    void threeArgConstructor_channelRefNotInProps_fallsBackToDefaultSender() throws Throwable {
+        RacerProperties props = new RacerProperties(); // empty channels map
+
+        PublishResultAspect aspectWithProps = new PublishResultAspect(registry, streamPublisher, props);
+
+        when(annotation.sender()).thenReturn("");            // blank → fall through
+        when(annotation.channelRef()).thenReturn("unknown-ref");
+        when(annotation.channel()).thenReturn(CHANNEL);
+        when(pjp.proceed()).thenReturn("payload");
+
+        Object result = aspectWithProps.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("payload");
+
+        // Should fall back to "racer-publisher"
+        verify(publisher, times(1)).publishAsync(eq("payload"), eq("racer-publisher"));
+    }
+
+    @Test
+    void resolveAsync_withChannelRefInProps_usesPropsAsyncSetting() throws Throwable {
+        RacerProperties props = new RacerProperties();
+        RacerProperties.ChannelProperties ch = new RacerProperties.ChannelProperties();
+        ch.setAsync(false); // props say sync
+        props.getChannels().put("orders", ch);
+
+        PublishResultAspect aspectWithProps = new PublishResultAspect(registry, streamPublisher, props);
+
+        when(annotation.sender()).thenReturn("svc");
+        when(annotation.channelRef()).thenReturn("orders");
+        when(annotation.channel()).thenReturn(CHANNEL);
+        when(annotation.async()).thenReturn(true); // annotation says async=true, but props override
+        when(pjp.proceed()).thenReturn("sync-payload");
+
+        aspectWithProps.intercept(pjp, annotation);
+
+        // Sync path: still calls publishAsync (it's the underlying API) but via sync branch
+        verify(publisher, times(1)).publishAsync(eq("sync-payload"), eq("svc"));
+    }
+
+    // ── resolveChannel with channelRef ────────────────────────────────────────
+
+    @Test
+    void resolveChannel_withChannelRef_getsPublisherByChannelRef() throws Throwable {
+        RacerChannelPublisher channelRefPublisher = mock(RacerChannelPublisher.class);
+        when(channelRefPublisher.getChannelName()).thenReturn("racer:orders");
+        when(channelRefPublisher.publishAsync(any(), anyString())).thenReturn(Mono.just(1L));
+        when(registry.getPublisher("orders")).thenReturn(channelRefPublisher);
+        when(registry.getAll()).thenReturn(Map.of("racer:orders", channelRefPublisher));
+
+        // no direct channel, only channelRef
+        when(annotation.channel()).thenReturn("");
+        when(annotation.channelRef()).thenReturn("orders");
+        when(pjp.proceed()).thenReturn("channelref-payload");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("channelref-payload");
+
+        verify(channelRefPublisher, times(1)).publishAsync(eq("channelref-payload"), anyString());
+    }
+
+    @Test
+    void resolveChannel_withNoChannelAndNoChannelRef_usesNullPublisher() throws Throwable {
+        RacerChannelPublisher defaultPublisher = mock(RacerChannelPublisher.class);
+        when(defaultPublisher.getChannelName()).thenReturn("racer:default");
+        when(defaultPublisher.publishAsync(any(), anyString())).thenReturn(Mono.just(1L));
+        when(registry.getPublisher(null)).thenReturn(defaultPublisher);
+        when(registry.getAll()).thenReturn(Map.of("racer:default", defaultPublisher));
+
+        when(annotation.channel()).thenReturn("");
+        when(annotation.channelRef()).thenReturn("");
+        when(pjp.proceed()).thenReturn("default-payload");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("default-payload");
+
+        verify(defaultPublisher, times(1)).publishAsync(eq("default-payload"), anyString());
+    }
+
+    // ── resolveStreamKey with explicit streamKey ──────────────────────────────
+
+    @Test
+    void resolveStreamKey_withExplicitStreamKey_usesItForStream() throws Throwable {
+        when(annotation.durable()).thenReturn(true);
+        when(annotation.async()).thenReturn(true);
+        when(annotation.streamKey()).thenReturn("custom:orders:stream");
+        doReturn(Mono.just(org.springframework.data.redis.connection.stream.RecordId.of("2-0")))
+                .when(streamPublisher).publishToStream(eq("custom:orders:stream"), any(), anyString());
+
+        when(pjp.proceed()).thenReturn("streamed-value");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("streamed-value");
+
+        verify(streamPublisher, times(1)).publishToStream(eq("custom:orders:stream"), any(), anyString());
+    }
+
+    // ── Durable sequential paths ──────────────────────────────────────────────
+
+    @Test
+    void durable_sequential_async_subscribesToStream() throws Throwable {
+        when(annotation.durable()).thenReturn(true);
+        when(annotation.async()).thenReturn(true);
+        when(annotation.streamKey()).thenReturn("");
+        doReturn(Mono.just(org.springframework.data.redis.connection.stream.RecordId.of("1-0")))
+                .when(streamPublisher).publishToStream(anyString(), any(), anyString());
+
+        when(pjp.proceed()).thenReturn("durable-async");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("durable-async");
+
+        verify(streamPublisher, times(1)).publishToStream(contains(CHANNEL), eq("durable-async"), anyString());
+        verify(publisher, never()).publishAsync(any(), anyString());
+    }
+
+    @Test
+    void durable_sequential_sync_blocksOnStream() throws Throwable {
+        when(annotation.durable()).thenReturn(true);
+        when(annotation.async()).thenReturn(false);
+        when(annotation.streamKey()).thenReturn("");
+        doReturn(Mono.just(org.springframework.data.redis.connection.stream.RecordId.of("3-0")))
+                .when(streamPublisher).publishToStream(anyString(), any(), anyString());
+
+        when(pjp.proceed()).thenReturn("durable-sync");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("durable-sync");
+
+        verify(streamPublisher, times(1)).publishToStream(contains(CHANNEL), eq("durable-sync"), anyString());
+        verify(publisher, never()).publishAsync(any(), anyString());
+    }
+
+    // ── Priority sequential paths ─────────────────────────────────────────────
+
+    @Test
+    void priority_pojo_async_usesSubscribePath() throws Throwable {
+        RacerPriorityPublisher priorityPub = mock(RacerPriorityPublisher.class);
+        when(priorityPub.publish(anyString(), any(), anyString(), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        aspect = new PublishResultAspect(registry, streamPublisher, null, priorityPub);
+
+        MethodSignature sig = mock(MethodSignature.class);
+        when(sig.getMethod()).thenReturn(getClass().getDeclaredMethod("priorityAnnotatedMethod"));
+        when(pjp.getSignature()).thenReturn(sig);
+        when(annotation.async()).thenReturn(true);
+        when(pjp.proceed()).thenReturn("async-priority");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("async-priority");
+
+        verify(priorityPub, times(1)).publish(eq(CHANNEL), eq("async-priority"), eq("test-sender"), eq("HIGH"));
+    }
+
+    @Test
+    void priority_pojo_sync_blocksOnPublish() throws Throwable {
+        RacerPriorityPublisher priorityPub = mock(RacerPriorityPublisher.class);
+        when(priorityPub.publish(anyString(), any(), anyString(), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        aspect = new PublishResultAspect(registry, streamPublisher, null, priorityPub);
+
+        MethodSignature sig = mock(MethodSignature.class);
+        when(sig.getMethod()).thenReturn(getClass().getDeclaredMethod("priorityAnnotatedMethod"));
+        when(pjp.getSignature()).thenReturn(sig);
+        when(annotation.async()).thenReturn(false);
+        when(pjp.proceed()).thenReturn("sync-priority");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("sync-priority");
+
+        verify(priorityPub, times(1)).publish(eq(CHANNEL), eq("sync-priority"), eq("test-sender"), eq("HIGH"));
+    }
+
+    // ── Priority concurrent paths ─────────────────────────────────────────────
+
+    @Test
+    void priority_concurrent_flux_routesViaPriorityPublisher() throws Throwable {
+        RacerPriorityPublisher priorityPub = mock(RacerPriorityPublisher.class);
+        when(priorityPub.publish(anyString(), any(), anyString(), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        aspect = new PublishResultAspect(registry, streamPublisher, null, priorityPub);
+
+        MethodSignature sig = mock(MethodSignature.class);
+        when(sig.getMethod()).thenReturn(getClass().getDeclaredMethod("priorityAnnotatedMethod"));
+        when(pjp.getSignature()).thenReturn(sig);
+        when(annotation.mode()).thenReturn(ConcurrencyMode.CONCURRENT);
+        when(annotation.concurrency()).thenReturn(2);
+        when(pjp.proceed()).thenReturn(Flux.just("a", "b", "c"));
+
+        Object result = aspect.intercept(pjp, annotation);
+        ((Flux<?>) result).blockLast();
+
+        verify(priorityPub, times(3)).publish(eq(CHANNEL), any(), eq("test-sender"), eq("HIGH"));
+        verify(publisher, never()).publishAsync(any(), anyString());
+    }
+
+    // ── resolvePriorityLevel with RacerMessage ────────────────────────────────
+
+    @Test
+    void resolvePriorityLevel_racerMessageWithPriority_usesMessagePriority() throws Throwable {
+        RacerPriorityPublisher priorityPub = mock(RacerPriorityPublisher.class);
+        when(priorityPub.publish(anyString(), any(), anyString(), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        aspect = new PublishResultAspect(registry, streamPublisher, null, priorityPub);
+
+        MethodSignature sig = mock(MethodSignature.class);
+        when(sig.getMethod()).thenReturn(getClass().getDeclaredMethod("priorityAnnotatedMethod"));
+        when(pjp.getSignature()).thenReturn(sig);
+
+        // RacerMessage with priority="LOW" should override method-level "HIGH"
+        RacerMessage msgWithPriority = RacerMessage.create(CHANNEL, "content", "svc", "low");
+        when(pjp.proceed()).thenReturn(msgWithPriority);
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isSameAs(msgWithPriority);
+
+        // message priority "low" -> toUpperCase() -> "LOW"
+        verify(priorityPub, times(1)).publish(eq(CHANNEL), eq(msgWithPriority), eq("test-sender"), eq("LOW"));
+    }
 }

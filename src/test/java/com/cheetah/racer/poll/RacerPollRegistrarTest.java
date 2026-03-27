@@ -13,12 +13,17 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.test.util.ReflectionTestUtils;
 import reactor.core.publisher.Mono;
+import reactor.test.StepVerifier;
 
+import java.lang.reflect.Method;
 import java.time.LocalDateTime;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -40,6 +45,24 @@ class RacerPollRegistrarTest {
     static class PlainBean {
         public String doSomething() {
             return "no annotation";
+        }
+    }
+
+    static class MonoReturnBean {
+        public Mono<String> fetchLatest() {
+            return Mono.just("{\"status\":\"ok\"}");
+        }
+    }
+
+    static class NullReturnBean {
+        public String noData() {
+            return null;
+        }
+    }
+
+    static class WithParamsBean {
+        public String withParams(String x) {
+            return x;
         }
     }
 
@@ -148,5 +171,86 @@ class RacerPollRegistrarTest {
         boolean matched = RacerPollRegistrar.CronMatcher.matchesOnce("not-a-cron", lastFired);
 
         assertThat(matched).isFalse();
+    }
+
+    // ── Tests: invokeThenPublish (via reflection) ──────────────────────────────
+
+    @Test
+    void invokeThenPublish_stringReturnAsync_publishesViaAsync() throws Exception {
+        when(publisher.publishAsync(anyString(), anyString())).thenReturn(Mono.just(1L));
+
+        SamplePollBean bean = new SamplePollBean();
+        Method method = SamplePollBean.class.getDeclaredMethod("generateOrder");
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                registrar, "invokeThenPublish",
+                bean, method, publisher, "orders-channel", "test-sender", true);
+
+        StepVerifier.create(result).verifyComplete();
+        verify(publisher).publishAsync(anyString(), anyString());
+    }
+
+    @Test
+    void invokeThenPublish_stringReturnSync_publishesViaSync() throws Exception {
+        when(publisher.publishSync(anyString())).thenReturn(1L);
+
+        SamplePollBean bean = new SamplePollBean();
+        Method method = SamplePollBean.class.getDeclaredMethod("generateOrder");
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                registrar, "invokeThenPublish",
+                bean, method, publisher, "orders-channel", "test-sender", false);
+
+        StepVerifier.create(result).verifyComplete();
+        verify(publisher).publishSync(anyString());
+    }
+
+    @Test
+    void invokeThenPublish_nullReturn_completesImmediately() throws Exception {
+        NullReturnBean bean = new NullReturnBean();
+        Method method = NullReturnBean.class.getDeclaredMethod("noData");
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                registrar, "invokeThenPublish",
+                bean, method, publisher, "orders-channel", "test-sender", true);
+
+        StepVerifier.create(result).verifyComplete();
+    }
+
+    @Test
+    void invokeThenPublish_monoReturn_subscribesAndPublishes() throws Exception {
+        when(publisher.publishAsync(anyString(), anyString())).thenReturn(Mono.just(1L));
+
+        MonoReturnBean bean = new MonoReturnBean();
+        Method method = MonoReturnBean.class.getDeclaredMethod("fetchLatest");
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                registrar, "invokeThenPublish",
+                bean, method, publisher, "orders-channel", "test-sender", true);
+
+        StepVerifier.create(result).verifyComplete();
+        verify(publisher).publishAsync(anyString(), anyString());
+    }
+
+    @Test
+    void invokeThenPublish_methodWithParams_skipsAndCompletesEmpty() throws Exception {
+        WithParamsBean bean = new WithParamsBean();
+        Method method = WithParamsBean.class.getDeclaredMethod("withParams", String.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                registrar, "invokeThenPublish",
+                bean, method, publisher, "orders-channel", "test-sender", true);
+
+        StepVerifier.create(result).verifyComplete();
     }
 }
