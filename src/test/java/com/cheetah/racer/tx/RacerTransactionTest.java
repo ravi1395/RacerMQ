@@ -165,5 +165,41 @@ class RacerTransactionTest {
                 .verifyComplete();
     }
 
+    @Test
+    void txPublisher_nullPayload_serializedAsNullString() {
+        // null payload → serializePayload returns "null" (in pipelined path)
+        when(pipelinedPublisher.publishItems(anyList())).thenReturn(Mono.just(List.of(1L)));
+
+        StepVerifier.create(transaction.execute(tx -> tx.publish("orders", null)))
+                .assertNext(result -> assertThat(result).hasSize(1))
+                .verifyComplete();
+
+        verify(pipelinedPublisher).publishItems(argThat(items -> {
+            @SuppressWarnings("unchecked")
+            var typedItems = (java.util.List<com.cheetah.racer.publisher.RacerPipelinedPublisher.PipelineItem>) items;
+            return typedItems.size() == 1 && "null".equals(typedItems.get(0).payload());
+        }));
+    }
+
+    @Test
+    void txPublisher_unserializablePayload_fallsBackToToString() {
+        // An anonymous class is not serializable by Jackson → falls back to toString()
+        when(pipelinedPublisher.publishItems(anyList())).thenReturn(Mono.just(List.of(1L)));
+
+        Object unserializable = new Object() {
+            @Override public String toString() { return "fallback-string"; }
+        };
+
+        StepVerifier.create(transaction.execute(tx -> tx.publish("orders", unserializable)))
+                .assertNext(result -> assertThat(result).hasSize(1))
+                .verifyComplete();
+
+        verify(pipelinedPublisher).publishItems(argThat(items -> {
+            @SuppressWarnings("unchecked")
+            var typedItems = (java.util.List<com.cheetah.racer.publisher.RacerPipelinedPublisher.PipelineItem>) items;
+            return typedItems.size() == 1 && "fallback-string".equals(typedItems.get(0).payload());
+        }));
+    }
+
     record TestPayload(String name, int value) {}
 }

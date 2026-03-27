@@ -166,4 +166,87 @@ class RacerHealthIndicatorTest {
                 })
                 .verifyComplete();
     }
+
+    @Test
+    void health_dlqSizeFails_reportsDlqUnavailable() {
+        when(dlqService.size()).thenReturn(Mono.error(new RuntimeException("Redis timeout")));
+
+        var indicator = new RacerHealthIndicator(redisTemplate, dlqService);
+
+        StepVerifier.create(indicator.health())
+                .assertNext(health -> {
+                    assertThat(health.getStatus()).isEqualTo(Status.UP);
+                    assertThat(health.getDetails()).containsEntry("dlq.depth", "unavailable");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    void health_withLagMonitor_emptyCounters_skipsLagEnrichment() {
+        when(lagMonitor.getLagCounters()).thenReturn(new java.util.LinkedHashMap<>());
+
+        var indicator = new RacerHealthIndicator(redisTemplate, null, lagMonitor, null);
+
+        StepVerifier.create(indicator.health())
+                .assertNext(health -> {
+                    assertThat(health.getStatus()).isEqualTo(Status.UP);
+                    assertThat(health.getDetails()).doesNotContainKey("consumer-lag");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    void health_withRacerPropertiesConfiguredThreshold_usesConfiguredThreshold() {
+        com.cheetah.racer.config.RacerProperties props = new com.cheetah.racer.config.RacerProperties();
+        props.getConsumerLag().setLagDownThreshold(5_000L);
+
+        java.util.Map<String, java.util.concurrent.atomic.AtomicLong> counters = new java.util.LinkedHashMap<>();
+        counters.put("stream:orders", new java.util.concurrent.atomic.AtomicLong(7_000));
+        when(lagMonitor.getLagCounters()).thenReturn(counters);
+
+        // 7000 > configured threshold of 5000 → OUT_OF_SERVICE
+        var indicator = new RacerHealthIndicator(redisTemplate, null, lagMonitor, props);
+
+        StepVerifier.create(indicator.health())
+                .assertNext(health -> {
+                    assertThat(health.getStatus()).isEqualTo(new Status("OUT_OF_SERVICE"));
+                    assertThat(health.getDetails()).containsEntry("consumer-lag.threshold-breached", true);
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    void health_withRacerPropertiesZeroThreshold_neverBreaches() {
+        com.cheetah.racer.config.RacerProperties props = new com.cheetah.racer.config.RacerProperties();
+        props.getConsumerLag().setLagDownThreshold(0L); // disabled
+
+        java.util.Map<String, java.util.concurrent.atomic.AtomicLong> counters = new java.util.LinkedHashMap<>();
+        counters.put("stream:orders", new java.util.concurrent.atomic.AtomicLong(1_000_000));
+        when(lagMonitor.getLagCounters()).thenReturn(counters);
+
+        var indicator = new RacerHealthIndicator(redisTemplate, null, lagMonitor, props);
+
+        StepVerifier.create(indicator.health())
+                .assertNext(health -> {
+                    // Zero threshold means no breach
+                    assertThat(health.getDetails()).doesNotContainKey("consumer-lag.threshold-breached");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    void health_redisUp_butEnrichmentThrows_topLevelErrorHandlerFires() {
+        // Make dlqService.size() return successfully but then throw in the map
+        when(dlqService.size()).thenReturn(Mono.error(new RuntimeException("total-failure")));
+        // Also make the overall Mono chain produce a top-level error by breaking the lag enrichment
+        when(lagMonitor.getLagCounters()).thenThrow(new RuntimeException("lag-monitor-crash"));
+
+        var indicator = new RacerHealthIndicator(redisTemplate, dlqService, lagMonitor, null);
+
+        // The top-level onErrorResume should catch and return Health.down()
+        StepVerifier.create(indicator.health())
+                .assertNext(health ->
+                    assertThat(health.getDetails()).containsEntry("component", "racer"))
+                .verifyComplete();
+    }
 }

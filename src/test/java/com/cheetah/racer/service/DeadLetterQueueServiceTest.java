@@ -19,6 +19,7 @@ import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
@@ -159,6 +160,53 @@ class DeadLetterQueueServiceTest {
 
         StepVerifier.create(service.clear())
                 .expectNext(false)
+                .verifyComplete();
+    }
+
+    // ── enqueue — trim path ───────────────────────────────────────────────────
+
+    @Test
+    void enqueue_trimsQueue_whenSizeExceedsMaxSize() {
+        // Use a custom maxSize of 5 so we can trigger trim with size=6
+        DeadLetterQueueService smallService =
+                new DeadLetterQueueService(redisTemplate, objectMapper, 5L);
+
+        when(listOps.leftPush(eq(RedisChannels.DEAD_LETTER_QUEUE), anyString()))
+                .thenReturn(Mono.just(6L)); // size > maxSize(5)
+        when(listOps.trim(eq(RedisChannels.DEAD_LETTER_QUEUE), eq(0L), anyLong()))
+                .thenReturn(Mono.just(true));
+
+        StepVerifier.create(smallService.enqueue(sampleMessage, sampleError))
+                .expectNext(6L)
+                .verifyComplete();
+    }
+
+    // ── 3-arg constructor ─────────────────────────────────────────────────────
+
+    @Test
+    void customMaxSizeConstructor_usesProvidedMaxSize() {
+        DeadLetterQueueService customService =
+                new DeadLetterQueueService(redisTemplate, objectMapper, 42L);
+
+        when(listOps.leftPush(eq(RedisChannels.DEAD_LETTER_QUEUE), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        StepVerifier.create(customService.enqueue(sampleMessage, sampleError))
+                .expectNext(1L)
+                .verifyComplete();
+    }
+
+    @Test
+    void customMaxSizeConstructor_withZeroMaxSize_usesDefault() {
+        // maxSize=0 → should fall back to DEFAULT_MAX_SIZE
+        DeadLetterQueueService zeroService =
+                new DeadLetterQueueService(redisTemplate, objectMapper, 0L);
+
+        when(listOps.leftPush(eq(RedisChannels.DEAD_LETTER_QUEUE), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        StepVerifier.create(zeroService.enqueue(sampleMessage, sampleError))
+                .expectNext(1L)
                 .verifyComplete();
     }
 }

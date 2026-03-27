@@ -1,5 +1,6 @@
 package com.cheetah.racer.web;
 
+import com.cheetah.racer.circuitbreaker.RacerCircuitBreaker;
 import com.cheetah.racer.circuitbreaker.RacerCircuitBreakerRegistry;
 import com.cheetah.racer.config.RacerProperties;
 import com.cheetah.racer.publisher.RacerChannelPublisher;
@@ -13,6 +14,7 @@ import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 import reactor.test.StepVerifier;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -141,6 +143,53 @@ class RacerAdminControllerTest {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> channels = (Map<String, Object>) body.get("channels");
                     assertThat(channels).containsKey("orders");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    void rateLimits_channelWithZeroCapacityAndRefillRate_usesDefaults() {
+        RacerProperties.RateLimitProperties.ChannelRateLimitProperties ch =
+                new RacerProperties.RateLimitProperties.ChannelRateLimitProperties();
+        ch.setCapacity(0);   // should fall back to defaultCapacity
+        ch.setRefillRate(0); // should fall back to defaultRefillRate
+
+        properties.getRateLimit().setDefaultCapacity(100L);
+        properties.getRateLimit().setDefaultRefillRate(50L);
+        properties.getRateLimit().getChannels().put("events", ch);
+
+        StepVerifier.create(controller.rateLimits())
+                .assertNext(body -> {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> channels = (Map<String, Object>) body.get("channels");
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> eventsInfo = (Map<String, Object>) channels.get("events");
+                    assertThat(eventsInfo.get("capacity")).isEqualTo(100L);
+                    assertThat(eventsInfo.get("refillRate")).isEqualTo(50L);
+                })
+                .verifyComplete();
+    }
+
+    // ── /circuitbreakers — with actual CB data ────────────────────────────────
+
+    @Test
+    void circuitBreakers_withActualBreaker_returnsStateAndCounts() {
+        RacerCircuitBreaker cb = new RacerCircuitBreaker("orders-cb", 10, 0.5f, 5000, 3);
+
+        RacerCircuitBreakerRegistry cbRegistry = mock(RacerCircuitBreakerRegistry.class);
+        when(cbRegistry.getAll()).thenReturn(List.of(cb));
+
+        RacerAdminController ctrl = new RacerAdminController(publisherRegistry, properties, cbRegistry);
+
+        StepVerifier.create(ctrl.circuitBreakers())
+                .assertNext(body -> {
+                    assertThat(body.get("enabled")).isEqualTo(true);
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> breakers = (Map<String, Object>) body.get("circuitBreakers");
+                    assertThat(breakers).containsKey("orders-cb");
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> info = (Map<String, Object>) breakers.get("orders-cb");
+                    assertThat(info).containsKeys("state", "transitionCount", "rejectedCount");
                 })
                 .verifyComplete();
     }

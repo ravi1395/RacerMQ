@@ -114,4 +114,22 @@ class RacerChannelResolverTest {
         assertThat(RacerChannelResolver.resolveStreamKey("", "", props))
                 .isEqualTo(props.getDefaultChannel());
     }
+
+    // ── resolveChannel() with logPrefix — warning on missing ref ────────────
+
+    @Test
+    void resolveChannel_withLogPrefix_missingChannelRef_fallsBackToDefault() {
+        RacerProperties props = new RacerProperties();
+        // channelRef "unknown" is not in props.channels → warning logged, returns default
+        String result = RacerChannelResolver.resolveChannel("", "unknown", props, "TEST-PREFIX");
+        assertThat(result).isEqualTo(props.getDefaultChannel());
+    }
+
+    @Test
+    void resolveStreamKey_withLogPrefix_missingStreamKeyRef_fallsBackToDefault() {
+        RacerProperties props = new RacerProperties();
+        // streamKeyRef "unknown" is not in props.channels → warning logged, returns default
+        String result = RacerChannelResolver.resolveStreamKey("", "unknown", props, "TEST-PREFIX");
+        assertThat(result).isEqualTo(props.getDefaultChannel());
+    }
 }

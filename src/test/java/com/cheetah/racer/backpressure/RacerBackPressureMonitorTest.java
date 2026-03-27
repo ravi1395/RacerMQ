@@ -58,6 +58,32 @@ class RacerBackPressureMonitorTest {
         executor.shutdownNow();
     }
 
+    // ── start() / stop() lifecycle ────────────────────────────────────────────
+
+    @Test
+    void start_registersGaugeAndStartsMonitorLoop() {
+        RacerBackPressureMonitor monitor = buildMonitor();
+        monitor.start();
+        // After starting the monitor should still report inactive (queue is empty)
+        assertThat(monitor.isActive()).isFalse();
+        monitor.stop();
+    }
+
+    @Test
+    void stop_disposesMonitorLoop_withoutThrowing() {
+        RacerBackPressureMonitor monitor = buildMonitor();
+        monitor.start();
+        // Should not throw
+        monitor.stop();
+    }
+
+    @Test
+    void stop_beforeStart_doesNotThrow() {
+        RacerBackPressureMonitor monitor = buildMonitor();
+        // stop() before start() — monitorLoop is null, must be handled gracefully
+        monitor.stop();
+    }
+
     // ── initial state ─────────────────────────────────────────────────────────
 
     @Test

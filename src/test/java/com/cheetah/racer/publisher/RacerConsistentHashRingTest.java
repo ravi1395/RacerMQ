@@ -1,9 +1,11 @@
 package com.cheetah.racer.publisher;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.HashSet;
 import java.util.Set;
+import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -149,5 +151,70 @@ class RacerConsistentHashRingTest {
                     .isGreaterThan(total / 10)
                     .isLessThan(total * 40 / 100);
         }
+    }
+
+    // ── Edge paths via ring injection (reflection) ────────────────────────────
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getShardFor_emptyRing_returnsZero() {
+        RacerConsistentHashRing ring = new RacerConsistentHashRing(1, 1);
+        TreeMap<Integer, Integer> ringMap =
+                (TreeMap<Integer, Integer>) ReflectionTestUtils.getField(ring, "ring");
+        ringMap.clear();
+
+        // L67: ring.isEmpty() → return 0
+        assertThat(ring.getShardFor("any-key")).isZero();
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getShardFor_hashExceedsMaxRingPosition_wrapsToFirst() {
+        RacerConsistentHashRing ring = new RacerConsistentHashRing(1, 1);
+        TreeMap<Integer, Integer> ringMap =
+                (TreeMap<Integer, Integer>) ReflectionTestUtils.getField(ring, "ring");
+        // Only entry at a very negative value — any non-negative hash wraps to firstKey
+        ringMap.clear();
+        ringMap.put(Integer.MIN_VALUE, 0);
+
+        // L72: ceilingKey(hash) == null when hash > Integer.MIN_VALUE; nearly every key qualifies
+        for (int i = 0; i < 10; i++) {
+            assertThat(ring.getShardFor("wrap-" + i)).isZero();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getFailoverShardFor_hashExceedsMaxRingPosition_wrapsToFirst() {
+        // 2 shards so the shardCount==1 early-return does NOT fire
+        RacerConsistentHashRing ring = new RacerConsistentHashRing(2, 1);
+        TreeMap<Integer, Integer> ringMap =
+                (TreeMap<Integer, Integer>) ReflectionTestUtils.getField(ring, "ring");
+        ringMap.clear();
+        // Two entries: shard 0 at MIN_VALUE, shard 1 at MIN_VALUE+1
+        ringMap.put(Integer.MIN_VALUE, 0);
+        ringMap.put(Integer.MIN_VALUE + 1, 1);
+
+        // L95: ceilingKey(hash) wraps to firstKey when hash > MIN_VALUE+1 (nearly always)
+        // findFailover will return shard 1 (different from primary 0)
+        int failover = ring.getFailoverShardFor("failover-wrap-key");
+        assertThat(failover).isBetween(0, 1);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getFailoverShardFor_walkReachesEndOfRing_wrapsAndFallsBack() {
+        // 2 shards, but inject both virtual nodes as shard 0 → walk exhausts ring,
+        // hits the end-of-ring wrap (L113), then falls to fallback return (L132)
+        RacerConsistentHashRing ring = new RacerConsistentHashRing(2, 1);
+        TreeMap<Integer, Integer> ringMap =
+                (TreeMap<Integer, Integer>) ReflectionTestUtils.getField(ring, "ring");
+        ringMap.clear();
+        ringMap.put(-200, 0);
+        ringMap.put(-100, 0);  // both nodes → shard 0; walk never finds a different shard
+
+        // For any key, primary = shard 0; walk exhausts all nodes hitting the wrap-around,
+        // then returns the fallback (primaryShard + 1) % 2 = 1
+        assertThat(ring.getFailoverShardFor("fallback-key")).isEqualTo(1);
     }
 }

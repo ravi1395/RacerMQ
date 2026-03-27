@@ -8,13 +8,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
+import reactor.test.StepVerifier;
 
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for {@link RacerSchemaRegistry}.
@@ -231,5 +236,116 @@ class RacerSchemaRegistryTest {
         props.getSchema().getSchemas().put(CHANNEL, def);
 
         return props;
+    }
+
+    // ------------------------------------------------------------------
+    // validateForPublishReactive
+    // ------------------------------------------------------------------
+
+    @Test
+    void validateForPublishReactive_validPayload_completesEmpty() {
+        StepVerifier.create(registry.validateForPublishReactive(CHANNEL, "{\"name\":\"Eve\"}"))
+                .verifyComplete();
+    }
+
+    @Test
+    void validateForPublishReactive_invalidPayload_emitsError() {
+        StepVerifier.create(registry.validateForPublishReactive(CHANNEL, "{\"age\":99}"))
+                .expectError(SchemaValidationException.class)
+                .verify();
+    }
+
+    // ------------------------------------------------------------------
+    // init() — alias-to-channel mapping stores schema under both keys
+    // ------------------------------------------------------------------
+
+    @Test
+    void init_registersSchemaUnderBothAliasAndChannelName() {
+        RacerProperties props = new RacerProperties();
+        props.getSchema().setEnabled(true);
+        props.getSchema().setValidationMode(RacerProperties.SchemaValidationMode.BOTH);
+        props.getSchema().setFailOnViolation(true);
+
+        // Set up a channel alias "orders" → "racer:orders"
+        RacerProperties.ChannelProperties cp = new RacerProperties.ChannelProperties();
+        cp.setName("racer:orders");
+        props.getChannels().put("orders", cp);
+
+        // Register schema under the alias key "orders"
+        RacerProperties.SchemaDefinition def = new RacerProperties.SchemaDefinition();
+        def.setInline(SCHEMA_JSON);
+        def.setVersion("1.0");
+        props.getSchema().getSchemas().put("orders", def);
+
+        RacerSchemaRegistry reg = new RacerSchemaRegistry(props, resourceLoader, objectMapper);
+        reg.init();
+
+        // Schema accessible via alias AND resolved channel name
+        assertThat(reg.hasSchema("orders")).isTrue();
+        assertThat(reg.hasSchema("racer:orders")).isTrue();
+    }
+
+    // ------------------------------------------------------------------
+    // loadSchema — error paths
+    // ------------------------------------------------------------------
+
+    @Test
+    void init_skipsSchema_whenBothInlineAndLocationBlank() {
+        RacerProperties props = new RacerProperties();
+        props.getSchema().setEnabled(true);
+        props.getSchema().setValidationMode(RacerProperties.SchemaValidationMode.BOTH);
+
+        RacerProperties.SchemaDefinition badDef = new RacerProperties.SchemaDefinition();
+        // Neither inline nor location set — should throw IAE, caught by init() and logged
+        props.getSchema().getSchemas().put("broken", badDef);
+
+        RacerSchemaRegistry reg = new RacerSchemaRegistry(props, resourceLoader, objectMapper);
+        reg.init(); // should not throw
+
+        assertThat(reg.hasSchema("broken")).isFalse();
+    }
+
+    @Test
+    void init_skipsSchema_whenLocationResourceDoesNotExist() {
+        RacerProperties props = new RacerProperties();
+        props.getSchema().setEnabled(true);
+        props.getSchema().setValidationMode(RacerProperties.SchemaValidationMode.BOTH);
+
+        RacerProperties.SchemaDefinition locationDef = new RacerProperties.SchemaDefinition();
+        locationDef.setLocation("classpath:schemas/nonexistent.json");
+        props.getSchema().getSchemas().put("missing-resource", locationDef);
+
+        Resource missingResource = mock(Resource.class);
+        when(missingResource.exists()).thenReturn(false);
+        when(resourceLoader.getResource(anyString())).thenReturn(missingResource);
+
+        RacerSchemaRegistry reg = new RacerSchemaRegistry(props, resourceLoader, objectMapper);
+        reg.init(); // should not throw
+
+        assertThat(reg.hasSchema("missing-resource")).isFalse();
+    }
+
+    // ------------------------------------------------------------------
+    // toJsonString — non-JSON String wrapping
+    // ------------------------------------------------------------------
+
+    @Test
+    void validateForPublish_plainStringPayload_wrapsAsJsonString() {
+        // "plain text" is not valid JSON — toJsonString wraps it as a JSON string value
+        // With our schema requiring an object, this should fail validation
+        assertThatThrownBy(() -> registry.validateForPublish(CHANNEL, "plain text"))
+                .isInstanceOf(SchemaValidationException.class);
+    }
+
+    // ------------------------------------------------------------------
+    // validateAdHoc — parse-error on malformed JSON
+    // ------------------------------------------------------------------
+
+    @Test
+    void validateAdHoc_malformedJson_returnsParseError() {
+        List<SchemaViolation> violations =
+                registry.validateAdHoc(CHANNEL, "{not valid json");
+        assertThat(violations).hasSize(1);
+        assertThat(violations.get(0).path()).isEqualTo("$");
     }
 }

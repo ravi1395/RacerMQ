@@ -111,4 +111,21 @@ class RacerExceptionHierarchyTest {
         assertThat(ex).hasMessage("timeout");
         assertThat(ex.getCause()).isSameAs(cause);
     }
+
+    // ── RacerRateLimitException ──────────────────────────────────────────────
+
+    @Test
+    void rateLimitException_singleArg_hasChannelInMessage() {
+        RacerRateLimitException ex = new RacerRateLimitException("orders");
+        assertThat(ex.getChannel()).isEqualTo("orders");
+        assertThat(ex.getMessage()).contains("orders");
+        assertThat(ex).isInstanceOf(RacerException.class);
+    }
+
+    @Test
+    void rateLimitException_twoArg_hasChannelAndDetailInMessage() {
+        RacerRateLimitException ex = new RacerRateLimitException("orders", "bucket empty");
+        assertThat(ex.getChannel()).isEqualTo("orders");
+        assertThat(ex.getMessage()).contains("orders").contains("bucket empty");
+    }
 }

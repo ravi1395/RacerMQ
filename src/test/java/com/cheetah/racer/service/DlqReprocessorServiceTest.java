@@ -133,4 +133,42 @@ class DlqReprocessorServiceTest {
 
         assertThat(service.getRepublishedCount()).isEqualTo(1L);
     }
+
+    // ── republishAll — large batch (> BATCH_CHUNK=100), triggers recursive batch ──
+
+    @Test
+    void republishAll_withMoreThanBatchChunk_recursiveBatchProcessed() {
+        when(dlqService.size()).thenReturn(Mono.just(101L));
+        when(dlqService.dequeue()).thenAnswer(inv -> {
+            RacerMessage msg = RacerMessage.create("racer:orders", "p", "svc");
+            return Mono.just(DeadLetterMessage.from(msg, sampleError));
+        });
+        when(redisTemplate.convertAndSend(anyString(), anyString()))
+                .thenReturn(Mono.just(1L));
+
+        StepVerifier.create(service.republishAll())
+                .assertNext(count -> assertThat(count).isGreaterThanOrEqualTo(100L))
+                .verifyComplete();
+    }
+
+    // ── republishOne — JSON serialization failure ──────────────────────────────
+
+    @Test
+    void republishOne_serializationFails_propagatesError() throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper mockMapper =
+                org.mockito.Mockito.mock(com.fasterxml.jackson.databind.ObjectMapper.class);
+        org.mockito.Mockito.when(mockMapper.writeValueAsString(org.mockito.ArgumentMatchers.any()))
+                .thenThrow(new com.fasterxml.jackson.core.JsonProcessingException("ser-fail") {});
+
+        DlqReprocessorService failingService =
+                new DlqReprocessorService(dlqService, redisTemplate, mockMapper, null);
+
+        sampleMessage.setRetryCount(0);
+        DeadLetterMessage dlm = DeadLetterMessage.from(sampleMessage, sampleError);
+        when(dlqService.dequeue()).thenReturn(Mono.just(dlm));
+
+        StepVerifier.create(failingService.republishOne())
+                .expectError(com.fasterxml.jackson.core.JsonProcessingException.class)
+                .verify();
+    }
 }

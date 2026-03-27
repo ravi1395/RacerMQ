@@ -490,7 +490,140 @@ class PublishResultAspectTest {
     @SuppressWarnings("unused")
     private void priorityAnnotatedMethod() {}
 
-    // ── 3-arg constructor with RacerProperties ────────────────────────────────
+    // ── Reactive upstream error handlers ─────────────────────────────────────
+
+    @Test
+    void mono_upstreamError_propagatesAndLogsDebug() throws Throwable {
+        when(pjp.proceed()).thenReturn(Mono.error(new RuntimeException("upstream-failure")));
+
+        Object result = aspect.intercept(pjp, annotation);
+
+        assertThat(result).isInstanceOf(Mono.class);
+        StepVerifier.create((Mono<?>) result)
+                .expectError(RuntimeException.class)
+                .verify();
+    }
+
+    @Test
+    void sequential_flux_upstreamError_propagatesAndLogsDebug() throws Throwable {
+        when(annotation.mode()).thenReturn(ConcurrencyMode.SEQUENTIAL);
+        when(pjp.proceed()).thenReturn(Flux.error(new RuntimeException("seq-flux-failure")));
+
+        Object result = aspect.intercept(pjp, annotation);
+
+        assertThat(result).isInstanceOf(Flux.class);
+        StepVerifier.create((Flux<?>) result)
+                .expectError(RuntimeException.class)
+                .verify();
+    }
+
+    @Test
+    void concurrent_flux_upstreamError_propagatesAndLogsDebug() throws Throwable {
+        when(annotation.mode()).thenReturn(ConcurrencyMode.CONCURRENT);
+        when(pjp.proceed()).thenReturn(Flux.error(new RuntimeException("concurrent-flux-failure")));
+
+        Object result = aspect.intercept(pjp, annotation);
+
+        assertThat(result).isInstanceOf(Flux.class);
+        StepVerifier.create((Flux<?>) result)
+                .expectError(RuntimeException.class)
+                .verify();
+    }
+
+    // ── Durable publish error handlers ────────────────────────────────────────
+
+    @Test
+    void pojo_asyncDurable_publishFails_errorHandlerInvoked() throws Throwable {
+        when(annotation.durable()).thenReturn(true);
+        when(annotation.async()).thenReturn(true);
+        when(annotation.streamKey()).thenReturn("");
+        doReturn(Mono.error(new RuntimeException("stream-async-error")))
+                .when(streamPublisher).publishToStream(anyString(), any(), anyString());
+
+        when(pjp.proceed()).thenReturn("durable-fail-value");
+
+        // Should not throw — error callback handles it
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("durable-fail-value");
+        verify(streamPublisher, times(1)).publishToStream(anyString(), any(), anyString());
+    }
+
+    @Test
+    void pojo_syncDurable_publishFails_exceptionCaught() throws Throwable {
+        when(annotation.durable()).thenReturn(true);
+        when(annotation.async()).thenReturn(false);
+        when(annotation.streamKey()).thenReturn("");
+        doReturn(Mono.error(new RuntimeException("stream-sync-error")))
+                .when(streamPublisher).publishToStream(anyString(), any(), anyString());
+
+        when(pjp.proceed()).thenReturn("sync-durable-fail");
+
+        // catch block should handle the exception
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("sync-durable-fail");
+        verify(streamPublisher, times(1)).publishToStream(anyString(), any(), anyString());
+    }
+
+    // ── Standard publish error handlers ──────────────────────────────────────
+
+    @Test
+    void pojo_async_publishFails_errorHandlerInvoked() throws Throwable {
+        when(publisher.publishAsync(any(), anyString()))
+                .thenReturn(Mono.error(new RuntimeException("async-pub-error")));
+        when(pjp.proceed()).thenReturn("failing-value");
+
+        // Fire-and-forget subscribe error callback should handle without throwing
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("failing-value");
+    }
+
+    @Test
+    void pojo_sync_publishFails_exceptionCaught() throws Throwable {
+        when(annotation.async()).thenReturn(false);
+        when(publisher.publishAsync(any(), anyString()))
+                .thenReturn(Mono.error(new RuntimeException("sync-pub-error")));
+        when(pjp.proceed()).thenReturn("sync-failing-value");
+
+        // catch block should handle the block() exception
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("sync-failing-value");
+    }
+
+    // ── Priority publish error handlers ──────────────────────────────────────
+
+    @Test
+    void priority_pojo_async_publishFails_errorHandlerInvoked() throws Throwable {
+        RacerPriorityPublisher priorityPub = mock(RacerPriorityPublisher.class);
+        when(priorityPub.publish(anyString(), any(), anyString(), anyString()))
+                .thenReturn(Mono.error(new RuntimeException("async-priority-error")));
+        aspect = new PublishResultAspect(registry, streamPublisher, null, priorityPub);
+
+        MethodSignature sig = mock(MethodSignature.class);
+        when(sig.getMethod()).thenReturn(getClass().getDeclaredMethod("priorityAnnotatedMethod"));
+        when(pjp.getSignature()).thenReturn(sig);
+        when(annotation.async()).thenReturn(true);
+        when(pjp.proceed()).thenReturn("priority-fail-async");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("priority-fail-async");
+    }
+
+    @Test
+    void priority_pojo_sync_publishFails_exceptionCaught() throws Throwable {
+        RacerPriorityPublisher priorityPub = mock(RacerPriorityPublisher.class);
+        when(priorityPub.publish(anyString(), any(), anyString(), anyString()))
+                .thenReturn(Mono.error(new RuntimeException("sync-priority-error")));
+        aspect = new PublishResultAspect(registry, streamPublisher, null, priorityPub);
+
+        MethodSignature sig = mock(MethodSignature.class);
+        when(sig.getMethod()).thenReturn(getClass().getDeclaredMethod("priorityAnnotatedMethod"));
+        when(pjp.getSignature()).thenReturn(sig);
+        when(annotation.async()).thenReturn(false);
+        when(pjp.proceed()).thenReturn("priority-fail-sync");
+
+        Object result = aspect.intercept(pjp, annotation);
+        assertThat(result).isEqualTo("priority-fail-sync");
+    }
 
     @Test
     void threeArgConstructor_withProperties_sendsChannelRefConfiguredSender() throws Throwable {

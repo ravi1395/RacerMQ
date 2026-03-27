@@ -147,4 +147,22 @@ class RacerTraceContextTest {
         // parent-id must be 16 hex chars
         assertThat(RacerTraceContext.isValid("00-4bf92f3577b34da6a3ce929d0e0e4736-abc-01")).isFalse();
     }
+
+    @Test
+    void isValid_falseForNonHexTraceId() {
+        // trace-id has correct length but contains non-hex character 'g'
+        assertThat(RacerTraceContext.isValid("00-gf92f3577b34da6a3ce929d0e0e47369-00f067aa0ba902b7-01")).isFalse();
+    }
+
+    @Test
+    void isValid_falseForAllZerosTraceId() {
+        assertThat(RacerTraceContext.isValid(
+                "00-00000000000000000000000000000000-00f067aa0ba902b7-01")).isFalse();
+    }
+
+    @Test
+    void isValid_falseForAllZerosParentId() {
+        assertThat(RacerTraceContext.isValid(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01")).isFalse();
+    }
 }

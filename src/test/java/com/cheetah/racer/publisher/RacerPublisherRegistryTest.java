@@ -141,4 +141,73 @@ class RacerPublisherRegistryTest {
         // "broken" alias should not be registered; unknown alias falls back to default
         assertThat(reg.getPublisher("broken").getChannelName()).isEqualTo("racer:messages");
     }
+
+    // ------------------------------------------------------------------
+    // 4-arg constructor with Optional<RacerMetrics>
+    // ------------------------------------------------------------------
+
+    @Test
+    void fourArgConstructor_withMetrics_buildsRegistrySuccessfully() {
+        com.cheetah.racer.metrics.RacerMetrics metrics = org.mockito.Mockito.mock(com.cheetah.racer.metrics.RacerMetrics.class);
+        RacerPublisherRegistry reg = new RacerPublisherRegistry(
+                properties, redisTemplate, objectMapper, java.util.Optional.of(metrics));
+        reg.init();
+        assertThat(reg.getPublisher(null)).isNotNull();
+        assertThat(reg.getAll()).containsKey(RacerPublisherRegistry.DEFAULT_ALIAS);
+    }
+
+    @Test
+    void fourArgConstructor_withEmptyMetrics_buildsRegistrySuccessfully() {
+        RacerPublisherRegistry reg = new RacerPublisherRegistry(
+                properties, redisTemplate, objectMapper, java.util.Optional.empty());
+        reg.init();
+        assertThat(reg.getPublisher(null)).isNotNull();
+    }
+
+    // ------------------------------------------------------------------
+    // Durable channel registration
+    // ------------------------------------------------------------------
+
+    @Test
+    void durableChannel_withBlankStreamKey_registersDefaultStreamKey() {
+        RacerProperties props = new RacerProperties();
+        props.setDefaultChannel("racer:messages");
+
+        RacerProperties.ChannelProperties durableChannel = new RacerProperties.ChannelProperties();
+        durableChannel.setName("racer:events");
+        durableChannel.setSender("event-service");
+        durableChannel.setDurable(true);
+        durableChannel.setStreamKey(""); // blank → default "<name>:stream"
+
+        props.setChannels(Map.of("events", durableChannel));
+
+        RacerPublisherRegistry reg = new RacerPublisherRegistry(props, redisTemplate, objectMapper);
+        reg.init();
+
+        RacerChannelPublisher pub = reg.getPublisher("events");
+        assertThat(pub).isNotNull();
+        assertThat(pub.getChannelAlias()).isEqualTo("events");
+        assertThat(pub.getChannelName()).isEqualTo("racer:events");
+    }
+
+    @Test
+    void durableChannel_withCustomStreamKey_usesProvidedKey() {
+        RacerProperties props = new RacerProperties();
+        props.setDefaultChannel("racer:messages");
+
+        RacerProperties.ChannelProperties durableChannel = new RacerProperties.ChannelProperties();
+        durableChannel.setName("racer:orders");
+        durableChannel.setSender("order-service");
+        durableChannel.setDurable(true);
+        durableChannel.setStreamKey("custom:orders:stream");
+
+        props.setChannels(Map.of("orders-durable", durableChannel));
+
+        RacerPublisherRegistry reg = new RacerPublisherRegistry(props, redisTemplate, objectMapper);
+        reg.init();
+
+        RacerChannelPublisher pub = reg.getPublisher("orders-durable");
+        assertThat(pub).isNotNull();
+        assertThat(pub.getChannelAlias()).isEqualTo("orders-durable");
+    }
 }

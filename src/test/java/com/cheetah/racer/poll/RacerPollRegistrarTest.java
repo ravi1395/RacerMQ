@@ -22,7 +22,9 @@ import java.time.LocalDateTime;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -63,6 +65,43 @@ class RacerPollRegistrarTest {
     static class WithParamsBean {
         public String withParams(String x) {
             return x;
+        }
+    }
+
+    static class DirectChannelBean {
+        @RacerPoll(channel = "racer:orders", fixedRate = 5_000)
+        public String fetchData() {
+            return "{\"direct\": true}";
+        }
+    }
+
+    static class NeitherChannelBean {
+        @RacerPoll(fixedRate = 5_000) // channel="" channelRef="" both empty
+        public String fetchData() {
+            return "{}";
+        }
+    }
+
+    static class CronPollBean {
+        @RacerPoll(channelRef = "orders", cron = "* * * * * *")
+        public String fetchCron() {
+            return "{\"cron\": true}";
+        }
+    }
+
+    static class NonStringReturnBean {
+        @RacerPoll(channelRef = "orders", fixedRate = 5_000)
+        public java.util.concurrent.atomic.AtomicBoolean fetchUnserializable() {
+            // Jackson can serialize AtomicBoolean normally; to cause failure we'll
+            // override the mapper in the specific test
+            return new java.util.concurrent.atomic.AtomicBoolean(true);
+        }
+    }
+
+    static class ThrowingBean {
+        @RacerPoll(channelRef = "orders", fixedRate = 5_000)
+        public String failAlways() {
+            throw new RuntimeException("intentional-failure");
         }
     }
 
@@ -250,6 +289,84 @@ class RacerPollRegistrarTest {
         Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
                 registrar, "invokeThenPublish",
                 bean, method, publisher, "orders-channel", "test-sender", true);
+
+        StepVerifier.create(result).verifyComplete();
+    }
+
+    // ── Tests: direct channel attribute (L107) ────────────────────────────────
+
+    @Test
+    void registerPoll_withDirectChannelAttribute_usesChannelDirectly() {
+        when(publisherRegistry.getPublisher("racer:orders")).thenReturn(publisher);
+        when(publisher.getChannelName()).thenReturn("racer:orders");
+        when(publisher.publishAsync(anyString(), anyString())).thenReturn(Mono.just(1L));
+
+        DirectChannelBean bean = new DirectChannelBean();
+        registrar.postProcessAfterInitialization(bean, "directChannelBean");
+
+        // publisherRegistry.getPublisher(channel) is called synchronously during registration
+        verify(publisherRegistry).getPublisher("racer:orders");
+        registrar.stop();
+    }
+
+    // ── Tests: neither channel nor channelRef (L109-111) ──────────────────────
+
+    @Test
+    void registerPoll_withNeitherChannelNorRef_logsErrorAndSkips() {
+        NeitherChannelBean bean = new NeitherChannelBean();
+        // Should not throw, should not call the registry, should not register any subscription
+        registrar.postProcessAfterInitialization(bean, "neitherChannelBean");
+        registrar.stop();
+    }
+
+    // ── Tests: cron expression path (L122-126) ────────────────────────────────
+
+    @Test
+    void registerPoll_withCronExpression_registersCronTicker() {
+        // CronPollBean uses channelRef="orders" which is already stubbed in setUp()
+        CronPollBean bean = new CronPollBean();
+        registrar.postProcessAfterInitialization(bean, "cronPollBean");
+
+        // The cron ticker Flux is assembled synchronously during registerPoll — lines 122-126
+        verify(publisherRegistry).getPublisher("orders");
+        registrar.stop();
+    }
+
+    // ── Tests: invokeThenPublish error handler (L166-168) ────────────────────
+
+    @Test
+    void invokeThenPublish_throwingMethod_incrementsErrorCount() throws Exception {
+        ThrowingBean bean = new ThrowingBean();
+        Method method = ThrowingBean.class.getDeclaredMethod("failAlways");
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                registrar, "invokeThenPublish",
+                bean, method, publisher, "orders-channel", "test-sender", true);
+
+        StepVerifier.create(result).verifyComplete();
+        assertThat(registrar.getTotalErrors()).isEqualTo(1L);
+    }
+
+    // ── Tests: serialization failure in publish (L180-182) ───────────────────
+
+    @Test
+    void publish_withSerializationFailure_returnsEmptyMono() throws Exception {
+        ObjectMapper failingMapper = mock(ObjectMapper.class);
+        when(failingMapper.writeValueAsString(any()))
+                .thenThrow(new com.fasterxml.jackson.core.JsonProcessingException("ser-fail") {});
+
+        RacerPollRegistrar failingRegistrar = new RacerPollRegistrar(publisherRegistry, failingMapper, null);
+        failingRegistrar.setEnvironment(new MockEnvironment());
+
+        // Call publish() with a non-String payload so objectMapper.writeValueAsString is invoked
+        Object nonStringPayload = new java.util.concurrent.atomic.AtomicBoolean(true);
+
+        @SuppressWarnings("unchecked")
+        Mono<Void> result = (Mono<Void>) ReflectionTestUtils.invokeMethod(
+                failingRegistrar, "publish",
+                nonStringPayload, publisher, "orders-channel", "test-sender", true);
 
         StepVerifier.create(result).verifyComplete();
     }

@@ -1,11 +1,14 @@
 package com.cheetah.racer.router.dsl;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
 import com.cheetah.racer.model.RacerMessage;
 import com.cheetah.racer.router.RouteDecision;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
@@ -123,6 +126,60 @@ class RouteHandlersTest {
 
         assertThat(result).isEqualTo(RouteDecision.DROPPED);
         verifyNoInteractions(ctx);
+    }
+
+    // ── drop() — debug-enabled paths ──────────────────────────────────────
+
+    @Test
+    void drop_withDebugEnabled_longPayload_truncatesAndReturnsDROPPED() {
+        Logger logger = (Logger) LoggerFactory.getLogger(RouteHandlers.class);
+        Level original = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            String longPayload = "A".repeat(200); // > 120 chars — triggers truncation
+            RacerMessage m = RacerMessage.builder()
+                    .id("msg-2").channel("orders").payload(longPayload).sender("svc").build();
+
+            RouteDecision result = RouteHandlers.drop().handle(m, ctx);
+
+            assertThat(result).isEqualTo(RouteDecision.DROPPED);
+        } finally {
+            logger.setLevel(original);
+        }
+    }
+
+    @Test
+    void drop_withDebugEnabled_shortPayloadWithControlChars_sanitizesAndReturnsDROPPED() {
+        Logger logger = (Logger) LoggerFactory.getLogger(RouteHandlers.class);
+        Level original = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            RacerMessage m = RacerMessage.builder()
+                    .id("msg-3").channel("orders").payload("line1\r\nline2").sender("svc").build();
+
+            RouteDecision result = RouteHandlers.drop().handle(m, ctx);
+
+            assertThat(result).isEqualTo(RouteDecision.DROPPED);
+        } finally {
+            logger.setLevel(original);
+        }
+    }
+
+    @Test
+    void drop_withDebugEnabled_nullPayload_returnsDROPPED() {
+        Logger logger = (Logger) LoggerFactory.getLogger(RouteHandlers.class);
+        Level original = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            RacerMessage m = RacerMessage.builder()
+                    .id("msg-4").channel("orders").payload(null).sender("svc").build();
+
+            RouteDecision result = RouteHandlers.drop().handle(m, ctx);
+
+            assertThat(result).isEqualTo(RouteDecision.DROPPED);
+        } finally {
+            logger.setLevel(original);
+        }
     }
 
     // ── dropQuietly ───────────────────────────────────────────────────────
