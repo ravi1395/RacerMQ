@@ -10,12 +10,12 @@
 		<relativePath/>
 	</parent>
 
-	<groupId>com.cheetah</groupId>
+	<groupId>io.github.ravi1395</groupId>
 	<artifactId>racer</artifactId>
 	<version>1.3.0</version>
 	<name>racer</name>
 	<description>Reactive Redis Messaging with Pub/Sub and Dead Letter Queue</description>
-	<url>https://github.com/ravichandrasekhar/racer</url>
+	<url>https://github.com/ravi1395/Racer</url>
 
 	<licenses>
 		<license>
@@ -27,17 +27,17 @@
 
 	<developers>
 		<developer>
-			<id>ravichandrasekhar</id>
+			<id>ravi1395</id>
 			<name>Ravi Chandrasekhar</name>
-			<email>ravichandrasekhar@cheetah.com</email>
+			<email>ravi1395@gmail.com</email>
 		</developer>
 	</developers>
 
 	<scm>
-		<connection>scm:git:git://github.com/ravichandrasekhar/racer.git</connection>
-		<developerConnection>scm:git:ssh://github.com/ravichandrasekhar/racer.git</developerConnection>
-		<url>https://github.com/ravichandrasekhar/racer</url>
-		<tag>v1.0.0</tag>
+		<connection>scm:git:git://github.com/ravi1395/Racer.git</connection>
+		<developerConnection>scm:git:ssh://github.com/ravi1395/Racer.git</developerConnection>
+		<url>https://github.com/ravi1395/Racer</url>
+		<tag>v1.3.0</tag>
 	</scm>
 
 	<properties>
@@ -143,13 +143,9 @@
 	</dependencies>
 
 	<distributionManagement>
-		<snapshotRepository>
-			<id>ossrh</id>
-			<url>https://s01.oss.sonatype.org/content/repositories/snapshots</url>
-		</snapshotRepository>
 		<repository>
-			<id>ossrh</id>
-			<url>https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+			<id>central</id>
+			<url>https://central.sonatype.com/</url>
 		</repository>
 	</distributionManagement>
 
@@ -261,16 +257,16 @@
 							</execution>
 						</executions>
 					</plugin>
-					<!-- Sonatype Central Publishing Plugin -->
+					<!-- Central Portal Publishing Plugin (replaces nexus-staging-maven-plugin) -->
 					<plugin>
-						<groupId>org.sonatype.plugins</groupId>
-						<artifactId>nexus-staging-maven-plugin</artifactId>
-						<version>1.7.0</version>
+						<groupId>org.sonatype.central</groupId>
+						<artifactId>central-publishing-maven-plugin</artifactId>
+						<version>0.7.0</version>
 						<extensions>true</extensions>
 						<configuration>
-							<serverId>ossrh</serverId>
-							<nexusUrl>https://s01.oss.sonatype.org/</nexusUrl>
-							<autoReleaseAfterClose>true</autoReleaseAfterClose>
+							<publishingServerId>central</publishingServerId>
+							<autoPublish>true</autoPublish>
+							<waitUntil>published</waitUntil>
 						</configuration>
 					</plugin>
 				</plugins>
