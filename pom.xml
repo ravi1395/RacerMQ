@@ -180,6 +180,15 @@
 					<skip>true</skip>
 				</configuration>
 			</plugin>
+			<!-- Skip default deploy; publishing to Maven Central requires -P release
+			     which activates central-publishing-maven-plugin with the correct API -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-deploy-plugin</artifactId>
+				<configuration>
+					<skip>true</skip>
+				</configuration>
+			</plugin>
 			<plugin>
 				<groupId>org.jacoco</groupId>
 				<artifactId>jacoco-maven-plugin</artifactId>
